@@ -38,8 +38,10 @@ class Settings(BaseSettings):
     # ── LLM Defaults ─────────────────────────────────────────
     default_provider: str = "nvidia"
     llm_temperature: float = 0.6
-    llm_max_tokens: int = 2048
-    llm_timeout: int = 60
+    llm_max_tokens: int = 4096
+    llm_timeout: int = 300
+    ollama_model: str = "ollama/qwen2.5-coder:latest"
+    ollama_api_base: str = "http://localhost:11434"
 
     # ── App ───────────────────────────────────────────────────
     app_name: str = "Wings of AI – Content Pipeline"

@@ -17,7 +17,9 @@ DOCS_COLLECTION = "docs_collection"
 
 def get_qdrant() -> QdrantClient | None:
     """Get the initialized Qdrant client."""
-    global _qdrant
+    # Commented out to disable Qdrant as per user request
+    return None
+    
     if _qdrant:
         return _qdrant
         

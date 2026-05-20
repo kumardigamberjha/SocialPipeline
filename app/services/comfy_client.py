@@ -8,6 +8,7 @@ Optimized for:
 - Resolution: 1080x1350 (Instagram 4:5)
 """
 
+import os
 import aiohttp
 import asyncio
 import json
@@ -256,12 +257,32 @@ class ComfyClient:
         except Exception:
             return False
 
+    def _get_model_status(self, model_name: str) -> tuple[bool, str]:
+        """Check if model exists and has expected minimum size (~3GB for SDXL Turbo)."""
+        # Resolve home path in case of ~ usage
+        comfy_home = Path("/home/digamber-jha/ComfyUI")
+        ckpt_path = comfy_home / "models" / "checkpoints" / model_name
+        
+        if not ckpt_path.exists():
+            return False, f"Model file missing: {model_name}"
+            
+        # Expected size for sd_xl_turbo_1.0_fp16 is ~3.16 GiB (3.4 GB)
+        # We'll check if it's at least 3GB (3,000,000,000 bytes)
+        size = ckpt_path.stat().st_size
+        if "sd_xl_turbo" in model_name and size < 3_000_000_000:
+            pct = round((size / 3_391_372_288) * 100, 1)
+            return False, f"Model {model_name} is still downloading ({pct}% complete). Please wait."
+            
+        return True, "Ready"
+
     async def queue_prompt(self, workflow: dict) -> str:
         """Queue workflow, return prompt_id."""
         payload = {"prompt": workflow, "client_id": self.client_id}
         async with aiohttp.ClientSession() as s:
             async with s.post(f"{self.base_url}/prompt", json=payload) as r:
                 data = await r.json()
+                if "prompt_id" not in data:
+                    raise RuntimeError(f"ComfyUI error posting prompt: {data}")
                 return data["prompt_id"]
 
     async def wait_for_result(self, prompt_id: str, timeout: int = 120) -> list[bytes]:
@@ -322,6 +343,12 @@ class ComfyClient:
             }
         """
         t0 = time.time()
+
+        # Safety check: prevent starting if model is not ready
+        if model == "sdxl_turbo":
+            ready, msg = self._get_model_status("sd_xl_turbo_1.0_fp16.safetensors")
+            if not ready:
+                raise RuntimeError(msg)
 
         positive, negative = build_instagram_prompt(topic, palette, layout, style_hints)
 
