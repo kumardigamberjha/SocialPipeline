@@ -1,0 +1,1155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wings of AI — Instagram Generator</title>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;800&family=JetBrains+Mono:wght@300;400;500&family=Instrument+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg:       #07070d;
+  --s1:       #0f0f1a;
+  --s2:       #171726;
+  --s3:       #1f1f32;
+  --bdr:      rgba(255,255,255,0.06);
+  --bdr2:     rgba(255,255,255,0.11);
+  --txt:      #eeeaf8;
+  --muted:    #6b677e;
+  --accent:   #7c6aff;
+  --a2:       #ff6ab0;
+  --a3:       #00e5c8;
+  --warn:     #f59e0b;
+  --ff-head:  'Bricolage Grotesque', sans-serif;
+  --ff-mono:  'JetBrains Mono', monospace;
+  --ff-body:  'Instrument Sans', sans-serif;
+}
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--txt);
+  font-family: var(--ff-body);
+  font-size: 14px;
+  line-height: 1.6;
+  overflow: hidden;
+}
+
+/* ── Scrollbar ────────────────────────────────── */
+::-webkit-scrollbar { width: 3px; height: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--s3); border-radius: 2px; }
+
+/* ── Layout ───────────────────────────────────── */
+.shell {
+  display: grid;
+  grid-template-rows: 52px 1fr;
+  height: 100vh;
+}
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--bdr);
+  background: rgba(7,7,13,0.95);
+  backdrop-filter: blur(16px);
+  position: sticky; top: 0; z-index: 200;
+}
+.brand {
+  font-family: var(--ff-head);
+  font-weight: 800;
+  font-size: 15px;
+  letter-spacing: -0.3px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.brand-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--a2));
+  box-shadow: 0 0 8px var(--accent);
+  animation: pulse 2s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100%{box-shadow:0 0 6px var(--accent)} 50%{box-shadow:0 0 14px var(--accent)} }
+
+.brand-name { background: linear-gradient(90deg, var(--accent), var(--a2)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+.brand-sub { color: var(--muted); font-weight: 400; font-size: 13px; }
+
+.gpu-badge {
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  padding: 4px 10px;
+  border-radius: 20px;
+  background: rgba(0,229,200,0.08);
+  border: 1px solid rgba(0,229,200,0.2);
+  color: var(--a3);
+  display: flex; align-items: center; gap: 5px;
+}
+.gpu-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--a3); animation: pulse 1.5s ease-in-out infinite; }
+
+.content {
+  display: grid;
+  grid-template-columns: 290px 1fr 290px;
+  overflow: hidden;
+  height: calc(100vh - 52px);
+}
+
+/* ── Panels ───────────────────────────────────── */
+.panel {
+  background: var(--s1);
+  border-right: 1px solid var(--bdr);
+  overflow-y: auto;
+  padding: 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.panel.right { border-right: none; border-left: 1px solid var(--bdr); }
+
+.panel-head {
+  font-family: var(--ff-mono);
+  font-size: 9px;
+  letter-spacing: 2.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--bdr);
+}
+
+.group { display: flex; flex-direction: column; gap: 7px; }
+.lbl {
+  font-family: var(--ff-mono);
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+/* ── Inputs ───────────────────────────────────── */
+.inp {
+  width: 100%;
+  background: var(--s2);
+  border: 1px solid var(--bdr);
+  border-radius: 8px;
+  padding: 8px 11px;
+  color: var(--txt);
+  font-family: var(--ff-body);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 0.18s;
+}
+.inp:focus { border-color: rgba(124,106,255,0.5); }
+textarea.inp { resize: none; line-height: 1.5; }
+select.inp { cursor: pointer; }
+input[type=range] { width: 100%; accent-color: var(--accent); cursor: pointer; height: 3px; }
+
+/* ── Palette ──────────────────────────────────── */
+.pal-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 6px; }
+.pal-chip {
+  aspect-ratio: 1;
+  border-radius: 8px;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: transform 0.14s, border-color 0.14s;
+  position: relative;
+  overflow: hidden;
+}
+.pal-chip:hover { transform: scale(1.07); }
+.pal-chip.on { border-color: rgba(255,255,255,0.7); box-shadow: 0 0 0 2px var(--accent); }
+
+/* ── Layout chips ─────────────────────────────── */
+.lay-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 7px; }
+.lay-chip {
+  aspect-ratio: 4/5;
+  border-radius: 8px;
+  background: var(--s2);
+  border: 1.5px solid var(--bdr);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  font-size: 9px;
+  color: var(--muted);
+  transition: all 0.14s;
+}
+.lay-chip:hover { border-color: rgba(124,106,255,0.35); color: var(--txt); }
+.lay-chip.on { border-color: var(--accent); background: rgba(124,106,255,0.1); color: var(--accent); }
+.lay-icon { font-size: 16px; line-height: 1; }
+
+/* ── Model selector ───────────────────────────── */
+.model-row { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
+.model-chip {
+  border-radius: 9px;
+  border: 1.5px solid var(--bdr);
+  background: var(--s2);
+  cursor: pointer;
+  padding: 10px 10px;
+  transition: all 0.14s;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.model-chip:hover { border-color: rgba(124,106,255,0.3); }
+.model-chip.on { border-color: var(--accent); background: rgba(124,106,255,0.08); }
+.model-name { font-weight: 600; font-size: 12px; color: var(--txt); }
+.model-info { font-family: var(--ff-mono); font-size: 9px; color: var(--muted); }
+.model-chip.on .model-name { color: var(--accent); }
+
+/* ── Tags ─────────────────────────────────────── */
+.tags-row { display: flex; flex-wrap: wrap; gap: 5px; }
+.tag {
+  padding: 3px 9px;
+  border-radius: 20px;
+  background: var(--s2);
+  border: 1px solid var(--bdr);
+  font-size: 11px;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.14s;
+}
+.tag:hover, .tag.on { background: rgba(124,106,255,0.12); border-color: var(--accent); color: var(--accent); }
+
+/* ── Buttons ──────────────────────────────────── */
+.btn {
+  border: none;
+  border-radius: 9px;
+  font-family: var(--ff-body);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  padding: 9px 18px;
+  transition: all 0.18s;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.btn-ghost { background: var(--s2); color: var(--muted); border: 1px solid var(--bdr); }
+.btn-ghost:hover { color: var(--txt); border-color: var(--bdr2); }
+.btn-gen {
+  background: linear-gradient(135deg, var(--accent) 0%, #9580ff 100%);
+  color: #fff;
+  width: 100%;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 12px;
+  box-shadow: 0 4px 20px rgba(124,106,255,0.3);
+}
+.btn-gen:hover { transform: translateY(-1px); box-shadow: 0 6px 28px rgba(124,106,255,0.45); }
+.btn-gen:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+.btn-copy {
+  background: rgba(0,229,200,0.08);
+  border: 1px solid rgba(0,229,200,0.2);
+  color: var(--a3);
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  padding: 4px 10px;
+}
+.btn-copy:hover { background: rgba(0,229,200,0.15); }
+.btn-dl {
+  background: rgba(245,158,11,0.1);
+  border: 1px solid rgba(245,158,11,0.25);
+  color: var(--warn);
+  font-size: 12px;
+  padding: 7px 14px;
+  width: 100%;
+  justify-content: center;
+}
+.btn-dl:hover { background: rgba(245,158,11,0.18); }
+
+/* ── Canvas area ──────────────────────────────── */
+.canvas-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: #040408;
+  background-image:
+    radial-gradient(circle at 50% 50%, rgba(124,106,255,0.04) 0%, transparent 65%),
+    linear-gradient(rgba(255,255,255,0.012) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.012) 1px, transparent 1px);
+  background-size: 100% 100%, 28px 28px, 28px 28px;
+  padding: 28px;
+  overflow: hidden;
+  position: relative;
+  gap: 16px;
+}
+
+#ig-post {
+  width: 360px;
+  height: 450px;
+  border-radius: 4px;
+  overflow: hidden;
+  box-shadow:
+    0 0 0 1px rgba(255,255,255,0.04),
+    0 24px 64px rgba(0,0,0,0.8),
+    0 4px 16px rgba(0,0,0,0.5);
+  position: relative;
+  transition: transform 0.3s;
+  flex-shrink: 0;
+}
+#ig-post:hover { transform: scale(1.01); }
+
+/* Generated image fills background */
+#gen-image {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
+  object-fit: cover;
+  display: none;
+  z-index: 1;
+}
+.post-bg {
+  position: absolute; inset: 0;
+  z-index: 2;
+  transition: background 0.4s;
+}
+.post-overlay { position: absolute; inset: 0; z-index: 3; }
+.post-content {
+  position: absolute; inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  padding: 18px;
+  font-family: 'Bricolage Grotesque', sans-serif;
+}
+
+/* Post text elements */
+.p-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 9px;
+  border-radius: 20px;
+  font-size: 8px;
+  font-weight: 600;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  width: fit-content;
+}
+.p-hl {
+  font-weight: 800;
+  line-height: 1.1;
+  letter-spacing: -0.5px;
+}
+.p-sub {
+  font-family: var(--ff-body);
+  font-weight: 300;
+  font-size: 10px;
+  line-height: 1.5;
+  opacity: 0.8;
+}
+.p-cta {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border-radius: 7px;
+  font-family: var(--ff-mono);
+  font-size: 9px;
+  font-weight: 500;
+  width: fit-content;
+}
+.p-user {
+  font-family: var(--ff-mono);
+  font-size: 8px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.p-avatar {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.p-brand {
+  font-family: var(--ff-head);
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  opacity: 0.65;
+}
+.p-div { height: 1px; background: rgba(255,255,255,0.1); margin: 7px 0; }
+.p-tags { font-family: var(--ff-mono); font-size: 7px; opacity: 0.45; line-height: 1.8; }
+.p-spacer { flex: 1; }
+.p-acc-bar {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+}
+
+/* ── Generation loader ────────────────────────── */
+.gen-loader {
+  position: absolute; inset: 0;
+  z-index: 10;
+  background: rgba(7,7,13,0.88);
+  backdrop-filter: blur(8px);
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  border-radius: 4px;
+}
+.gen-loader.show { display: flex; }
+.spinner {
+  width: 36px; height: 36px;
+  border: 2px solid var(--s3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.gen-status {
+  font-family: var(--ff-mono);
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  max-width: 200px;
+  line-height: 1.6;
+}
+.gen-pct { color: var(--accent); font-size: 22px; font-weight: 800; font-family: var(--ff-head); }
+
+/* Comfy offline notice */
+.offline-notice {
+  background: rgba(245,158,11,0.08);
+  border: 1px solid rgba(245,158,11,0.2);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  color: var(--warn);
+  line-height: 1.7;
+  display: none;
+}
+.offline-notice.show { display: block; }
+
+/* ── Right panel specifics ────────────────────── */
+.prompt-box {
+  background: var(--s2);
+  border: 1px solid var(--bdr);
+  border-radius: 9px;
+  padding: 11px;
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  color: #9effd4;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+  min-height: 90px;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.neg-box {
+  background: var(--s2);
+  border: 1px solid var(--bdr);
+  border-radius: 9px;
+  padding: 11px;
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  color: #ff8fa3;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 90px;
+  overflow-y: auto;
+}
+.lbl-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.result-img-wrap {
+  width: 100%;
+  aspect-ratio: 4/5;
+  border-radius: 9px;
+  overflow: hidden;
+  background: var(--s2);
+  border: 1px dashed var(--bdr2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--ff-mono);
+  position: relative;
+}
+#result-img { width: 100%; height: 100%; object-fit: cover; display: none; }
+
+.meta-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.meta-chip {
+  background: var(--s2);
+  border: 1px solid var(--bdr);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.meta-val { font-family: var(--ff-mono); font-size: 13px; color: var(--a3); font-weight: 500; }
+.meta-key { font-family: var(--ff-mono); font-size: 9px; color: var(--muted); margin-top: 1px; }
+
+/* ── Toast ────────────────────────────────────── */
+@keyframes toastIn { from { opacity:0; transform: translateX(-50%) translateY(8px); } to { opacity:1; transform: translateX(-50%) translateY(0); } }
+.toast {
+  position: fixed;
+  bottom: 24px; left: 50%;
+  transform: translateX(-50%);
+  background: var(--s2);
+  border: 1px solid rgba(0,229,200,0.25);
+  color: var(--a3);
+  padding: 9px 18px;
+  border-radius: 9px;
+  font-family: var(--ff-mono);
+  font-size: 11px;
+  z-index: 9999;
+  animation: toastIn 0.2s ease;
+  pointer-events: none;
+}
+
+/* ── Zoom ─────────────────────────────────────── */
+.zoom-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.z-btn {
+  width: 28px; height: 28px;
+  background: var(--s1);
+  border: 1px solid var(--bdr);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 15px;
+  cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: all 0.14s;
+}
+.z-btn:hover { border-color: var(--bdr2); color: var(--txt); }
+#z-lbl {
+  font-family: var(--ff-mono);
+  font-size: 10px;
+  color: var(--muted);
+  min-width: 40px;
+  text-align: center;
+  background: var(--s1);
+  border: 1px solid var(--bdr);
+  border-radius: 7px;
+  padding: 0 8px;
+  height: 28px;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* Animations */
+@keyframes fadeUp { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+.post-content > * { animation: fadeUp 0.25s ease both; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-dot"></div>
+      <span class="brand-name">Wings of AI</span>
+      <span class="brand-sub">/ Instagram Generator</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px">
+      <div id="comfy-status" class="gpu-badge" style="display:none">
+        <div class="gpu-dot"></div>
+        ComfyUI connected
+      </div>
+      <div class="gpu-badge">
+        <div class="gpu-dot"></div>
+        RTX 4060 · 8GB
+      </div>
+      <button class="btn btn-ghost" onclick="resetAll()" style="font-size:12px;padding:6px 14px">Reset</button>
+    </div>
+  </header>
+
+  <div class="content">
+    <!-- ── LEFT PANEL ── -->
+    <div class="panel">
+      <div class="panel-head">Design Controls</div>
+
+      <div class="group">
+        <div class="lbl">Topic / Script excerpt</div>
+        <textarea class="inp" id="topic" rows="2" oninput="update()">Build AI Agents with CrewAI and Python</textarea>
+      </div>
+
+      <div class="group">
+        <div class="lbl">Palette</div>
+        <div class="pal-grid" id="pal-grid"></div>
+      </div>
+
+      <div class="group">
+        <div class="lbl">Layout</div>
+        <div class="lay-grid" id="lay-grid"></div>
+      </div>
+
+      <div class="group">
+        <div class="lbl">Model</div>
+        <div class="model-row">
+          <div class="model-chip on" id="mc-sdxl" onclick="selectModel('sdxl_turbo')">
+            <div class="model-name">SDXL-Turbo</div>
+            <div class="model-info">~3s · 4 steps · fp16</div>
+          </div>
+          <div class="model-chip" id="mc-flux" onclick="selectModel('flux_schnell')">
+            <div class="model-name">Flux Schnell</div>
+            <div class="model-info">~8s · Q4 · better</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="lbl">Badge</div>
+        <input class="inp" id="badge" value="AI Tutorial" oninput="update()" maxlength="22">
+      </div>
+
+      <div class="group">
+        <div class="lbl">Headline</div>
+        <textarea class="inp" id="headline" rows="2" oninput="update()">Build AI Agents in Python</textarea>
+      </div>
+
+      <div class="group">
+        <div class="lbl">Subtext</div>
+        <textarea class="inp" id="subtext" rows="2" oninput="update()">CrewAI + FastAPI in 60 seconds</textarea>
+      </div>
+
+      <div class="group">
+        <div class="lbl">CTA</div>
+        <input class="inp" id="cta" value="Watch Now →" oninput="update()" maxlength="26">
+      </div>
+
+      <div class="group">
+        <div class="lbl">Username</div>
+        <input class="inp" id="username" value="@codingindia" oninput="update()" maxlength="32">
+      </div>
+
+      <div class="group">
+        <div class="lbl">Brand</div>
+        <input class="inp" id="brand" value="Coding India" oninput="update()" maxlength="24">
+      </div>
+
+      <div class="group">
+        <div class="lbl">Hashtag presets</div>
+        <div class="tags-row" id="tag-row"></div>
+        <input class="inp" id="tags" placeholder="#python #ai #automation" oninput="update()" style="margin-top:6px">
+      </div>
+
+      <div class="group">
+        <div class="lbl">Headline size <span id="hl-val" style="color:var(--accent)">32px</span></div>
+        <input type="range" id="hl-size" min="18" max="46" value="32" oninput="document.getElementById('hl-val').textContent=this.value+'px';update()">
+      </div>
+
+      <div class="group">
+        <div class="lbl">Style hints (optional)</div>
+        <input class="inp" id="style-hints" placeholder="e.g. neon rain, circuit board" oninput="update()">
+      </div>
+
+      <div class="group">
+        <div class="lbl">ComfyUI endpoint</div>
+        <input class="inp" id="comfy-url" value="http://127.0.0.1:8188" oninput="update()">
+      </div>
+
+      <button class="btn btn-gen" id="gen-btn" onclick="generate()">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Generate Image
+      </button>
+
+      <div class="offline-notice" id="offline-notice">
+        ComfyUI not detected at <strong id="comfy-url-display"></strong><br>
+        Start it with:<br>
+        <code>~/start_comfy.sh</code><br><br>
+        Preview mode active — template renders live.
+      </div>
+    </div>
+
+    <!-- ── CENTER CANVAS ── -->
+    <div class="canvas-wrap">
+      <div id="ig-post">
+        <img id="gen-image" alt="Generated">
+        <div class="post-bg" id="post-bg"></div>
+        <div class="post-overlay" id="post-overlay"></div>
+        <div class="post-content" id="post-content"></div>
+        <div class="gen-loader" id="gen-loader">
+          <div class="spinner"></div>
+          <div class="gen-pct" id="gen-pct">0%</div>
+          <div class="gen-status" id="gen-status">Connecting to ComfyUI...</div>
+        </div>
+      </div>
+      <div class="zoom-bar">
+        <button class="z-btn" onclick="zoom(-0.1)">−</button>
+        <div id="z-lbl">100%</div>
+        <button class="z-btn" onclick="zoom(0.1)">+</button>
+      </div>
+    </div>
+
+    <!-- ── RIGHT PANEL ── -->
+    <div class="panel right">
+      <div class="panel-head">Output</div>
+
+      <div class="group">
+        <div class="lbl-row">
+          <div class="lbl">Positive prompt</div>
+          <button class="btn btn-copy" onclick="copyText('pos-prompt')">Copy</button>
+        </div>
+        <div class="prompt-box" id="pos-prompt"></div>
+      </div>
+
+      <div class="group">
+        <div class="lbl-row">
+          <div class="lbl">Negative prompt</div>
+          <button class="btn btn-copy" onclick="copyText('neg-prompt')">Copy</button>
+        </div>
+        <div class="neg-box" id="neg-prompt"></div>
+      </div>
+
+      <div class="group">
+        <div class="lbl">Generated image</div>
+        <div class="result-img-wrap">
+          <span id="no-img-label">No image yet</span>
+          <img id="result-img" alt="Result">
+        </div>
+        <button class="btn btn-dl" id="dl-btn" onclick="downloadImage()" style="margin-top:8px;display:none">
+          ↓ Download 1080×1350 PNG
+        </button>
+      </div>
+
+      <div class="group">
+        <div class="lbl">Generation stats</div>
+        <div class="meta-row">
+          <div class="meta-chip">
+            <div class="meta-val" id="stat-time">—</div>
+            <div class="meta-key">duration</div>
+          </div>
+          <div class="meta-chip">
+            <div class="meta-val" id="stat-model">—</div>
+            <div class="meta-key">model</div>
+          </div>
+          <div class="meta-chip">
+            <div class="meta-val">1080×1350</div>
+            <div class="meta-key">resolution</div>
+          </div>
+          <div class="meta-chip">
+            <div class="meta-val">4:5</div>
+            <div class="meta-key">aspect ratio</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="lbl-row">
+          <div class="lbl">ComfyUI JSON payload</div>
+          <button class="btn btn-copy" onclick="copyText('comfy-json')">Copy</button>
+        </div>
+        <div class="prompt-box" style="color:var(--muted);font-size:9px;max-height:160px;overflow-y:auto" id="comfy-json"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────
+const S = {
+  palette: 0,
+  layout: 0,
+  model: 'sdxl_turbo',
+  zoom: 1,
+  genImgB64: null,
+  tags: ['#python','#ai','#crewai','#automation','#django','#react','#mlops','#n8n'],
+};
+
+// ── Palettes ─────────────────────────────────────────────────
+const PALS = [
+  { name:'Void Purple',bg:'#0d0b1e',a:'#7c6aff',a2:'#ff6ab0',txt:'#f0eeff',
+    bb:'rgba(124,106,255,0.18)',bt:'#b8adff',ctabg:'#7c6aff',ov:'linear-gradient(180deg,transparent 25%,#0d0b1e 100%)' },
+  { name:'Cyber Teal', bg:'#011a17',a:'#00e5c8',a2:'#00b8a0',txt:'#d4fff8',
+    bb:'rgba(0,229,200,0.15)',bt:'#00e5c8',ctabg:'#00b8a0',ov:'linear-gradient(180deg,transparent 25%,#011a17 100%)' },
+  { name:'Neon Coral', bg:'#1a0609',a:'#ff4d6d',a2:'#ff8fa3',txt:'#fff0f2',
+    bb:'rgba(255,77,109,0.15)',bt:'#ff8fa3',ctabg:'#ff4d6d',ov:'linear-gradient(180deg,transparent 25%,#1a0609 100%)' },
+  { name:'Solar Amber',bg:'#120c00',a:'#f59e0b',a2:'#fbbf24',txt:'#fffbeb',
+    bb:'rgba(245,158,11,0.15)',bt:'#fbbf24',ctabg:'#d97706',ov:'linear-gradient(180deg,transparent 25%,#120c00 100%)' },
+  { name:'Ice Blue',   bg:'#010d1a',a:'#38bdf8',a2:'#7dd3fc',txt:'#e0f4ff',
+    bb:'rgba(56,189,248,0.15)',bt:'#7dd3fc',ctabg:'#0284c7',ov:'linear-gradient(180deg,transparent 25%,#010d1a 100%)' },
+  { name:'Forest',     bg:'#060f09',a:'#4ade80',a2:'#86efac',txt:'#ecfdf5',
+    bb:'rgba(74,222,128,0.15)',bt:'#86efac',ctabg:'#16a34a',ov:'linear-gradient(180deg,transparent 25%,#060f09 100%)' },
+  { name:'Crimson',    bg:'#120000',a:'#ef4444',a2:'#fca5a5',txt:'#fff1f1',
+    bb:'rgba(239,68,68,0.15)',bt:'#fca5a5',ctabg:'#dc2626',ov:'linear-gradient(180deg,transparent 25%,#120000 100%)' },
+  { name:'Obsidian',   bg:'#000000',a:'#ffffff',a2:'#aaaaaa',txt:'#ffffff',
+    bb:'rgba(255,255,255,0.1)',bt:'#cccccc',ctabg:'#222',ov:'linear-gradient(180deg,transparent 25%,#000 100%)' },
+];
+
+// ── Layouts ──────────────────────────────────────────────────
+const LAYS = [
+  { id:'bottom_hero', name:'Bottom Hero', icon:'▬' },
+  { id:'top_title',   name:'Top Title',   icon:'▀' },
+  { id:'center_bold', name:'Center',      icon:'◉' },
+  { id:'split_left',  name:'Split Left',  icon:'◧' },
+  { id:'minimal',     name:'Minimal',     icon:'·' },
+  { id:'full_text',   name:'Full Text',   icon:'≡' },
+];
+
+// ── Prompt engine ────────────────────────────────────────────
+const MOOD = {
+  0:'cinematic deep purple neon atmosphere, violet bokeh particles, dark cyberpunk tech editorial, electric purple glow rays',
+  1:'bioluminescent teal ocean tech, deep aqua glow, cyan light refractions, dark abyss depth, glass prism effects',
+  2:'warm coral neon editorial, pink digital particles, sunset bokeh flares, rose gold accent light',
+  3:'golden amber cinematic sunrise, warm orange bokeh lens flares, editorial magazine photography, luxury warm tones',
+  4:'crisp arctic ice blue, cold white light shafts, frost crystal texture, clean sharp Nordic aesthetic',
+  5:'lush emerald bioluminescent tech nature, deep forest green glows, organic circuit patterns, rich jungle depth',
+  6:'deep crimson dramatic editorial, red glowing mist particles, dark theatrical lighting, noir cinematic red',
+  7:'ultra clean monochrome, black white high contrast, fine film grain texture, Kubrick studio editorial',
+};
+const COMP = {
+  'bottom_hero':'wide cinematic composition, strong visual interest upper 60 percent, clear negative space lower third, panoramic depth of field',
+  'top_title':  'vertical portrait composition, anchor at center mass, clear empty space at top quarter, rule of thirds',
+  'center_bold':'radially symmetrical, single dramatic centered focal point, vignette edges, perfect exposure balance',
+  'split_left': 'asymmetric rule-of-thirds, main subject right-weighted, open clean negative space on left side',
+  'minimal':    'extreme minimalism, 70 percent negative space, one single dramatic subject, zen stillness, breathing room',
+  'full_text':  'abstract layered bokeh texture, blurred atmospheric depth, pattern without subject, pure mood',
+};
+const QUALITY = 'professional commercial photography, 8K ultra sharp, perfect cinematic color grading, no text, no watermark, no logos, no letters, no numbers, Instagram worthy composition, trending ArtStation, Hasselblad medium format aesthetic, award winning';
+const NEGATIVE = 'text, watermark, logo, words, letters, typography, numbers, username, blurry, low resolution, pixelated, oversaturated, distorted, ugly, amateur, stock photo look, white background, flat design, cartoonish, drawing, anime, deformed, bad anatomy, duplicate, JPEG artifacts';
+
+function buildPrompt() {
+  const topic  = document.getElementById('topic').value.trim() || 'AI technology';
+  const hints  = document.getElementById('style-hints').value.trim();
+  const mood   = MOOD[S.palette];
+  const comp   = COMP[LAYS[S.layout].id];
+  const extra  = hints ? `, ${hints}` : '';
+  const pos = `(Instagram post visual for: ${topic}), ${mood}, ${comp}, ${QUALITY}${extra}`;
+  return { pos, neg: NEGATIVE };
+}
+
+// ── Build ComfyUI payload ────────────────────────────────────
+function buildPayload(pos, neg) {
+  const seed = Math.floor(Math.random() * 999999999);
+  const url   = document.getElementById('comfy-url').value.trim();
+  if (S.model === 'flux_schnell') {
+    return {
+      seed,
+      url,
+      workflow: {
+        "1":{"class_type":"UnetLoaderGGUF","inputs":{"unet_name":"flux1-schnell-Q4_K_M.gguf"}},
+        "2":{"class_type":"DualCLIPLoader","inputs":{"clip_name1":"t5xxl_fp8_e4m3fn.safetensors","clip_name2":"clip_l.safetensors","type":"flux"}},
+        "3":{"class_type":"VAELoader","inputs":{"vae_name":"ae.safetensors"}},
+        "4":{"class_type":"CLIPTextEncode","inputs":{"text":pos,"clip":["2",0]}},
+        "5":{"class_type":"EmptySD3LatentImage","inputs":{"width":1080,"height":1350,"batch_size":1}},
+        "6":{"class_type":"BasicGuider","inputs":{"model":["1",0],"conditioning":["4",0]}},
+        "7":{"class_type":"RandomNoise","inputs":{"noise_seed":seed}},
+        "8":{"class_type":"BasicScheduler","inputs":{"model":["1",0],"scheduler":"simple","steps":4,"denoise":1.0}},
+        "9":{"class_type":"SamplerCustomAdvanced","inputs":{"noise":["7",0],"guider":["6",0],"sampler":["10",0],"sigmas":["8",0],"latent_image":["5",0]}},
+        "10":{"class_type":"KSamplerSelect","inputs":{"sampler_name":"euler"}},
+        "11":{"class_type":"VAEDecode","inputs":{"samples":["9",0],"vae":["3",0]}},
+        "12":{"class_type":"SaveImage","inputs":{"images":["11",0],"filename_prefix":`wings_ai_flux_${seed}`}},
+      }
+    };
+  }
+  return {
+    seed,
+    url,
+    workflow: {
+      "1":{"class_type":"CheckpointLoaderSimple","inputs":{"ckpt_name":"sd_xl_turbo_1.0_fp16.safetensors"}},
+      "2":{"class_type":"EmptyLatentImage","inputs":{"width":1080,"height":1350,"batch_size":1}},
+      "3":{"class_type":"CLIPTextEncode","inputs":{"text":pos,"clip":["1",1]}},
+      "4":{"class_type":"CLIPTextEncode","inputs":{"text":neg,"clip":["1",1]}},
+      "5":{"class_type":"KSampler","inputs":{"seed":seed,"steps":4,"cfg":1.0,"sampler_name":"euler_ancestral","scheduler":"karras","denoise":1.0,"model":["1",0],"positive":["3",0],"negative":["4",0],"latent_image":["2",0]}},
+      "6":{"class_type":"VAEDecode","inputs":{"samples":["5",0],"vae":["1",2]}},
+      "7":{"class_type":"SaveImage","inputs":{"images":["6",0],"filename_prefix":`wings_ai_ig_${seed}`}},
+    }
+  };
+}
+
+// ── Generate ─────────────────────────────────────────────────
+async function generate() {
+  const { pos, neg } = buildPrompt();
+  const payload = buildPayload(pos, neg);
+  const baseUrl = document.getElementById('comfy-url').value.trim();
+
+  // Show loader
+  const loader = document.getElementById('gen-loader');
+  loader.classList.add('show');
+  document.getElementById('gen-btn').disabled = true;
+  setStatus('Connecting to ComfyUI...',5);
+
+  const t0 = Date.now();
+
+  try {
+    // 1. Check health
+    setStatus('Checking ComfyUI health...',10);
+    const health = await fetch(`${baseUrl}/system_stats`,{signal:AbortSignal.timeout(3000)}).catch(()=>null);
+    if (!health || !health.ok) throw new Error('ComfyUI offline');
+
+    // 2. Queue prompt
+    setStatus(`Queuing prompt on ComfyUI...`,25);
+    const clientId = crypto.randomUUID();
+    const qRes = await fetch(`${baseUrl}/prompt`,{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ prompt: payload.workflow, client_id: clientId })
+    });
+    if (!qRes.ok) throw new Error(`Queue failed: ${qRes.status}`);
+    const { prompt_id } = await qRes.json();
+
+    setStatus(`Generating on RTX 4060 (${S.model === 'flux_schnell' ? '~8s' : '~3s'})...`,40);
+
+    // 3. Poll history until done
+    let images = null;
+    const deadline = Date.now() + 120000;
+    while (Date.now() < deadline) {
+      await sleep(1200);
+      const hRes = await fetch(`${baseUrl}/history/${prompt_id}`);
+      const hist = await hRes.json();
+      const run = hist[prompt_id];
+      if (run && run.outputs) {
+        for (const node of Object.values(run.outputs)) {
+          if (node.images && node.images.length > 0) {
+            images = node.images; break;
+          }
+        }
+        if (images) break;
+      }
+      setStatus('Generating...', Math.min(90, 40 + (Date.now()-t0)/1200));
+    }
+    if (!images) throw new Error('Timeout — no image returned');
+
+    // 4. Fetch image bytes
+    setStatus('Fetching result...', 92);
+    const imgInfo = images[0];
+    const params = new URLSearchParams({ filename: imgInfo.filename, type: imgInfo.type });
+    if (imgInfo.subfolder) params.set('subfolder', imgInfo.subfolder);
+    const imgRes = await fetch(`${baseUrl}/view?${params}`);
+    const blob   = await imgRes.blob();
+    const b64    = await blobToB64(blob);
+
+    S.genImgB64 = b64;
+    const duration = ((Date.now()-t0)/1000).toFixed(1)+'s';
+
+    // 5. Show result
+    applyGeneratedImage(b64);
+    showResultImage(b64);
+    document.getElementById('stat-time').textContent = duration;
+    document.getElementById('stat-model').textContent = S.model === 'flux_schnell' ? 'Flux' : 'SDXL';
+    document.getElementById('dl-btn').style.display = 'flex';
+    document.getElementById('comfy-status').style.display = 'flex';
+    toast('Image generated in '+duration);
+
+  } catch(err) {
+    // Preview mode fallback
+    showOfflineNotice(baseUrl);
+    toast('ComfyUI offline — preview mode active');
+    console.warn('ComfyUI error:', err);
+  } finally {
+    loader.classList.remove('show');
+    document.getElementById('gen-btn').disabled = false;
+  }
+}
+
+function setStatus(msg, pct) {
+  document.getElementById('gen-status').textContent = msg;
+  document.getElementById('gen-pct').textContent = Math.round(pct)+'%';
+}
+
+function applyGeneratedImage(b64) {
+  const img = document.getElementById('gen-image');
+  img.src = `data:image/png;base64,${b64}`;
+  img.style.display = 'block';
+  document.getElementById('post-bg').style.background = 'transparent';
+  document.getElementById('post-overlay').style.background = 'linear-gradient(180deg, transparent 30%, rgba(0,0,0,0.7) 100%)';
+}
+
+function showResultImage(b64) {
+  const ri = document.getElementById('result-img');
+  ri.src = `data:image/png;base64,${b64}`;
+  ri.style.display = 'block';
+  document.getElementById('no-img-label').style.display = 'none';
+}
+
+function showOfflineNotice(url) {
+  const n = document.getElementById('offline-notice');
+  document.getElementById('comfy-url-display').textContent = url;
+  n.classList.add('show');
+  setTimeout(()=>n.classList.remove('show'), 8000);
+}
+
+// ── Render template ───────────────────────────────────────────
+function renderTemplate() {
+  const p   = PALS[S.palette];
+  const lay = LAYS[S.layout].id;
+  const v   = {
+    badge:    document.getElementById('badge').value || 'Tutorial',
+    hl:       document.getElementById('headline').value || 'Headline',
+    sub:      document.getElementById('subtext').value,
+    cta:      document.getElementById('cta').value || 'Watch Now',
+    user:     document.getElementById('username').value || '@user',
+    brand:    document.getElementById('brand').value || 'Brand',
+    tags:     document.getElementById('tags').value.trim(),
+    hlSz:     document.getElementById('hl-size').value,
+  };
+
+  // Only set bg gradient if no generated image
+  const genImg = document.getElementById('gen-image');
+  if (!genImg.src || genImg.style.display === 'none') {
+    document.getElementById('post-bg').style.background =
+      `radial-gradient(circle at 70% 30%, ${hex2rgba(p.a,0.22)} 0%, transparent 55%),
+       radial-gradient(circle at 20% 80%, ${hex2rgba(p.a2,0.14)} 0%, transparent 45%),
+       ${p.bg}`;
+    document.getElementById('post-overlay').style.background = p.ov;
+  } else {
+    document.getElementById('post-overlay').style.background = `linear-gradient(180deg, transparent 30%, rgba(0,0,0,0.75) 100%)`;
+  }
+
+  const tagStr = v.tags.split(/\s+/).filter(t=>t).slice(0,7).join('  ');
+  const badge  = `<div class="p-badge" style="background:${p.bb};color:${p.bt};border:1px solid ${hex2rgba(p.a,0.3)}"><span style="width:5px;height:5px;border-radius:50%;background:${p.a};display:inline-block"></span>${v.badge}</div>`;
+  const hl     = `<div class="p-hl" style="font-size:${v.hlSz}px;color:${p.txt}">${v.hl}</div>`;
+  const sub    = v.sub ? `<div class="p-sub" style="color:${hex2rgba(p.txt,0.75)};margin-top:5px">${v.sub}</div>` : '';
+  const cta    = `<div class="p-cta" style="background:${p.ctabg};color:${p.txt};margin-top:9px">${v.cta}</div>`;
+  const user   = `<div class="p-user" style="color:${hex2rgba(p.txt,0.55)}"><span class="p-avatar" style="background:${p.a}"></span>${v.user}</div>`;
+  const brand  = `<div class="p-brand" style="color:${hex2rgba(p.a,0.7)}">${v.brand}</div>`;
+  const div    = `<div class="p-div"></div>`;
+  const tags   = tagStr ? `<div class="p-tags" style="color:${hex2rgba(p.txt,0.45)}">${tagStr}</div>` : '';
+  const sp     = `<div class="p-spacer"></div>`;
+  const accBar = `<div class="p-acc-bar" style="background:${p.a}"></div>`;
+
+  let html = '';
+  if (lay==='bottom_hero') html=`${sp}<div style="display:flex;flex-direction:column;gap:5px">${badge}${hl}${sub}${cta}${div}<div style="display:flex;justify-content:space-between;align-items:center">${user}${brand}</div>${tags}</div>`;
+  else if (lay==='top_title') html=`<div style="display:flex;justify-content:space-between;align-items:center">${brand}${user}</div>${div}<div style="display:flex;flex-direction:column;gap:5px;margin-top:7px">${badge}${hl}${sub}</div>${sp}${cta}${tags}`;
+  else if (lay==='center_bold') html=`${sp}<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:7px">${badge}<div class="p-hl" style="font-size:${Math.min(parseInt(v.hlSz)+4,48)}px;color:${p.txt};text-align:center">${v.hl}</div>${sub}${cta}</div>${sp}${div}<div style="display:flex;justify-content:space-between">${user}${brand}</div>`;
+  else if (lay==='split_left') html=`${accBar}<div style="display:flex;gap:10px;flex:1;padding-left:10px"><div style="display:flex;flex-direction:column;gap:6px">${badge}${hl}${sub}${cta}</div></div>${div}<div style="display:flex;justify-content:space-between">${user}${brand}</div>${tags}`;
+  else if (lay==='minimal') html=`<div style="display:flex;justify-content:space-between">${brand}${user}</div>${sp}<div class="p-hl" style="font-size:${v.hlSz}px;color:${p.txt};max-width:88%">${v.hl}</div>${sp}<div style="display:flex;align-items:center;justify-content:space-between">${cta}${tags}</div>`;
+  else if (lay==='full_text') html=`${badge}<div style="margin-top:7px">${hl}</div>${div}<div style="flex:1">${sub}</div>${div}<div style="display:flex;justify-content:space-between;align-items:center">${user}${cta}</div>${tags}`;
+
+  document.getElementById('post-content').innerHTML = html;
+  document.getElementById('ig-post').style.background = genImg.src && genImg.style.display!=='none' ? 'transparent' : p.bg;
+}
+
+// ── Prompts output ────────────────────────────────────────────
+function updatePrompts() {
+  const { pos, neg } = buildPrompt();
+  const payload = buildPayload(pos, neg);
+  document.getElementById('pos-prompt').textContent = pos;
+  document.getElementById('neg-prompt').textContent = neg;
+  document.getElementById('comfy-json').textContent = JSON.stringify(payload.workflow, null, 2);
+}
+
+function update() { renderTemplate(); updatePrompts(); }
+
+// ── Palette / layout / model init ────────────────────────────
+function initPalette() {
+  const g = document.getElementById('pal-grid');
+  PALS.forEach((p,i) => {
+    const d = document.createElement('div');
+    d.className = 'pal-chip'+(i===0?' on':'');
+    d.style.background = `linear-gradient(135deg,${p.bg} 50%,${p.a})`;
+    d.title = p.name;
+    d.onclick = ()=>{
+      S.palette = i;
+      document.querySelectorAll('.pal-chip').forEach((c,j)=>c.classList.toggle('on',j===i));
+      update();
+    };
+    g.appendChild(d);
+  });
+}
+function initLayouts() {
+  const g = document.getElementById('lay-grid');
+  LAYS.forEach((l,i) => {
+    const d = document.createElement('div');
+    d.className = 'lay-chip'+(i===0?' on':'');
+    d.innerHTML = `<span class="lay-icon">${l.icon}</span>${l.name}`;
+    d.onclick = ()=>{
+      S.layout = i;
+      document.querySelectorAll('.lay-chip').forEach((c,j)=>c.classList.toggle('on',j===i));
+      update();
+    };
+    g.appendChild(d);
+  });
+}
+function initTags() {
+  const row = document.getElementById('tag-row');
+  S.tags.forEach(tag => {
+    const t = document.createElement('div');
+    t.className = 'tag';
+    t.textContent = tag;
+    t.onclick = ()=>{
+      t.classList.toggle('on');
+      const cur = document.getElementById('tags').value.split(' ').filter(x=>x);
+      t.classList.contains('on') ? cur.push(tag) : cur.splice(cur.indexOf(tag),1);
+      document.getElementById('tags').value = cur.join(' ');
+      update();
+    };
+    row.appendChild(t);
+  });
+}
+function selectModel(m) {
+  S.model = m;
+  document.getElementById('mc-sdxl').classList.toggle('on', m==='sdxl_turbo');
+  document.getElementById('mc-flux').classList.toggle('on', m==='flux_schnell');
+  update();
+}
+
+// ── Zoom ──────────────────────────────────────────────────────
+function zoom(d) {
+  S.zoom = Math.min(2, Math.max(0.4, S.zoom+d));
+  document.getElementById('ig-post').style.transform = `scale(${S.zoom})`;
+  document.getElementById('z-lbl').textContent = Math.round(S.zoom*100)+'%';
+}
+
+// ── Download ──────────────────────────────────────────────────
+function downloadImage() {
+  if (!S.genImgB64) return;
+  const a = document.createElement('a');
+  a.href = `data:image/png;base64,${S.genImgB64}`;
+  a.download = `wings_ai_instagram_${Date.now()}.png`;
+  a.click();
+}
+
+// ── Reset ─────────────────────────────────────────────────────
+function resetAll() {
+  ['topic','badge','headline','subtext','cta','username','brand','tags','style-hints'].forEach(id => {
+    const el = document.getElementById(id);
+    const defaults = {topic:'Build AI Agents with CrewAI and Python',badge:'AI Tutorial',headline:'Build AI Agents in Python',subtext:'CrewAI + FastAPI in 60 seconds',cta:'Watch Now →',username:'@codingindia',brand:'Coding India',tags:'',hints:''};
+    if(defaults[id] !== undefined) el.value = defaults[id];
+  });
+  document.getElementById('hl-size').value = 32;
+  document.getElementById('hl-val').textContent = '32px';
+  S.palette = 0; S.layout = 0; S.model = 'sdxl_turbo';
+  document.querySelectorAll('.pal-chip').forEach((c,i)=>c.classList.toggle('on',i===0));
+  document.querySelectorAll('.lay-chip').forEach((c,i)=>c.classList.toggle('on',i===0));
+  document.getElementById('mc-sdxl').classList.add('on');
+  document.getElementById('mc-flux').classList.remove('on');
+  document.querySelectorAll('.tag').forEach(t=>t.classList.remove('on'));
+  const gi = document.getElementById('gen-image'); gi.src=''; gi.style.display='none';
+  document.getElementById('dl-btn').style.display='none';
+  document.getElementById('result-img').style.display='none';
+  document.getElementById('no-img-label').style.display='';
+  S.genImgB64 = null;
+  update();
+}
+
+// ── Helpers ───────────────────────────────────────────────────
+function hex2rgba(hex, a) {
+  hex = hex.replace('#','');
+  if(hex.length===3) hex=hex.split('').map(x=>x+x).join('');
+  const r=parseInt(hex.slice(0,2),16), g=parseInt(hex.slice(2,4),16), b=parseInt(hex.slice(4,6),16);
+  return `rgba(${r},${g},${b},${a})`;
+}
+function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
+function blobToB64(blob) { return new Promise(r=>{ const fr=new FileReader(); fr.onload=()=>r(fr.result.split(',')[1]); fr.readAsDataURL(blob); }); }
+function copyText(id) {
+  const t = document.getElementById(id).textContent;
+  navigator.clipboard.writeText(t);
+  toast('Copied!');
+}
+function toast(msg) {
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(()=>t.remove(), 2200);
+}
+
+// ── Boot ──────────────────────────────────────────────────────
+initPalette(); initLayouts(); initTags(); update();
+</script>
+</body>
+</html>

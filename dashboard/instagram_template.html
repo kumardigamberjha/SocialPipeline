@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Instagram Template Builder — Wings of AI</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0f;
+    --surface: #13131a;
+    --surface2: #1c1c27;
+    --border: rgba(255,255,255,0.07);
+    --accent: #7c6aff;
+    --accent2: #ff6a9b;
+    --accent3: #00e5c8;
+    --text: #f0eeff;
+    --muted: #6b6880;
+    --canvas: 1080px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  /* --- Header --- */
+  header {
+    padding: 18px 32px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    background: rgba(10,10,15,0.9);
+    backdrop-filter: blur(12px);
+    position: sticky; top: 0; z-index: 100;
+  }
+  .logo {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    font-size: 18px;
+    letter-spacing: -0.5px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .logo span { -webkit-text-fill-color: rgba(255,255,255,0.35); font-weight: 400; }
+  .header-actions { display: flex; gap: 10px; }
+  .btn {
+    padding: 8px 18px;
+    border-radius: 8px;
+    font-family: 'DM Sans', sans-serif;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: none;
+    transition: all 0.2s;
+  }
+  .btn-ghost {
+    background: var(--surface2);
+    color: var(--muted);
+    border: 1px solid var(--border);
+  }
+  .btn-ghost:hover { color: var(--text); border-color: rgba(255,255,255,0.15); }
+  .btn-primary {
+    background: var(--accent);
+    color: #fff;
+  }
+  .btn-primary:hover { background: #9580ff; transform: translateY(-1px); }
+  .btn-export {
+    background: linear-gradient(135deg, var(--accent3), #00b8a0);
+    color: #001a17;
+    font-weight: 600;
+  }
+  .btn-export:hover { opacity: 0.9; transform: translateY(-1px); }
+
+  /* --- Layout --- */
+  .app {
+    display: grid;
+    grid-template-columns: 320px 1fr 300px;
+    flex: 1;
+    height: calc(100vh - 61px);
+    overflow: hidden;
+  }
+
+  /* --- Sidebar Panels --- */
+  .panel {
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+  .panel:last-child { border-right: none; border-left: 1px solid var(--border); }
+  .panel-title {
+    font-family: 'Syne', sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: var(--muted);
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .section { display: flex; flex-direction: column; gap: 10px; }
+  .section-label {
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--muted);
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+  }
+
+  /* --- Controls --- */
+  .control-row { display: flex; align-items: center; gap: 8px; }
+  .field {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 9px 12px;
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    font-size: 13px;
+    transition: border-color 0.2s;
+    outline: none;
+  }
+  .field:focus { border-color: var(--accent); }
+  textarea.field { resize: none; line-height: 1.5; }
+  select.field { cursor: pointer; }
+  input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+  input[type="color"] {
+    width: 36px; height: 36px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    cursor: pointer;
+    background: var(--surface2);
+    padding: 2px;
+    flex-shrink: 0;
+  }
+
+  /* Palette picker */
+  .palette-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; }
+  .palette-chip {
+    aspect-ratio: 1;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: transform 0.15s, box-shadow 0.15s;
+    border: 2px solid transparent;
+  }
+  .palette-chip:hover { transform: scale(1.08); }
+  .palette-chip.active { border-color: #fff; box-shadow: 0 0 0 2px var(--accent); }
+
+  /* Layout selector */
+  .layout-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+  .layout-chip {
+    aspect-ratio: 4/5;
+    border-radius: 8px;
+    background: var(--surface2);
+    border: 1.5px solid var(--border);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    font-size: 10px;
+    color: var(--muted);
+    transition: all 0.15s;
+    padding: 6px;
+  }
+  .layout-chip:hover { border-color: rgba(124,106,255,0.4); color: var(--text); }
+  .layout-chip.active { border-color: var(--accent); background: rgba(124,106,255,0.1); color: var(--accent); }
+  .layout-icon { font-size: 18px; line-height: 1; }
+
+  /* Tag row */
+  .tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tag {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    padding: 4px 10px;
+    font-size: 11px;
+    color: var(--muted);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .tag:hover, .tag.active { background: rgba(124,106,255,0.15); border-color: var(--accent); color: var(--accent); }
+
+  /* --- Canvas Area --- */
+  .canvas-area {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: #06060a;
+    background-image:
+      linear-gradient(rgba(255,255,255,0.015) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 24px 24px;
+    padding: 32px;
+    overflow: auto;
+    position: relative;
+  }
+  .zoom-controls {
+    position: absolute;
+    bottom: 20px;
+    right: 20px;
+    display: flex;
+    gap: 6px;
+  }
+  .zoom-btn {
+    width: 32px; height: 32px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    color: var(--text);
+    font-size: 16px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s;
+  }
+  .zoom-btn:hover { background: var(--surface2); }
+  #zoom-label {
+    padding: 0 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 12px;
+    color: var(--muted);
+    display: flex; align-items: center;
+    min-width: 54px; justify-content: center;
+  }
+
+  /* --- The Instagram Canvas --- */
+  #ig-canvas {
+    width: 405px; /* 1080/2.666 display size */
+    height: 506px;
+    position: relative;
+    border-radius: 3px;
+    overflow: hidden;
+    box-shadow: 0 32px 80px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,255,255,0.05);
+    transform-origin: center center;
+    transition: transform 0.2s;
+    flex-shrink: 0;
+  }
+
+  /* Canvas layers */
+  .canvas-bg {
+    position: absolute; inset: 0;
+    z-index: 1;
+  }
+  .canvas-image-zone {
+    position: absolute;
+    z-index: 2;
+  }
+  .canvas-overlay {
+    position: absolute; inset: 0;
+    z-index: 3;
+  }
+  .canvas-content {
+    position: absolute; inset: 0;
+    z-index: 4;
+    display: flex;
+    flex-direction: column;
+    padding: 20px;
+  }
+
+  /* Image placeholder */
+  .img-placeholder {
+    background: rgba(255,255,255,0.04);
+    border: 1.5px dashed rgba(255,255,255,0.12);
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    color: rgba(255,255,255,0.25);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .img-placeholder:hover {
+    border-color: rgba(255,255,255,0.25);
+    background: rgba(255,255,255,0.07);
+  }
+  .img-placeholder .icon { font-size: 24px; opacity: 0.5; }
+
+  /* Canvas text elements */
+  .c-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+  }
+  .c-headline {
+    font-family: 'Syne', sans-serif;
+    font-weight: 800;
+    line-height: 1.1;
+    letter-spacing: -0.5px;
+  }
+  .c-subtext {
+    font-family: 'DM Sans', sans-serif;
+    font-weight: 300;
+    line-height: 1.5;
+  }
+  .c-cta {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 16px;
+    border-radius: 8px;
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    font-weight: 500;
+    letter-spacing: 0.5px;
+    cursor: default;
+  }
+  .c-tag-row {
+    display: flex;
+    gap: 5px;
+    flex-wrap: wrap;
+  }
+  .c-hashtag {
+    font-family: 'DM Mono', monospace;
+    font-size: 8px;
+    opacity: 0.55;
+  }
+  .c-username {
+    font-family: 'DM Mono', monospace;
+    font-size: 9px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .c-divider {
+    height: 1px;
+    background: rgba(255,255,255,0.12);
+  }
+  .c-logo-mark {
+    font-family: 'Syne', sans-serif;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    opacity: 0.6;
+  }
+
+  /* --- Right Panel: Prompt Output --- */
+  .prompt-box {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    font-family: 'DM Mono', monospace;
+    font-size: 11px;
+    color: #9effd4;
+    line-height: 1.7;
+    white-space: pre-wrap;
+    word-break: break-word;
+    min-height: 160px;
+  }
+  .prompt-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 8px;
+  }
+  .copy-btn {
+    font-size: 11px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    background: rgba(0,229,200,0.1);
+    border: 1px solid rgba(0,229,200,0.2);
+    color: var(--accent3);
+    cursor: pointer;
+    font-family: 'DM Mono', monospace;
+    transition: all 0.15s;
+  }
+  .copy-btn:hover { background: rgba(0,229,200,0.2); }
+
+  .comfy-payload {
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px;
+    font-family: 'DM Mono', monospace;
+    font-size: 10px;
+    color: var(--muted);
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  /* Scrollbar */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* Animations */
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .canvas-content > * { animation: fadeIn 0.3s ease both; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">Wings of AI <span>/ Instagram Template</span></div>
+  <div class="header-actions">
+    <button class="btn btn-ghost" onclick="resetDefaults()">Reset</button>
+    <button class="btn btn-export" onclick="copyComfyPayload()">Export to ComfyUI</button>
+  </div>
+</header>
+
+<div class="app">
+
+  <!-- LEFT PANEL: Design Controls -->
+  <div class="panel">
+    <div class="panel-title">Design Controls</div>
+
+    <!-- Palette -->
+    <div class="section">
+      <div class="section-label">Color Palette</div>
+      <div class="palette-grid" id="palette-grid"></div>
+    </div>
+
+    <!-- Layout -->
+    <div class="section">
+      <div class="section-label">Layout Style</div>
+      <div class="layout-grid" id="layout-grid"></div>
+    </div>
+
+    <!-- Content -->
+    <div class="section">
+      <div class="section-label">Badge Text</div>
+      <input class="field" id="badge-text" value="AI Tutorial" oninput="render()" maxlength="20">
+    </div>
+    <div class="section">
+      <div class="section-label">Headline</div>
+      <textarea class="field" id="headline" rows="2" oninput="render()">Build AI Agents in Python</textarea>
+    </div>
+    <div class="section">
+      <div class="section-label">Subtext</div>
+      <textarea class="field" id="subtext" rows="2" oninput="render()">CrewAI + FastAPI in 60 seconds</textarea>
+    </div>
+    <div class="section">
+      <div class="section-label">CTA Button</div>
+      <input class="field" id="cta-text" value="Watch Now →" oninput="render()" maxlength="24">
+    </div>
+    <div class="section">
+      <div class="section-label">Username</div>
+      <input class="field" id="username" value="@codingindia" oninput="render()" maxlength="30">
+    </div>
+    <div class="section">
+      <div class="section-label">Channel / Brand</div>
+      <input class="field" id="brand" value="Coding India" oninput="render()" maxlength="24">
+    </div>
+
+    <!-- Hashtags -->
+    <div class="section">
+      <div class="section-label">Hashtag Presets</div>
+      <div class="tag-row" id="hashtag-presets"></div>
+      <input class="field" id="custom-tags" placeholder="#python #ai #crewai" oninput="render()">
+    </div>
+
+    <!-- Typography -->
+    <div class="section">
+      <div class="section-label">Headline Size</div>
+      <input type="range" id="headline-size" min="20" max="48" value="32" oninput="render()">
+    </div>
+    <div class="section">
+      <div class="section-label">Overlay Opacity</div>
+      <input type="range" id="overlay-opacity" min="0" max="90" value="55" oninput="render()">
+    </div>
+  </div>
+
+  <!-- CENTER: Canvas -->
+  <div class="canvas-area">
+    <div id="ig-canvas"></div>
+    <div class="zoom-controls">
+      <button class="zoom-btn" onclick="zoom(-0.1)">−</button>
+      <div id="zoom-label">100%</div>
+      <button class="zoom-btn" onclick="zoom(0.1)">+</button>
+    </div>
+  </div>
+
+  <!-- RIGHT PANEL: Prompt Output -->
+  <div class="panel">
+    <div class="panel-title">ComfyUI Prompt</div>
+
+    <div class="section">
+      <div class="prompt-label">
+        <span class="section-label">Image Gen Prompt</span>
+        <button class="copy-btn" onclick="copyPrompt()">Copy</button>
+      </div>
+      <div class="prompt-box" id="prompt-output"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-label">Negative Prompt</div>
+      <div class="prompt-box" style="color: #ff8fa3; min-height: 80px;" id="neg-prompt-output"></div>
+    </div>
+
+    <div class="section">
+      <div class="prompt-label">
+        <span class="section-label">ComfyUI JSON Payload</span>
+        <button class="copy-btn" onclick="copyComfyPayload()">Copy</button>
+      </div>
+      <div class="comfy-payload" id="comfy-payload"></div>
+    </div>
+
+    <div class="section">
+      <div class="section-label">Canvas Dimensions</div>
+      <div style="font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted); line-height: 2;">
+        Width: <span style="color: var(--accent3)">1080px</span><br>
+        Height: <span style="color: var(--accent3)">1350px</span><br>
+        Ratio: <span style="color: var(--accent3)">4:5 (Instagram)</span><br>
+        Steps: <span style="color: var(--accent3)">4 (SDXL-Turbo)</span><br>
+        CFG: <span style="color: var(--accent3)">1.0</span>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ─── State ──────────────────────────────────────────────
+const state = {
+  palette: 0,
+  layout: 0,
+  zoom: 1,
+  hashtagPresets: ['#python', '#ai', '#automation', '#crewai', '#django', '#react', '#machinelearning', '#n8n']
+};
+
+// ─── Palettes ────────────────────────────────────────────
+const palettes = [
+  { name: 'Void Purple', bg: '#0d0b1e', accent: '#7c6aff', accent2: '#ff6a9b', text: '#f0eeff', badge_bg: 'rgba(124,106,255,0.2)', badge_text: '#b8adff', cta_bg: '#7c6aff', overlay: 'linear-gradient(180deg, transparent 30%, #0d0b1e 100%)' },
+  { name: 'Cyber Teal',  bg: '#011a17', accent: '#00e5c8', accent2: '#00b8a0', text: '#d4fff8', badge_bg: 'rgba(0,229,200,0.15)', badge_text: '#00e5c8', cta_bg: '#00b8a0', overlay: 'linear-gradient(180deg, transparent 30%, #011a17 100%)' },
+  { name: 'Neon Coral',  bg: '#1a0609', accent: '#ff4d6d', accent2: '#ff8fa3', text: '#fff0f2', badge_bg: 'rgba(255,77,109,0.15)', badge_text: '#ff8fa3', cta_bg: '#ff4d6d', overlay: 'linear-gradient(180deg, transparent 30%, #1a0609 100%)' },
+  { name: 'Solar Amber', bg: '#120c00', accent: '#f59e0b', accent2: '#fbbf24', text: '#fffbeb', badge_bg: 'rgba(245,158,11,0.15)', badge_text: '#fbbf24', cta_bg: '#d97706', overlay: 'linear-gradient(180deg, transparent 30%, #120c00 100%)' },
+  { name: 'Ice Blue',    bg: '#010d1a', accent: '#38bdf8', accent2: '#7dd3fc', text: '#e0f4ff', badge_bg: 'rgba(56,189,248,0.15)', badge_text: '#7dd3fc', cta_bg: '#0284c7', overlay: 'linear-gradient(180deg, transparent 30%, #010d1a 100%)' },
+  { name: 'Forest',      bg: '#060f09', accent: '#4ade80', accent2: '#86efac', text: '#ecfdf5', badge_bg: 'rgba(74,222,128,0.15)', badge_text: '#86efac', cta_bg: '#16a34a', overlay: 'linear-gradient(180deg, transparent 30%, #060f09 100%)' },
+  { name: 'Crimson',     bg: '#120000', accent: '#ef4444', accent2: '#fca5a5', text: '#fff1f1', badge_bg: 'rgba(239,68,68,0.15)', badge_text: '#fca5a5', cta_bg: '#dc2626', overlay: 'linear-gradient(180deg, transparent 30%, #120000 100%)' },
+  { name: 'Pure Dark',   bg: '#000000', accent: '#ffffff', accent2: '#aaaaaa', text: '#ffffff', badge_bg: 'rgba(255,255,255,0.1)', badge_text: '#cccccc', cta_bg: '#222222', overlay: 'linear-gradient(180deg, transparent 30%, #000000 100%)' },
+];
+
+// ─── Layouts ─────────────────────────────────────────────
+const layouts = [
+  { id: 'bottom-hero',  name: 'Bottom Hero', icon: '▬' },
+  { id: 'top-title',    name: 'Top Title',   icon: '▀' },
+  { id: 'center-bold',  name: 'Center Bold', icon: '▪' },
+  { id: 'split',        name: 'Split Left',  icon: '◧' },
+  { id: 'minimal',      name: 'Minimal',     icon: '·' },
+  { id: 'full-text',    name: 'Full Text',   icon: '≡' },
+];
+
+// ─── Init palette chips ───────────────────────────────────
+function initPalette() {
+  const g = document.getElementById('palette-grid');
+  palettes.forEach((p, i) => {
+    const d = document.createElement('div');
+    d.className = 'palette-chip' + (i === 0 ? ' active' : '');
+    d.style.background = `linear-gradient(135deg, ${p.bg} 50%, ${p.accent})`;
+    d.title = p.name;
+    d.onclick = () => {
+      state.palette = i;
+      document.querySelectorAll('.palette-chip').forEach((c,j) => c.classList.toggle('active', j===i));
+      render();
+    };
+    g.appendChild(d);
+  });
+}
+
+// ─── Init layout chips ────────────────────────────────────
+function initLayouts() {
+  const g = document.getElementById('layout-grid');
+  layouts.forEach((l, i) => {
+    const d = document.createElement('div');
+    d.className = 'layout-chip' + (i === 0 ? ' active' : '');
+    d.innerHTML = `<span class="layout-icon">${l.icon}</span>${l.name}`;
+    d.onclick = () => {
+      state.layout = i;
+      document.querySelectorAll('.layout-chip').forEach((c,j) => c.classList.toggle('active', j===i));
+      render();
+    };
+    g.appendChild(d);
+  });
+}
+
+// ─── Init hashtag presets ─────────────────────────────────
+function initHashtags() {
+  const row = document.getElementById('hashtag-presets');
+  state.hashtagPresets.forEach(tag => {
+    const t = document.createElement('div');
+    t.className = 'tag';
+    t.textContent = tag;
+    t.onclick = () => {
+      t.classList.toggle('active');
+      const cur = document.getElementById('custom-tags').value;
+      const existing = cur.split(' ').filter(x => x);
+      if (t.classList.contains('active')) {
+        if (!existing.includes(tag)) existing.push(tag);
+      } else {
+        const idx = existing.indexOf(tag);
+        if (idx > -1) existing.splice(idx, 1);
+      }
+      document.getElementById('custom-tags').value = existing.join(' ');
+      render();
+    };
+    row.appendChild(t);
+  });
+}
+
+// ─── Get current values ───────────────────────────────────
+function vals() {
+  return {
+    p: palettes[state.palette],
+    l: layouts[state.layout],
+    badge: document.getElementById('badge-text').value || 'Tutorial',
+    headline: document.getElementById('headline').value || 'Your Headline',
+    subtext: document.getElementById('subtext').value || '',
+    cta: document.getElementById('cta-text').value || 'Watch Now',
+    username: document.getElementById('username').value || '@user',
+    brand: document.getElementById('brand').value || 'Brand',
+    tags: document.getElementById('custom-tags').value || '',
+    hlSize: document.getElementById('headline-size').value,
+    overlayOpacity: document.getElementById('overlay-opacity').value,
+  };
+}
+
+// ─── Build canvas HTML for each layout ───────────────────
+function buildCanvas(v) {
+  const { p, l, badge, headline, subtext, cta, username, brand, tags, hlSize, overlayOpacity } = v;
+  const overlayRgba = hexToRgba(p.bg, overlayOpacity / 100);
+  const tagList = tags.trim().split(/\s+/).filter(t => t).slice(0, 6).join('  ');
+
+  const imgZone = `
+    <div style="position:absolute;inset:0;background:linear-gradient(135deg, ${p.bg} 0%, ${adjustHex(p.bg, 20)} 50%, ${p.bg} 100%);"></div>
+    <div style="position:absolute;inset:0;background-image:radial-gradient(circle at 70% 30%, ${hexToRgba(p.accent, 0.18)} 0%, transparent 60%), radial-gradient(circle at 20% 80%, ${hexToRgba(p.accent2, 0.12)} 0%, transparent 50%);"></div>
+  `;
+
+  const badgeEl = `<div class="c-badge" style="background:${p.badge_bg};color:${p.badge_text};border:1px solid ${hexToRgba(p.accent,0.3)}">
+    <span style="width:5px;height:5px;border-radius:50%;background:${p.accent};display:inline-block;"></span>
+    ${badge}
+  </div>`;
+
+  const headlineEl = `<div class="c-headline" style="font-size:${hlSize}px;color:${p.text}">${headline}</div>`;
+  const subtextEl = subtext ? `<div class="c-subtext" style="font-size:12px;color:${hexToRgba(p.text,0.7)};margin-top:6px">${subtext}</div>` : '';
+  const ctaEl = `<div class="c-cta" style="background:${p.cta_bg};color:${p.text};margin-top:10px">${cta}</div>`;
+  const tagsEl = tagList ? `<div style="margin-top:8px"><span class="c-hashtag" style="color:${hexToRgba(p.text,0.5)}">${tagList}</span></div>` : '';
+  const userEl = `<div class="c-username" style="color:${hexToRgba(p.text,0.55)}"><span style="width:16px;height:16px;border-radius:50%;background:${p.accent};display:inline-block;flex-shrink:0"></span>${username}</div>`;
+  const brandEl = `<div class="c-logo-mark" style="color:${hexToRgba(p.accent,0.7)}">${brand}</div>`;
+  const divider = `<div class="c-divider" style="margin:8px 0"></div>`;
+
+  let contentHTML = '';
+
+  if (l.id === 'bottom-hero') {
+    contentHTML = `
+      <div style="flex:1"></div>
+      <div style="background:linear-gradient(0deg, ${hexToRgba(p.bg,0.97)} 0%, transparent 100%);padding:20px 0 0;display:flex;flex-direction:column;gap:6px">
+        ${badgeEl}
+        ${headlineEl}
+        ${subtextEl}
+        ${ctaEl}
+        ${divider}
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          ${userEl}
+          ${brandEl}
+        </div>
+        ${tagsEl}
+      </div>`;
+  } else if (l.id === 'top-title') {
+    contentHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        ${brandEl}
+        ${userEl}
+      </div>
+      ${divider}
+      <div style="margin-top:8px;display:flex;flex-direction:column;gap:6px">
+        ${badgeEl}
+        ${headlineEl}
+        ${subtextEl}
+      </div>
+      <div style="flex:1"></div>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        ${ctaEl}
+        ${tagsEl}
+      </div>`;
+  } else if (l.id === 'center-bold') {
+    contentHTML = `
+      <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;gap:8px">
+        ${badgeEl}
+        <div class="c-headline" style="font-size:${Math.min(parseInt(hlSize)+6,52)}px;color:${p.text};text-align:center">${headline}</div>
+        ${subtextEl}
+        ${ctaEl}
+      </div>
+      ${divider}
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        ${userEl}
+        ${brandEl}
+      </div>`;
+  } else if (l.id === 'split') {
+    contentHTML = `
+      <div style="display:flex;align-items:flex-start;gap:10px;flex:1">
+        <div style="width:3px;background:${p.accent};border-radius:2px;align-self:stretch;flex-shrink:0"></div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${badgeEl}
+          ${headlineEl}
+          ${subtextEl}
+          ${ctaEl}
+        </div>
+      </div>
+      ${divider}
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        ${userEl}
+        ${brandEl}
+      </div>
+      ${tagsEl}`;
+  } else if (l.id === 'minimal') {
+    contentHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        ${brandEl}
+        ${userEl}
+      </div>
+      <div style="flex:1;display:flex;align-items:center">
+        <div class="c-headline" style="font-size:${hlSize}px;color:${p.text};max-width:85%">${headline}</div>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        ${ctaEl}
+        ${tagsEl}
+      </div>`;
+  } else if (l.id === 'full-text') {
+    contentHTML = `
+      ${badgeEl}
+      <div style="margin-top:8px">${headlineEl}</div>
+      ${divider}
+      <div style="flex:1;display:flex;flex-direction:column;gap:6px">
+        ${subtextEl}
+      </div>
+      ${divider}
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        ${userEl}
+        ${ctaEl}
+      </div>
+      ${tagsEl}`;
+  }
+
+  return `
+    ${imgZone}
+    <div class="canvas-overlay" style="background:${hexToRgba(p.bg, overlayOpacity/100*0.6)}"></div>
+    <div class="canvas-content">${contentHTML}</div>
+  `;
+}
+
+// ─── Render ───────────────────────────────────────────────
+function render() {
+  const v = vals();
+  const canvas = document.getElementById('ig-canvas');
+  canvas.style.background = v.p.bg;
+  canvas.innerHTML = buildCanvas(v);
+  updatePrompt(v);
+}
+
+// ─── Build ComfyUI prompt ─────────────────────────────────
+function updatePrompt(v) {
+  const { p, l, headline, subtext, badge, brand } = v;
+
+  const moodMap = {
+    0: 'cinematic purple neon cyberpunk atmosphere, deep violet and pink bokeh',
+    1: 'teal bioluminescent glow, deep ocean tech atmosphere, cyan light trails',
+    2: 'warm coral sunset gradient, energetic vibrant digital art',
+    3: 'golden amber warm light, sunrise tech editorial, warm bokeh flares',
+    4: 'cool ice blue tech atmosphere, crisp white light, frost glass',
+    5: 'lush forest green digital nature, emerald data streams',
+    6: 'deep crimson dark atmosphere, red glow editorial, dark dramatic lighting',
+    7: 'monochrome black white contrast, high contrast editorial, film noir tech',
+  };
+
+  const layoutStyle = {
+    'bottom-hero':  'wide panoramic background scene with clear lower third space',
+    'top-title':    'portrait vertical composition with open top space for text overlay',
+    'center-bold':  'centered dramatic subject with radial symmetry',
+    'split':        'asymmetric left-weighted composition',
+    'minimal':      'negative space dominant, single focal point, 70% empty space',
+    'full-text':    'abstract texture background, blurred depth of field',
+  };
+
+  const prompt = `(Instagram post background for "${headline}"), ${moodMap[state.palette]}, 4:5 vertical format, ${layoutStyle[l.id]}, professional digital art, no text, no watermarks, ultra sharp 8k, photorealistic lighting, depth of field, ${badge.toLowerCase()} tech theme, trending on artstation, --ar 4:5`;
+
+  const negPrompt = `text, watermark, logo, letters, words, typography, blurry, low quality, pixelated, oversaturated, distorted, ugly, amateur, stock photo look, white background, flat design`;
+
+  document.getElementById('prompt-output').textContent = prompt;
+  document.getElementById('neg-prompt-output').textContent = negPrompt;
+
+  const payload = {
+    prompt: {
+      "3": { class_type: "KSampler", inputs: { seed: Math.floor(Math.random()*999999), steps: 4, cfg: 1.0, sampler_name: "euler_ancestral", scheduler: "karras", denoise: 1.0, model: ["4",0], positive: ["6",0], negative: ["7",0], latent_image: ["5",0] } },
+      "4": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "sdxl_turbo_fp16.safetensors" } },
+      "5": { class_type: "EmptyLatentImage", inputs: { width: 1080, height: 1350, batch_size: 1 } },
+      "6": { class_type: "CLIPTextEncode", inputs: { text: prompt, clip: ["4",1] } },
+      "7": { class_type: "CLIPTextEncode", inputs: { text: negPrompt, clip: ["4",1] } },
+      "8": { class_type: "VAEDecode", inputs: { samples: ["3",0], vae: ["4",2] } },
+      "9": { class_type: "SaveImage", inputs: { images: ["8",0], filename_prefix: `wings_ai_instagram_${Date.now()}` } }
+    }
+  };
+
+  document.getElementById('comfy-payload').textContent = JSON.stringify(payload, null, 2);
+}
+
+// ─── Copy helpers ─────────────────────────────────────────
+function copyPrompt() {
+  navigator.clipboard.writeText(document.getElementById('prompt-output').textContent);
+  showToast('Prompt copied!');
+}
+function copyComfyPayload() {
+  navigator.clipboard.writeText(document.getElementById('comfy-payload').textContent);
+  showToast('ComfyUI payload copied!');
+}
+
+function showToast(msg) {
+  const t = document.createElement('div');
+  t.textContent = msg;
+  Object.assign(t.style, {
+    position:'fixed', bottom:'28px', left:'50%', transform:'translateX(-50%)',
+    background:'#1c1c27', border:'1px solid rgba(0,229,200,0.3)',
+    color:'#00e5c8', padding:'10px 20px', borderRadius:'10px',
+    fontFamily:"'DM Mono', monospace", fontSize:'12px',
+    zIndex:'9999', boxShadow:'0 8px 24px rgba(0,0,0,0.5)',
+    animation:'fadeIn 0.2s ease'
+  });
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2000);
+}
+
+// ─── Zoom ─────────────────────────────────────────────────
+function zoom(delta) {
+  state.zoom = Math.min(2, Math.max(0.4, state.zoom + delta));
+  document.getElementById('ig-canvas').style.transform = `scale(${state.zoom})`;
+  document.getElementById('zoom-label').textContent = Math.round(state.zoom * 100) + '%';
+}
+
+// ─── Reset ────────────────────────────────────────────────
+function resetDefaults() {
+  document.getElementById('badge-text').value = 'AI Tutorial';
+  document.getElementById('headline').value = 'Build AI Agents in Python';
+  document.getElementById('subtext').value = 'CrewAI + FastAPI in 60 seconds';
+  document.getElementById('cta-text').value = 'Watch Now →';
+  document.getElementById('username').value = '@codingindia';
+  document.getElementById('brand').value = 'Coding India';
+  document.getElementById('custom-tags').value = '';
+  document.getElementById('headline-size').value = 32;
+  document.getElementById('overlay-opacity').value = 55;
+  document.querySelectorAll('.tag').forEach(t => t.classList.remove('active'));
+  state.palette = 0; state.layout = 0;
+  document.querySelectorAll('.palette-chip').forEach((c,i) => c.classList.toggle('active', i===0));
+  document.querySelectorAll('.layout-chip').forEach((c,i) => c.classList.toggle('active', i===0));
+  render();
+}
+
+// ─── Helpers ──────────────────────────────────────────────
+function hexToRgba(hex, alpha) {
+  hex = hex.replace('#','');
+  if (hex.length === 3) hex = hex.split('').map(x=>x+x).join('');
+  const r = parseInt(hex.slice(0,2),16), g = parseInt(hex.slice(2,4),16), b = parseInt(hex.slice(4,6),16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+function adjustHex(hex, amount) {
+  hex = hex.replace('#','');
+  if (hex.length === 3) hex = hex.split('').map(x=>x+x).join('');
+  const r = Math.min(255, parseInt(hex.slice(0,2),16)+amount);
+  const g = Math.min(255, parseInt(hex.slice(2,4),16)+amount);
+  const b = Math.min(255, parseInt(hex.slice(4,6),16)+amount);
+  return `#${r.toString(16).padStart(2,'0')}${g.toString(16).padStart(2,'0')}${b.toString(16).padStart(2,'0')}`;
+}
+
+// ─── Boot ─────────────────────────────────────────────────
+initPalette();
+initLayouts();
+initHashtags();
+render();
+</script>
+</body>
+</html>
