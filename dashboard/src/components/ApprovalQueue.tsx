@@ -16,7 +16,7 @@ import {
   PenTool,
 } from "lucide-react";
 
-interface StreamedTask {
+export interface StreamedTask {
   task: string;
   output: string;
 }
@@ -77,7 +77,7 @@ export default function ApprovalQueue({
     const endpoint = isAuto ? `auto-generate/${clientId}` : `generate/${clientId}`;
     
     // Support both ws:// and wss:// dynamically based on the env string
-    const baseUrl = process.env.NEXT_PUBLIC_BACKEND_API || "http://127.0.0.1:8000";
+    const baseUrl = process.env.NEXT_PUBLIC_BACKEND_API || "http://localhost:8000";
     const wsProtocol = baseUrl.startsWith("https") ? "wss" : "ws";
     const wsHost = baseUrl.replace(/^https?:\/\//, "");
     const wsUrl = `${wsProtocol}://${wsHost}/api/ws/${endpoint}`;
@@ -89,7 +89,7 @@ export default function ApprovalQueue({
       console.log(`WebSocket connected. Mode: ${isAuto ? "Auto" : "Manual"}`);
       // Send the payload. The auto-generate endpoint ignores the topic field, 
       // but we send it for safety to prevent JSON parse errors.
-      ws.send(JSON.stringify({ topic: isAuto ? "auto" : topic, provider: "nvidia" }));
+      ws.send(JSON.stringify({ topic: isAuto ? "auto" : topic, provider: "ollama" }));
     };
 
     ws.onmessage = (event) => {
@@ -128,7 +128,7 @@ export default function ApprovalQueue({
     setGeneratedImages([]);
     
     try {
-      const baseUrl = process.env.NEXT_PUBLIC_BACKEND_API || "http://127.0.0.1:8000";
+      const baseUrl = process.env.NEXT_PUBLIC_BACKEND_API || "http://localhost:8000";
       const res = await fetch(`${baseUrl}/api/instagram/generate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

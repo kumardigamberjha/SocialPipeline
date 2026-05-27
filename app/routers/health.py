@@ -23,6 +23,6 @@ async def health_check(
         status="healthy",
         app_name=settings.app_name,
         version=settings.app_version,
-        providers=["nvidia", "groq"],
+        providers=["nvidia", "groq", "ollama"],
         agents_available=10,
     )

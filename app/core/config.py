@@ -16,11 +16,12 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         case_sensitive=False,
+        extra="ignore",
     )
 
     # ── API Keys ──────────────────────────────────────────────
-    nvidia_api_key: str
-    groq_api_key: str
+    nvidia_api_key: str = ""
+    groq_api_key: str = ""
 
     # ── LLM Defaults ─────────────────────────────────────────
     default_provider: str = "nvidia"
@@ -42,7 +43,7 @@ class Settings(BaseSettings):
     
     # ── Additional API Keys ───────────────────────────────────
     openai_api_key: str = ""
-    # groq and nvidia already present
+    openai_api_base: str = ""
 
 
 

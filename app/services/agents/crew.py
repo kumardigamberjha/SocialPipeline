@@ -12,7 +12,7 @@ from crewai import Crew
 from app.agents import create_all_agents
 from app.core.config import Settings
 from app.core.llm import build_llm
-from app.tasks import create_all_tasks
+from app.task_factories import create_all_tasks
 
 logger = logging.getLogger(__name__)
 

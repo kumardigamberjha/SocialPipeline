@@ -19,8 +19,8 @@ class GenerateRequest(BaseModel):
         description="The content topic to generate around.",
     )
     provider: str = Field(
-        default="nvidia",
-        description="LLM provider to use. One of: nvidia, groq.",
+        default="ollama",
+        description="LLM provider to use. One of: nvidia, groq, ollama.",
     )
 
 

@@ -30,8 +30,13 @@ async def lifespan(app: FastAPI):
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     logger.info("  %s  v%s", settings.app_name, settings.app_version)
     logger.info("  Default LLM provider : %s", settings.default_provider)
+    logger.info("  Redis                : %s", settings.redis_url)
     logger.info("  Log level            : %s", settings.log_level)
     logger.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    # Initialize SQLite tables
+    from app.db.database import init_db
+    init_db()
 
     yield  # ── application is running ──
 
@@ -57,22 +62,26 @@ def create_app() -> FastAPI:
         redoc_url="/redoc",
     )
 
+    # ── Rate Limiting ────────────────────────────────────────────────────
+    from app.middleware.rate_limit import setup_rate_limiter
+    setup_rate_limiter(application)
+
     # ── CORS ─────────────────────────────────────────────────────────────
     origins = [o.strip() for o in settings.cors_origins.split(",")]
     if "*" in origins:
         origins.remove("*")
-    
+
     # Always include localhost/127.0.0.1 for development
     dev_origins = [
-        "http://localhost:3000", 
-        "http://127.0.0.1:3000", 
-        "http://localhost:3001", 
-        "http://127.0.0.1:3001"
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3001",
     ]
     for origin in dev_origins:
         if origin not in origins:
             origins.append(origin)
-            
+
     application.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
@@ -82,7 +91,7 @@ def create_app() -> FastAPI:
     )
 
     # ── Routers ──────────────────────────────────────────────────────────
-    from app.routers import ws, auth, rag, memory, runs
+    from app.routers import ws, auth, rag, memory, runs, billing
     application.include_router(health.router)
     application.include_router(generate.router)
     application.include_router(ws.router)
@@ -91,6 +100,7 @@ def create_app() -> FastAPI:
     application.include_router(memory.router)
     application.include_router(runs.router)
     application.include_router(instagram.router)
+    application.include_router(billing.router)
 
     return application
 

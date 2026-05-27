@@ -3,34 +3,46 @@ from dotenv import load_dotenv
 from crewai import Agent, Task, Crew, LLM
 
 # =========================
-# ENV
+# ENV & OPENAI BYPASS
 # =========================
 
+# Load env variables (check root first, then app/.env)
 load_dotenv()
+load_dotenv(dotenv_path="app/.env")
 
-NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Force-sever the default OpenAI LLM fallback
+os.environ["OPENAI_API_KEY"] = "sk-no-openai-intended"
 
-if not NVIDIA_API_KEY:
-    raise RuntimeError("Missing NVIDIA_API_KEY")
-
-if not GROQ_API_KEY:
-    raise RuntimeError("Missing GROQ_API_KEY")
-
+# OLLAMA CONFIGURATION
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "ollama/mistral:latest")
+OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 
 # =========================
 # LLM BUILDER (RUNTIME SAFE)
 # =========================
 
-def build_llm(provider="nvidia"):
+def build_llm(provider="ollama"):
+    provider = provider.lower().strip()
+
+    if provider == "ollama":
+        print(f"[SYSTEM] Using local Ollama: {OLLAMA_MODEL} at {OLLAMA_API_BASE}")
+        return LLM(
+            model=OLLAMA_MODEL,
+            base_url=OLLAMA_API_BASE,
+            api_key="ollama", # dummy key to satisfy LiteLLM/OpenAI validation issues
+            temperature=0.0,
+            timeout=120,
+        )
 
     if provider == "nvidia":
+        NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+        if not NVIDIA_API_KEY:
+            raise RuntimeError("Missing NVIDIA_API_KEY")
         print("[SYSTEM] Using NVIDIA")
-
         return LLM(
             model="qwen/qwen3.5-122b-a10b",
             api_key=NVIDIA_API_KEY,
-            api_base="https://integrate.api.nvidia.com/v1",
+            base_url="https://integrate.api.nvidia.com/v1",
             temperature=0.6,
             top_p=0.9,
             max_tokens=2048,
@@ -38,19 +50,24 @@ def build_llm(provider="nvidia"):
         )
 
     if provider == "groq":
+        GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+        if not GROQ_API_KEY:
+            raise RuntimeError("Missing GROQ_API_KEY")
         print("[SYSTEM] Using GROQ")
-
         return LLM(
             model="llama-3.3-70b-versatile",
             api_key=GROQ_API_KEY,
-            api_base="https://api.groq.com/openai/v1",
+            base_url="https://api.groq.com/openai/v1",
             temperature=0.7,
             max_tokens=2048,
             timeout=60,
         )
 
+    raise ValueError(f"Unknown provider: {provider}")
 
-llm = build_llm("nvidia")
+# Default LLM to Ollama
+llm = build_llm("ollama")
+
 
 
 # =========================
@@ -308,29 +325,25 @@ crew = Crew(
     ],
     process="sequential",
     verbose=True,
+    memory=False, # Disable memory to prevent any default OpenAI embedding models from being called
+    llm=llm,      # Explicitly set Crew-level LLM to bypass OpenAI fallback
 )
 
 
 # =========================
-# RUN WITH FALLBACK
+# RUN SYSTEM
 # =========================
 
 try:
 
-    print("\n[SYSTEM] RUNNING NVIDIA\n")
+    print(f"\n[SYSTEM] RUNNING OLLAMA ({OLLAMA_MODEL})\n")
 
     result = crew.kickoff()
 
 except Exception as e:
 
-    print("\n[SYSTEM] NVIDIA FAILED → SWITCHING TO GROQ\n")
-
-    llm = build_llm("groq")
-
-    for a in crew.agents:
-        a.llm = llm
-
-    result = crew.kickoff()
+    print(f"\n[SYSTEM] OLLAMA PIPELINE RUN FAILED: {e}\n")
+    raise e
 
 
 print("\nFINAL RESULT\n")

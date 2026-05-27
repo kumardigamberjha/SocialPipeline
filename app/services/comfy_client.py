@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Optional
 import websockets
 
-COMFY_HOST = "127.0.0.1"
-COMFY_PORT = 8188
+COMFY_HOST = os.getenv("COMFY_HOST", "127.0.0.1")
+COMFY_PORT = int(os.getenv("COMFY_PORT", "8188"))
 COMFY_URL  = f"http://{COMFY_HOST}:{COMFY_PORT}"
 WS_URL     = f"ws://{COMFY_HOST}:{COMFY_PORT}/ws"
 
@@ -260,7 +260,7 @@ class ComfyClient:
     def _get_model_status(self, model_name: str) -> tuple[bool, str]:
         """Check if model exists and has expected minimum size (~3GB for SDXL Turbo)."""
         # Resolve home path in case of ~ usage
-        comfy_home = Path("/home/digamber-jha/ComfyUI")
+        comfy_home = Path("/media/digamber-jha/D/ComfyUI")
         ckpt_path = comfy_home / "models" / "checkpoints" / model_name
         
         if not ckpt_path.exists():

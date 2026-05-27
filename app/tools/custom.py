@@ -6,43 +6,69 @@ import contextlib
 import urllib.parse
 from crewai.tools import tool
 
-# ── 1. Web Search Tool ─────────────────────────────────────────
-try:
-    from duckduckgo_search import DDGS
-    has_ddgs = True
-except ImportError:
-    has_ddgs = False
+from app.tools.research_engine import run_multi_source_search
 
-@tool("web_search")
-def web_search_tool(query: str, max_results: int = 5) -> str:
-    """Useful to search the internet about a given tech/AI topic and return relevant results."""
-    # 1. Primary approach for Tech/AI content: Hacker News Algolia Search (100% Free & Reliable)
+# ── 1. Web Search Tool ─────────────────────────────────────────
+# Uses the multi-source ResearchEngine (HN, DuckDuckGo, Reddit, DEV.to,
+# ArXiv, GitHub Trending, Product Hunt) instead of Hacker News alone.
+
+def run_web_search(query: str, max_results: int = 5) -> str:
+    """
+    Performs a multi-source web search using the ResearchEngine.
+
+    Searches in parallel:
+        - Hacker News Algolia
+        - DuckDuckGo News
+        - Reddit (ML, AI, programming, webdev, LocalLLaMA)
+        - DEV.to
+        - ArXiv
+        - GitHub Trending
+        - Product Hunt
+
+    Results are deduplicated, scored by recency + engagement + source authority,
+    and the top 15 are returned as formatted text.
+    """
     try:
-        import requests
-        import urllib.parse
-        
-        # Clean query by stripping generic instructions that confuse keyword search
+        result = run_multi_source_search(query, max_results_per_source=max_results)
+        if result and "no results" not in result.lower():
+            return result
+    except Exception as e:
+        # Fall back to legacy single-source search if engine fails entirely
+        return _legacy_web_search(query, max_results)
+
+    return _legacy_web_search(query, max_results)
+
+
+def _legacy_web_search(query: str, max_results: int = 5) -> str:
+    """
+    Legacy single-source fallback: Hacker News Algolia + DuckDuckGo.
+    Only used if the multi-source engine fails completely.
+    """
+    # 1. Hacker News Algolia
+    try:
         clean_query = query.lower()
         for phrase in ["latest", "viral", "news", "today", "trends"]:
             clean_query = clean_query.replace(phrase, "").strip()
         if not clean_query:
-            clean_query = "AI" # Fallback literal
-            
+            clean_query = "AI"
+
         encoded = urllib.parse.quote(clean_query)
         url = f"https://hn.algolia.com/api/v1/search_by_date?query={encoded}&tags=story&hitsPerPage={max_results * 2}"
-        
+
         response = requests.get(url, timeout=10)
         if response.status_code == 200:
             hits = response.json().get("hits", [])
             if hits:
-                results = "We searched Hacker News (the premier tech aggregator) and found this breaking news:\n\n"
+                results = "Hacker News results:\n\n"
                 count = 0
                 for hit in hits:
-                    if count >= max_results: break
+                    if count >= max_results:
+                        break
                     title = hit.get("title", "")
                     story_url = hit.get("url", "") or f"https://news.ycombinator.com/item?id={hit.get('objectID')}"
                     points = hit.get("points", 0)
-                    if not title: continue
+                    if not title:
+                        continue
                     results += f"Title: {title}\nURL: {story_url}\nUpvotes: {points}\n\n"
                     count += 1
                 if count > 0:
@@ -50,9 +76,12 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
     except Exception:
         pass
 
-    # 2. Fallback to DDGS if Hacker News fails
-    if not has_ddgs:
+    # 2. DuckDuckGo fallback
+    try:
+        from duckduckgo_search import DDGS
+    except ImportError:
         return "Search failed: DuckDuckGo module not installed and primary API failed."
+
     try:
         results = ""
         with DDGS() as ddgs:
@@ -61,6 +90,12 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
         return results if results else "No results found across all search endpoints."
     except Exception as e:
         return f"Search completely failed: {e}"
+
+
+@tool("web_search")
+def web_search_tool(query: str, max_results: int = 5) -> str:
+    """Useful to search the internet about a given tech/AI topic and return relevant results from multiple sources (Hacker News, Reddit, DEV.to, ArXiv, GitHub Trending, Product Hunt, DuckDuckGo)."""
+    return run_web_search(query, max_results)
 
 # ── 2. File Reader Tool ─────────────────────────────────────────
 @tool("read_local_file")
@@ -87,17 +122,19 @@ def code_execution_tool(code: str) -> str:
     except Exception as e:
         return f"Error executing code: {e}"
 
-# ── 4. DB Query Tool ──────────────────────────────────────────
 @tool("query_database")
 def db_query_tool(query: str) -> str:
-    """Query data from the Postgres/Supabase database if configured."""
-    from app.db.supabase import get_supabase
-    client = get_supabase()
-    if not client:
-        return "Database is not configured yet."
-    # Since direct SQL execution is not straightforward with the Supabase client,
-    # and agents might guess SQL, we wrap table selections here, or we return a warning.
-    return "DB execution requires specific table RPCs. This tool is a placeholder for safety."
+    """Query data from the local SQLite database."""
+    from app.db.database import get_db
+    try:
+        db = get_db()
+        # Restrict queries for safety if needed, but for local DevRel it's fine
+        cursor = db.execute(query)
+        rows = cursor.fetchall()
+        import json
+        return json.dumps([dict(row) for row in rows], default=str, indent=2)
+    except Exception as e:
+        return f"Database query failed: {e}"
 
 # ── 5. API Interaction Tool ───────────────────────────────────
 @tool("api_request")
@@ -119,7 +156,7 @@ def generate_instagram_image_tool(topic: str, palette: str = "void_purple", layo
     """Generate an Instagram image using ComfyUI. Provide a topic, palette (e.g. void_purple, cyber_teal), layout (e.g. bottom_hero, top_title), model (sdxl_turbo or flux_schnell), and style_hints."""
     import asyncio
     from app.services.comfy_client import ComfyClient
-    
+
     async def _generate():
         comfy = ComfyClient()
         if not await comfy.health_check():
@@ -140,7 +177,7 @@ def generate_instagram_image_tool(topic: str, palette: str = "void_purple", layo
             return f"Successfully generated {num_imgs} Instagram image(s) for topic '{topic}' in {result.get('duration_s')}s:\n\n" + "\n\n".join(images_markup)
         except Exception as e:
             return f"Error generating image: {str(e)}"
-    
+
     try:
         return asyncio.run(_generate())
     except RuntimeError:

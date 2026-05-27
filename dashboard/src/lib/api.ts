@@ -2,7 +2,7 @@
  * Simple API client for the Wings of AI backend.
  */
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_API || "http://127.0.0.1:8000";
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_API || "http://localhost:8000";
 const API_BASE_URL = `${BACKEND_URL}/api`;
 
 export interface HealthResponse {
@@ -28,7 +28,7 @@ export const api = {
     return response.json();
   },
 
-  async generateContent(topic: string, provider: string = "nvidia"): Promise<GenerateResponse> {
+  async generateContent(topic: string, provider: string = "ollama"): Promise<GenerateResponse> {
     const response = await fetch(`${API_BASE_URL}/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

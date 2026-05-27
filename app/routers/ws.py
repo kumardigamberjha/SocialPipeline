@@ -1,15 +1,32 @@
+import asyncio
 import json
 import logging
-import asyncio
-import uuid
+import jwt
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
-from app.ws_manager import manager
 from app.config import Settings, get_settings
-from app.crew import run_pipeline_streaming
+from app.db import queries
+from app.ws_manager import manager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ws", tags=["websocket"])
+
+DUMMY_USER_ID = "00000000-0000-0000-0000-000000000000"
+
+
+def _extract_user_id(websocket: WebSocket, settings: Settings) -> str:
+    """Extract user_id from the ?token= query parameter via JWT verification."""
+    token = websocket.query_params.get("token")
+    if token:
+        try:
+            payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
+            user_id = payload.get("sub")
+            if user_id:
+                return user_id
+        except jwt.PyJWTError:
+            logger.warning("Invalid or expired JWT token provided on WebSocket connect")
+    return DUMMY_USER_ID
+
 
 @router.websocket("/generate/{client_id}")
 async def websocket_endpoint(
@@ -25,24 +42,45 @@ async def websocket_endpoint(
                 payload = json.loads(data)
                 topic = payload.get("topic")
                 provider = payload.get("provider", settings.default_provider)
-                
+
                 if not topic:
-                    await manager.send_json({"error": "Topic is required"}, client_id)
+                    await manager.send_json({"type": "error", "message": "Topic is required"}, client_id)
                     continue
 
-                run_id = str(uuid.uuid4())
-                # Run the pipeline in an async background task to avoid blocking the WS loop
+                user_id = _extract_user_id(websocket, settings)
+
+                from app.services.usage import check_and_increment
+                allowed, msg = check_and_increment(user_id)
+                if not allowed:
+                    await manager.send_json({"type": "error", "message": msg}, client_id)
+                    continue
+
+                # Create run in SQLite
+                run = queries.create_run(user_id, topic, provider)
+                run_id = run['id']
+
+                # Dispatch pipeline natively via asyncio.create_task
+                from app.crew import run_pipeline_streaming
                 asyncio.create_task(
-                    run_pipeline_streaming(topic, settings, provider, client_id, run_id)
+                    run_pipeline_streaming(
+                        topic=topic,
+                        settings=settings,
+                        provider=provider,
+                        client_id=client_id,
+                        run_id=run_id,
+                        auto_research=False
+                    )
                 )
+
             except json.JSONDecodeError:
-                await manager.send_json({"error": "Invalid JSON"}, client_id)
+                await manager.send_json({"type": "error", "message": "Invalid JSON"}, client_id)
     except WebSocketDisconnect:
         manager.disconnect(client_id)
-        logger.info(f"Client {client_id} disconnected")
+        logger.info("Client %s disconnected", client_id)
     except Exception as e:
-        logger.error(f"WebSocket Error: {e}")
+        logger.error("WebSocket error: %s", e)
         manager.disconnect(client_id)
+
 
 @router.websocket("/auto-generate/{client_id}")
 async def auto_generate_endpoint(
@@ -50,9 +88,6 @@ async def auto_generate_endpoint(
     client_id: str,
     settings: Settings = Depends(get_settings),
 ):
-    """
-    Automatically research the latest AI trends without requiring an explicit user topic.
-    """
     await manager.connect(client_id, websocket)
     try:
         while True:
@@ -60,27 +95,52 @@ async def auto_generate_endpoint(
             try:
                 payload = json.loads(data)
                 provider = payload.get("provider", settings.default_provider)
-                
-                # We do not pull 'topic' from the payload.
-                # Instead, we inject the dynamic meta-instruction.
-                auto_topic = (
-                    "LATEST AI TRENDS: Use your web search tool to find the most breaking, viral AI news from today. "
-                    "CRITICAL: When using the web_search tool, do NOT query this entire sentence. "
-                    "Use short, specific keywords like 'latest AI trends today' or 'viral tech news 2024'. "
-                    "Pick the absolute #1 most viral AI topic right now, perform a deep trend analysis, "
-                    "and base every single subsequent task output entirely on that specific topic."
-                )
-                
-                run_id = str(uuid.uuid4())
-                # Run the pipeline in an async background task
+
+                user_id = _extract_user_id(websocket, settings)
+
+                from app.services.usage import check_and_increment
+                allowed, msg = check_and_increment(user_id)
+                if not allowed:
+                    await manager.send_json({"type": "error", "message": msg}, client_id)
+                    continue
+
+                if provider == "ollama":
+                    auto_topic = (
+                        "LATEST AI TRENDS: Select one of the absolute most trending AI topics today "
+                        "(e.g., local LLMs, AI agents, RAG, or new reasoning models). Perform a deep trend analysis "
+                        "on it and base every single subsequent task output entirely on that specific topic."
+                    )
+                else:
+                    auto_topic = (
+                        "LATEST AI TRENDS: Use your web search tool to find the most breaking, viral AI news from today. "
+                        "CRITICAL: When using the web_search tool, do NOT query this entire sentence. "
+                        "Use short, specific keywords like 'latest AI trends today' or 'viral tech news 2024'. "
+                        "Pick the absolute #1 most viral AI topic right now, perform a deep trend analysis, "
+                        "and base every single subsequent task output entirely on that specific topic."
+                    )
+
+                # Create run in SQLite
+                run = queries.create_run(user_id, auto_topic, provider)
+                run_id = run['id']
+
+                # Dispatch pipeline natively via asyncio.create_task
+                from app.crew import run_pipeline_streaming
                 asyncio.create_task(
-                    run_pipeline_streaming(auto_topic, settings, provider, client_id, run_id)
+                    run_pipeline_streaming(
+                        topic=auto_topic,
+                        settings=settings,
+                        provider=provider,
+                        client_id=client_id,
+                        run_id=run_id,
+                        auto_research=True
+                    )
                 )
+
             except json.JSONDecodeError:
-                await manager.send_json({"error": "Invalid JSON"}, client_id)
+                await manager.send_json({"type": "error", "message": "Invalid JSON"}, client_id)
     except WebSocketDisconnect:
         manager.disconnect(client_id)
-        logger.info(f"Auto-generate Client {client_id} disconnected")
+        logger.info("Auto-generate client %s disconnected", client_id)
     except Exception as e:
-        logger.error(f"Auto-generate WebSocket Error: {e}")
+        logger.error("Auto-generate WebSocket error: %s", e)
         manager.disconnect(client_id)

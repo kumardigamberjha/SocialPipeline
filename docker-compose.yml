@@ -1,0 +1,158 @@
+# =============================================================================
+# Wings of AI — Full Stack Docker Compose
+# =============================================================================
+# Start:   docker compose up -d
+# Logs:    docker compose logs -f api worker
+# Scale:   docker compose up -d --scale api=3
+# Stop:    docker compose down
+# =============================================================================
+
+services:
+  # ── Redis (Message Broker + Result Backend) ─────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # ── FastAPI Backend ─────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    env_file:
+      - app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - COMFY_HOST=host.docker.internal
+      - COMFY_PORT=8188
+      - OPENAI_API_KEY=sk-no-openai-intended
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - sqlite_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    restart: unless-stopped
+
+  # ── Celery Worker (Default Queue) ───────────────────────────────────────
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A app.celery_app worker -Q celery --concurrency=4 --loglevel=info
+    env_file:
+      - app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - COMFY_HOST=host.docker.internal
+      - COMFY_PORT=8188
+      - OPENAI_API_KEY=sk-no-openai-intended
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - sqlite_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Celery GPU Worker (gpu_queue) ───────────────────────────────────────
+  gpu_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A app.celery_app worker -Q gpu_queue --concurrency=1 --loglevel=info
+    env_file:
+      - app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - COMFY_HOST=host.docker.internal
+      - COMFY_PORT=8188
+      - OPENAI_API_KEY=sk-no-openai-intended
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - sqlite_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ── ComfyUI ─────────────────────────────────────────────────────────────
+  # Disabled — using local ComfyUI at host.docker.internal:8188
+  # comfyui:
+  #   image: ghcr.io/ai-dock/comfyui:latest
+  #   ports:
+  #     - "8188:8188"
+  #   environment:
+  #     - CLI_ARGS=--listen 0.0.0.0 --port 8188
+  #   volumes:
+  #     - comfyui_models:/opt/ComfyUI/models
+  #     - comfyui_output:/opt/ComfyUI/output
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: 1
+  #             capabilities: [gpu]
+  #   restart: unless-stopped
+
+  # ── Flower (Celery Monitoring) ──────────────────────────────────────────
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A app.celery_app flower --port=5555 --broker_api=redis://redis:6379/0
+    ports:
+      - "5555:5555"
+    env_file:
+      - app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Next.js Dashboard ──────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_BACKEND_API=http://localhost:8000
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  sqlite_data:
