@@ -23,7 +23,10 @@ def _build_prompt(topic: str) -> str:
     return (
         f"Topic: {topic}\n\n"
         "Create high-quality developer content.\n"
-        "Focus on AI, Python, automation, and real-world use."
+        "Focus on AI, Python, automation, and real-world use.\n\n"
+        "CRITICAL INSTRUCTION: You are operating in a sequential pipeline. You will see previous outputs in your context.\n"
+        "IGNORE any previous outputs. DO NOT copy, summarize, or repeat them (especially the YouTube script).\n"
+        "You MUST generate entirely NEW content tailored strictly to your specific role and task description."
     )
 
 
@@ -35,6 +38,7 @@ def create_trend_task(agent: Agent, prompt: str) -> Task:
         description=f"{prompt}\n\nFind 5 viral topics related to this theme.",
         expected_output="A list of 5 trending, viral developer topics with brief justifications.",
         agent=agent,
+        context=[],
     )
 
 
@@ -58,6 +62,7 @@ def create_script_task(agent: Agent, prompt: str) -> Task:
             "energy markers, pattern interrupts, and a value-stack CTA close."
         ),
         agent=agent,
+        context=[],
     )
 
 
@@ -66,6 +71,7 @@ def create_seo_task(agent: Agent, prompt: str) -> Task:
         description=f"{prompt}\n\nGenerate YouTube SEO elements.",
         expected_output="YouTube SEO elements: an optimized title, structured description, and 10+ relevant tags.",
         agent=agent,
+        context=[],
     )
 
 
@@ -74,6 +80,7 @@ def create_thumbnail_task(agent: Agent, prompt: str) -> Task:
         description=f"{prompt}\n\nCreate a thumbnail concept.",
         expected_output="Creative and clickable thumbnail design ideas aimed at high CTR.",
         agent=agent,
+        context=[],
     )
 
 
@@ -82,6 +89,7 @@ def create_shorts_task(agent: Agent, prompt: str) -> Task:
         description=f"{prompt}\n\nWrite a YouTube Shorts script.",
         expected_output="A fast-paced script for a short-form video under 60 seconds.",
         agent=agent,
+        context=[],
     )
 
 
@@ -105,6 +113,7 @@ def create_linkedin_task(agent: Agent, prompt: str) -> Task:
             "open-ended closing question, max 3 lowercase hashtags."
         ),
         agent=agent,
+        context=[],
     )
 
 
@@ -129,6 +138,7 @@ def create_twitter_task(agent: Agent, prompt: str) -> Task:
             "inline code snippets, personal story in tweet 9, soft CTA in tweet 10."
         ),
         agent=agent,
+        context=[],
     )
 
 
@@ -153,6 +163,7 @@ def create_blog_task(agent: Agent, prompt: str) -> Task:
             "real-world analogies, 'What to Build Next' closing section."
         ),
         agent=agent,
+        context=[],
     )
 
 
@@ -161,6 +172,7 @@ def create_course_task(agent: Agent, prompt: str) -> Task:
         description=f"{prompt}\n\nCreate a course outline.",
         expected_output="A structured programming course outline with modules, lessons, and learning objectives.",
         agent=agent,
+        context=[],
     )
 
 
@@ -169,6 +181,7 @@ def create_idea_task(agent: Agent, prompt: str) -> Task:
         description=f"{prompt}\n\nGenerate 10 creative content ideas.",
         expected_output="A list of 10 creative and viral content ideas related to the topic.",
         agent=agent,
+        context=[],
     )
 
 
@@ -177,6 +190,7 @@ def create_instagram_image_task(agent: Agent, prompt: str) -> Task:
         description=f"{prompt}\n\nChoose the best artistic parameters (palette, layout, style_hints) and generate an Instagram image using your tool.",
         expected_output="Confirmation of the generated Instagram image along with the chosen palette, layout, and styles.",
         agent=agent,
+        context=[],
     )
 
 

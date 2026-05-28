@@ -166,13 +166,13 @@ def build_flux_schnell_workflow(
     Flux.1-schnell Q4_K_M workflow.
     Needs ~7GB VRAM — fits RTX 4060 8GB with headroom.
     Better quality than SDXL-Turbo, ~8s per image.
-    Model file: flux1-schnell-Q4_K_M.gguf (via ComfyUI-GGUF node)
+    Model file: flux1-schnell-Q4_K_S.gguf (via ComfyUI-GGUF node)
     """
     seed = seed or int(time.time() * 1000) % 999999999
     return {
         "1": {
             "class_type": "UnetLoaderGGUF",
-            "inputs": {"unet_name": "flux1-schnell-Q4_K_M.gguf"}
+            "inputs": {"unet_name": "flux1-schnell-Q4_K_S.gguf"}
         },
         "2": {
             "class_type": "DualCLIPLoader",
@@ -257,23 +257,28 @@ class ComfyClient:
         except Exception:
             return False
 
-    def _get_model_status(self, model_name: str) -> tuple[bool, str]:
-        """Check if model exists and has expected minimum size (~3GB for SDXL Turbo)."""
-        # Resolve home path in case of ~ usage
-        comfy_home = Path("/media/digamber-jha/D/ComfyUI")
-        ckpt_path = comfy_home / "models" / "checkpoints" / model_name
-        
-        if not ckpt_path.exists():
-            return False, f"Model file missing: {model_name}"
-            
-        # Expected size for sd_xl_turbo_1.0_fp16 is ~3.16 GiB (3.4 GB)
-        # We'll check if it's at least 3GB (3,000,000,000 bytes)
-        size = ckpt_path.stat().st_size
-        if "sd_xl_turbo" in model_name and size < 3_000_000_000:
-            pct = round((size / 3_391_372_288) * 100, 1)
-            return False, f"Model {model_name} is still downloading ({pct}% complete). Please wait."
-            
-        return True, "Ready"
+    async def _get_model_status(self, model_name: str) -> tuple[bool, str]:
+        """Check if model is available via ComfyUI API."""
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(
+                    f"{self.base_url}/object_info/CheckpointLoaderSimple",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as r:
+                    if r.status != 200:
+                        return True, "Cannot verify (API unavailable), proceeding"
+                    data = await r.json()
+                    ckpt_list = (
+                        data.get("CheckpointLoaderSimple", {})
+                        .get("input", {})
+                        .get("required", {})
+                        .get("ckpt_name", [[]])[0]
+                    )
+                    if model_name in ckpt_list:
+                        return True, "Ready"
+                    return False, f"Model not found in ComfyUI: {model_name}"
+        except Exception:
+            return True, "Cannot verify model, proceeding"
 
     async def queue_prompt(self, workflow: dict) -> str:
         """Queue workflow, return prompt_id."""
@@ -346,7 +351,7 @@ class ComfyClient:
 
         # Safety check: prevent starting if model is not ready
         if model == "sdxl_turbo":
-            ready, msg = self._get_model_status("sd_xl_turbo_1.0_fp16.safetensors")
+            ready, msg = await self._get_model_status("sd_xl_turbo_1.0_fp16.safetensors")
             if not ready:
                 raise RuntimeError(msg)
 
