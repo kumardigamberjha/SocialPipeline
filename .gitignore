@@ -2,5 +2,18 @@ node_modules/
 .venv/
 generated_posts/
 output/
-.next
+.next/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# SQLite databases
+data/
+
+# Environment files
+.env
+app/.env
+dashboard/.env
 
