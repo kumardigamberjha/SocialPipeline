@@ -187,6 +187,41 @@ def create_instagram_image_agent(llm: LLM) -> Agent:
     )
 
 
+def create_longform_blog_agent(llm: LLM) -> Agent:
+    """Principal technical writer for exhaustive ~20,000-word blog posts.
+
+    Standalone agent — NOT part of the 10-agent multi-platform pipeline
+    (`_AGENT_FACTORIES`). It powers the dedicated long-form blog flow and is
+    instantiated on demand by `app.crew.run_blog_pipeline*`.
+    """
+    return Agent(
+        role="Principal Technical Writer & Engineer",
+        goal=_niche_lock(
+            "Write a 20,000-word exhaustive technical blog post about the given topic. "
+            "The post must cover every aspect of the concept: theory, architecture, "
+            "implementation, gotchas, real-world examples, performance, and comparisons. "
+            "It must be specific — not generic. Every claim backed by code or data. "
+            "The writing style follows the Karpathy + Welsh + Hormozi + Paul Graham fusion."
+        ),
+        backstory=(
+            "You are the engineering blog equivalent of a Navy SEAL.\n"
+            "You have shipped production AI systems at scale and written technical content "
+            "read by hundreds of thousands of developers. You write like Andrej Karpathy explains "
+            "— from first principles, showing your reasoning. You structure like Justin Welsh "
+            "— every word earns its place. You create momentum like Alex Hormozi — the reader "
+            "always knows what they just got and what's coming next. You think like Paul Graham "
+            "— contrarian observations that turn out to be obviously true.\n"
+            "You NEVER write generic content. You write as if the reader is a senior engineer "
+            "who will immediately know if you're bullshitting them."
+        ),
+        llm=llm,
+        tools=[file_reader_tool, code_execution_tool, web_search_tool],
+        verbose=True,
+        allow_delegation=False,
+        max_iter=5,
+    )
+
+
 # ── Aggregate factory ────────────────────────────────────────────────────────
 
 _AGENT_FACTORIES = [
@@ -195,9 +230,7 @@ _AGENT_FACTORIES = [
     create_seo_agent,
     create_thumbnail_agent,
     create_shorts_agent,
-    create_linkedin_agent,
     create_twitter_agent,
-    create_blog_agent,
     create_course_agent,
     create_idea_agent,
 ]

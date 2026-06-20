@@ -73,6 +73,7 @@ def run_content_pipeline(self, run_id: str, topic: str, provider: str, user_id: 
                 process="sequential",
                 verbose=True,
                 memory=False,
+                max_rpm=10,
             )
             result = crew.kickoff()
             return str(result)

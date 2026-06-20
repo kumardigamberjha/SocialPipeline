@@ -74,6 +74,56 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ── LinkedIn Celery Worker ──────────────────────────────────────────────
+  # LinkedIn posts are fast (<3 min) so concurrency=4 is fine — unlike the
+  # GPU / blog workers. Resolves the Celery app via app.tasks (which re-exports
+  # the shared celery_app and registers run_linkedin_pipeline).
+  linkedin_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A app.tasks:app worker -Q linkedin_queue --concurrency=4 --hostname=linkedin_worker@%h --loglevel=info
+    env_file:
+      - app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - COMFY_HOST=host.docker.internal
+      - COMFY_PORT=8188
+      - OPENAI_API_KEY=sk-no-openai-intended
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - sqlite_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Blog Celery Worker ──────────────────────────────────────────────────
+  # Long-form blogs are slow (Researcher + a per-section write/edit loop), so
+  # concurrency stays low (2). Resolves the Celery app via app.tasks (which
+  # re-exports the shared celery_app and registers run_blog_pipeline).
+  blog_worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A app.tasks:app worker -Q blog_queue --concurrency=2 --hostname=blog_worker@%h --loglevel=info
+    env_file:
+      - app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - COMFY_HOST=host.docker.internal
+      - COMFY_PORT=8188
+      - OPENAI_API_KEY=sk-no-openai-intended
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - sqlite_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
   # ── Celery GPU Worker (gpu_queue) ───────────────────────────────────────
   gpu_worker:
     build:

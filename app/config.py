@@ -6,6 +6,7 @@ Use `get_settings()` to access the singleton instance.
 """
 
 from functools import lru_cache
+from typing import Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,8 +21,12 @@ class Settings(BaseSettings):
     )
 
     # ── API Keys ──────────────────────────────────────────────
-    nvidia_api_key: str = ""
-    groq_api_key: str = ""
+    nvidia_api_key: str | None = None
+    groq_api_key: str | None = None
+    openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    gemini_api_key: str | None = None
+    gemma_api_key: str | None = None
 
     # ── Database ──────────────────────────────────────────────
     sqlite_db_path: str = "./data/nexus.db"
@@ -35,13 +40,12 @@ class Settings(BaseSettings):
     qdrant_cluster_key: str = ""
 
     # ── LLM Defaults ─────────────────────────────────────────
-    default_provider: str = "ollama"
+    default_provider: Literal["nvidia", "groq", "ollama", "openai", "anthropic", "google", "gemma"] = "ollama"
     llm_temperature: float = 0.6
     llm_max_tokens: int = 4096
     llm_timeout: int = 300
     ollama_model: str = "ollama/mistral:latest"
     ollama_api_base: str = "http://host.docker.internal:11434"
-    openai_api_key: str = ""
     openai_api_base: str = ""
 
     # ── Redis / Celery ───────────────────────────────────────

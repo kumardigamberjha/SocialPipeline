@@ -19,6 +19,7 @@ COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m venv /opt/venv && \
     /opt/venv/bin/pip install --upgrade pip && \
+    /opt/venv/bin/pip install torch --extra-index-url https://download.pytorch.org/whl/cpu && \
     /opt/venv/bin/pip install -r requirements.txt
 
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
