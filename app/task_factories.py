@@ -15,6 +15,7 @@ from app.services.style_guide import (
     LINKEDIN_STYLE,
     TWITTER_STYLE,
     LONGFORM_STYLE,
+    LONGFORM_BLOG_STYLE,
 )
 
 
@@ -99,7 +100,7 @@ def create_linkedin_task(agent: Agent, prompt: str) -> Task:
             f"Write a LinkedIn post about: {prompt}\n\n"
             f"{LINKEDIN_STYLE}\n\n"
             "ADDITIONAL REQUIREMENTS:\n"
-            "- Total post length: 150-220 words (LinkedIn sweet spot for engagement)\n"
+            "- Total post length: 600-800 words\n"
             "- First line must work as a standalone hook — assume 90% of readers see ONLY this line\n"
             "- Include a personal story or anecdote (2-3 lines max)\n"
             "- End with an open-ended question that invites comments\n"
@@ -108,7 +109,7 @@ def create_linkedin_task(agent: Agent, prompt: str) -> Task:
             "- Every line max 9 words"
         ),
         expected_output=(
-            "A LinkedIn post (150-220 words) following the Justin Welsh + Shaan Puri style. "
+            "A LinkedIn post (600-800 words) following the Justin Welsh + Shaan Puri style. "
             "Must include: a standalone hook line, 1-3-1 structure, personal story, "
             "open-ended closing question, max 3 lowercase hashtags."
         ),
@@ -194,6 +195,54 @@ def create_instagram_image_task(agent: Agent, prompt: str) -> Task:
     )
 
 
+def create_longform_blog_task(
+    topic: str,
+    research_context: str,
+    agent: Agent,
+    niche: str = "AI / Software Development",
+) -> Task:
+    """Build the exhaustive 18,000-22,000 word blog task.
+
+    Standalone — not part of `create_all_tasks`. Driven by the dedicated
+    long-form blog flow in `app.crew`.
+    """
+    return Task(
+        description=f"""
+        Write a complete 18,000-22,000 word technical blog post about: {topic}
+
+        RESEARCH CONTEXT (use this as your factual foundation):
+        {research_context}
+
+        {LONGFORM_BLOG_STYLE}
+
+        MANDATORY SECTION REQUIREMENTS:
+        You must produce ALL 14 sections defined in the style guide above.
+        Each section must meet its minimum word count.
+        The total post must be between 18,000 and 22,000 words.
+
+        OUTPUT FORMAT:
+        - Pure markdown
+        - Each section starts with ## (H2 header)
+        - Sub-sections use ### (H3)
+        - Code blocks use triple backticks with language specified
+        - Tables use markdown table format
+        - NO HTML tags
+        - First line of output: the full blog title as # (H1)
+        - Second line: subtitle in *italics*
+        - Third line: blank
+        - Fourth line: "**Reading time:** X minutes | **Difficulty:** Intermediate-Advanced | **Niche:** {niche}"
+        """,
+        expected_output="""
+        A complete markdown blog post of 18,000-22,000 words containing all 14 sections.
+        The post must be immediately publishable with no editing needed.
+        It must contain at least 8 working code examples, 3 comparison tables,
+        8 specific gotchas, and 1 complete real-world project walkthrough.
+        """,
+        agent=agent,
+        context=[],
+    )
+
+
 # ── Aggregate factory ────────────────────────────────────────────────────────
 
 _TASK_FACTORIES = [
@@ -202,9 +251,7 @@ _TASK_FACTORIES = [
     ("SEO Optimization", create_seo_task),
     ("Thumbnail Design", create_thumbnail_task),
     ("Shorts Scripting", create_shorts_task),
-    ("LinkedIn Content", create_linkedin_task),
     ("Twitter Thread", create_twitter_task),
-    ("Blog Article", create_blog_task),
     ("Course Outline", create_course_task),
     ("Idea Generation", create_idea_task),
 ]

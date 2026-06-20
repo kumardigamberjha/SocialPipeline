@@ -68,7 +68,8 @@ async def websocket_endpoint(
                         provider=provider,
                         client_id=client_id,
                         run_id=run_id,
-                        auto_research=False
+                        auto_research=False,
+                        user_id=user_id
                     )
                 )
 
@@ -123,16 +124,17 @@ async def auto_generate_endpoint(
                 run = queries.create_run(user_id, auto_topic, provider)
                 run_id = run['id']
 
-                # Dispatch pipeline natively via asyncio.create_task
+                # 5) Dispatch streaming pipeline with auto_research=True
                 from app.crew import run_pipeline_streaming
                 asyncio.create_task(
                     run_pipeline_streaming(
-                        topic=auto_topic,
+                        topic="auto",
                         settings=settings,
                         provider=provider,
                         client_id=client_id,
                         run_id=run_id,
-                        auto_research=True
+                        auto_research=True,
+                        user_id=user_id
                     )
                 )
 
@@ -143,4 +145,66 @@ async def auto_generate_endpoint(
         logger.info("Auto-generate client %s disconnected", client_id)
     except Exception as e:
         logger.error("Auto-generate WebSocket error: %s", e)
+        manager.disconnect(client_id)
+
+
+@router.websocket("/blog/{client_id}")
+async def blog_endpoint(
+    websocket: WebSocket,
+    client_id: str,
+    settings: Settings = Depends(get_settings),
+):
+    """Stream long-form blog generation.
+
+    Client sends {"topic": "...", "provider": "...", "niche": "..."}.
+    Server emits: status, section_started, section_complete (with word_count),
+    blog_complete (full markdown + word_count + reading_time), error.
+    """
+    await manager.connect(client_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                payload = json.loads(data)
+                topic = payload.get("topic")
+                provider = payload.get("provider", settings.default_provider)
+                niche = payload.get("niche", "AI / Software Development")
+
+                if not topic:
+                    await manager.send_json({"type": "error", "message": "Topic is required"}, client_id)
+                    continue
+
+                user_id = _extract_user_id(websocket, settings)
+
+                from app.services.usage import check_and_increment
+                allowed, msg = check_and_increment(user_id)
+                if not allowed:
+                    await manager.send_json({"type": "error", "message": msg}, client_id)
+                    continue
+
+                # Create run in SQLite
+                run = queries.create_run(user_id, topic, provider)
+                run_id = run['id']
+
+                # Dispatch blog generation natively via asyncio.create_task
+                from app.crew import run_blog_pipeline_streaming
+                asyncio.create_task(
+                    run_blog_pipeline_streaming(
+                        topic=topic,
+                        settings=settings,
+                        provider=provider,
+                        client_id=client_id,
+                        run_id=run_id,
+                        user_id=user_id,
+                        niche=niche,
+                    )
+                )
+
+            except json.JSONDecodeError:
+                await manager.send_json({"type": "error", "message": "Invalid JSON"}, client_id)
+    except WebSocketDisconnect:
+        manager.disconnect(client_id)
+        logger.info("Blog client %s disconnected", client_id)
+    except Exception as e:
+        logger.error("Blog WebSocket error: %s", e)
         manager.disconnect(client_id)

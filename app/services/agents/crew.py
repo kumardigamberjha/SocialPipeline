@@ -61,6 +61,7 @@ def run_pipeline(topic: str, settings: Settings, provider: str | None = None) ->
             tasks=tasks,
             process="sequential",
             verbose=True,
+            max_rpm=10,
         )
 
         result = crew.kickoff()
@@ -92,6 +93,7 @@ def run_pipeline(topic: str, settings: Settings, provider: str | None = None) ->
             tasks=tasks,
             process="sequential",
             verbose=True,
+            max_rpm=10,
         )
 
         result = crew.kickoff()

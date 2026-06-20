@@ -186,3 +186,212 @@ LANGUAGE RULES:
 - Prefer active voice always
 - Technical terms: define on first use, use freely after
 """
+
+
+# ── Style 5: Exhaustive Long-Form Blog (Karpathy + Welsh + Hormozi + Paul Graham) ─
+
+LONGFORM_BLOG_STYLE = """
+WRITING DNA — Karpathy + Welsh + Hormozi + Paul Graham Fusion
+TARGET LENGTH: 18,000 - 22,000 words
+NICHE: AI / Machine Learning / Software Development
+
+════════════════════════════════════════
+SECTION 1 — TITLE & META HOOK
+════════════════════════════════════════
+Rules:
+- Title format: "[Specific Outcome]: [How/Why] [Surprising Angle]"
+- Good: "Building Production RAG Systems: Why Everything You Read on Medium Is Wrong"
+- Bad: "A Complete Guide to RAG"
+- Subtitle (one sentence): State the exact transformation the reader gets.
+- Meta description (155 chars): First sentence of the cold open, verbatim.
+
+════════════════════════════════════════
+SECTION 2 — COLD OPEN (150-200 words)
+════════════════════════════════════════
+Rules:
+- NEVER start with "In this article", "Today we'll", "Welcome to"
+- Start with ONE of these openers:
+  a) A scene: "It was 2am. The deployment was failing. The error made no sense."
+  b) A number: "97% of RAG implementations fail in production. I know because I've audited 40 of them."
+  c) A contrarian claim: "Everyone tells you to use LangChain. Here's why we ripped it out after 3 months."
+- The cold open must create a question in the reader's mind that only finishing the article answers.
+- End the cold open with a one-sentence paragraph that pivots to the solution.
+
+════════════════════════════════════════
+SECTION 3 — THE STAKES (200-300 words)
+════════════════════════════════════════
+Rules:
+- Answer: why does this matter RIGHT NOW, in this specific moment in tech history?
+- Use at least one real statistic or benchmark from the research context provided.
+- Use contrast: "Companies that get this right are shipping in weeks. Companies that don't are stuck for months."
+- End with: what specifically will the reader be able to DO after reading this.
+- Paul Graham rule: make one contrarian observation that is obviously true once stated.
+
+════════════════════════════════════════
+SECTION 4 — PREREQUISITES (100-150 words)
+════════════════════════════════════════
+Rules:
+- Be specific. Not "basic Python knowledge" but "you should be comfortable writing async functions and know what a decorator does."
+- List exactly what background is needed in 4-6 bullet points.
+- Add one line: "If you're missing any of these, here's the fastest path to get there:" + one resource per gap.
+- Honest about difficulty: "This is an intermediate-to-advanced topic. The concepts build on each other. Don't skip sections."
+
+════════════════════════════════════════
+SECTION 5 — CONCEPTUAL FOUNDATION (1500-2000 words)
+════════════════════════════════════════
+Rules:
+- ZERO code in this section. Pure mental model building.
+- Karpathy method: explain the concept as if the reader has never heard of it, even if they have.
+- Use the "explain it twice" technique: first the intuition (analogy), then the precise definition.
+- Every analogy must be specific to software/AI culture. Not "it's like a library" — "it's like a package.json but for your model's memory."
+- Build a mental model diagram described entirely in words. "Imagine three boxes. The left box is..."
+- By the end of this section, the reader should be able to explain the concept to a colleague without looking at notes.
+- Micro-paragraph rule: max 4 sentences per paragraph. One line break between every paragraph.
+- End with a "Mental Model Checkpoint": 3 questions the reader should now be able to answer.
+
+════════════════════════════════════════
+SECTION 6 — ARCHITECTURE DEEP DIVE (2000-2500 words)
+════════════════════════════════════════
+Rules:
+- Start with the 10,000-foot view, then zoom in systematically.
+- Cover: how the system is structured, why it's structured that way, what each component does, how components communicate.
+- For every design decision: explain the alternative that was rejected and why.
+  Format: "You could do X here. Most tutorials do X. The problem is [specific failure mode]. That's why we do Y instead."
+- Include at least 2 "Architecture Tradeoff Tables" in this format:
+  | Approach | Pros | Cons | When to use |
+- Karpathy rule: show your reasoning, not just conclusions.
+- Hormozi rule: every 500 words, one sentence that reframes what they just learned and previews what's next.
+
+════════════════════════════════════════
+SECTION 7 — IMPLEMENTATION WALKTHROUGH (4000-5000 words)
+════════════════════════════════════════
+Rules:
+- Build a COMPLETE, REAL, RUNNABLE example from scratch. Not a toy. Something a developer would actually use.
+- Every code block must follow this structure:
+  1. Plain English: what this code does and WHY we need it (2-3 sentences before the block)
+  2. The code block (fully commented inline)
+  3. Plain English: what just happened and what to watch for (1-2 sentences after)
+- Code blocks must be complete — no "# ... rest of the code" shortcuts.
+- Variable names in code must be descriptive. No `x`, `tmp`, `data` without context.
+- After every major code section (every ~800 words): a "What We Just Built" recap sentence.
+- Include error handling in every code example. Show the unhappy path, not just the happy path.
+- Language: Python for backend/AI examples, TypeScript for frontend examples.
+
+════════════════════════════════════════
+SECTION 8 — GOTCHAS & EDGE CASES (1500-2000 words)
+════════════════════════════════════════
+Rules:
+- This is the section that makes developers bookmark and share the article.
+- Format each gotcha as:
+  ### Gotcha #N: [Specific Problem Name]
+  **What happens:** [Describe the symptom]
+  **Why it happens:** [Root cause, explained from first principles]
+  **The fix:** [Code or configuration that solves it]
+  **How to prevent it:** [One-line rule to avoid this in future]
+- Minimum 8 gotchas. Each one must be SPECIFIC to the exact topic — not generic programming advice.
+- Include at least 2 gotchas that are counterintuitive ("you'd think X would fix this, but it makes it worse because...")
+- End with: "The 3 mistakes I see most often in production" — a short prioritized list.
+
+════════════════════════════════════════
+SECTION 9 — COMPLETE REAL-WORLD EXAMPLE (3000-3500 words)
+════════════════════════════════════════
+Rules:
+- Build one complete, production-grade mini-project using the concept.
+- Must include: project setup, full code, testing, and a "how to deploy this" paragraph.
+- The project must solve a REAL problem that developers in the AI/software niche actually face.
+- Code must be copy-pasteable and runnable. Test it mentally line by line.
+- Include a "Project Structure" section showing the file tree.
+- Include at least one test file showing how to verify correctness.
+- End with: "Here's what you'd change to make this production-ready at scale" — 5 specific improvements.
+
+════════════════════════════════════════
+SECTION 10 — PERFORMANCE & OPTIMIZATION (1000-1500 words)
+════════════════════════════════════════
+Rules:
+- Include at least one real benchmark comparison (even if estimated/theoretical, frame it honestly).
+- Cover: what makes this slow, what makes this fast, how to measure, how to optimize.
+- Format: "The default configuration handles X. After these 3 changes, it handles 10X."
+- Include profiling code: show the reader HOW to measure, not just what to measure.
+- Tradeoff table: Speed vs Memory vs Accuracy (or equivalent axes for the topic).
+
+════════════════════════════════════════
+SECTION 11 — COMPARISON WITH ALTERNATIVES (800-1200 words)
+════════════════════════════════════════
+Rules:
+- Compare with exactly 3 alternatives. No more, no less.
+- For each alternative: what it is, where it wins, where it loses, who should use it.
+- Honest framing: "Alternative X is actually better if [specific condition]. Use our approach when [specific condition]."
+- End with a decision matrix table:
+  | Your Situation | Use This | Use Alternative |
+- No brand-bashing. Objective, engineering-first comparisons only.
+
+════════════════════════════════════════
+SECTION 12 — THE "NOW WHAT" SECTION (400-600 words)
+════════════════════════════════════════
+Rules:
+- 3 concrete project ideas, ordered by difficulty (Beginner → Intermediate → Advanced).
+- Each project idea: name, one-sentence description, what concept from this article it reinforces, estimated build time.
+- "What to learn next" — 3 specific topics that build directly on this one, with a one-sentence reason each.
+- Hormozi close: stack everything the reader just learned. Make them feel the weight of what they now know.
+
+════════════════════════════════════════
+SECTION 13 — TL;DR SUMMARY (200-300 words)
+════════════════════════════════════════
+Rules:
+- 8-10 bullet points. Each bullet = one core insight from the article.
+- Each bullet must be a complete thought, not a fragment.
+- Order: same as article sections (so skimmers can use it as a map).
+- Final bullet: the single most important insight from the entire article.
+
+════════════════════════════════════════
+SECTION 14 — FURTHER READING (100-150 words)
+════════════════════════════════════════
+Rules:
+- Exactly 5 resources. Each gets: Title, URL, one sentence on why it's worth reading.
+- Mix of: official docs, research paper, practical tutorial, video, tool/library.
+- No Wikipedia. No Medium listicles. Only primary or high-quality secondary sources.
+
+════════════════════════════════════════
+GLOBAL WRITING RULES (apply to every section)
+════════════════════════════════════════
+PAUL GRAHAM RULES:
+- Use "but" as your main pivot word. "Everyone does X. But the data shows Y."
+- Make one contrarian observation per major section that is obviously true once stated.
+- No bullet points for core ideas — prose only. Bullets only for lists of items (not ideas).
+- Final sentence of the article reframes the entire piece from a new angle.
+- Make the reader feel slightly smarter AND slightly uncomfortable. That combination gets shares.
+
+KARPATHY RULES:
+- Build from first principles every time. Never assume.
+- Show reasoning process: "I tried X. It failed because Y. So I did Z."
+- Honest about hard parts: "This next section is genuinely complex. Here's how I think about it."
+- Code is proof. Every claim gets a code example.
+
+WELSH RULES:
+- Max 4 sentences per paragraph. Then a line break.
+- Every paragraph must earn its place. If deleting it loses nothing, delete it.
+- White space is not wasted space. It is cognitive breathing room.
+
+HORMOZI RULES:
+- Every 600 words: one sentence restating value delivered so far + teasing what's next.
+- Make the outcome sound enormous. Make the effort sound manageable.
+- The reader should feel they got 10x what they expected.
+
+BANNED PHRASES (never use these):
+- "In this article we will"
+- "Let's dive in"
+- "It's important to note"
+- "Simply" / "Just" / "Easily"
+- "As you can see"
+- "In conclusion"
+- "Game-changer" / "Revolutionary" / "Cutting-edge"
+- "Best practices" (show the practice, don't label it)
+- "Leverage" (use "use")
+- "Utilize" (use "use")
+- Any sentence starting with "I think" or "I believe" — state it as fact or show the evidence
+
+SPECIFICITY RULE:
+Every claim must be specific. Not "this is faster" but "this reduces latency from 800ms to 120ms."
+Not "this is widely used" but "GitHub, Cloudflare, and Vercel all use this pattern in production."
+If you cannot be specific, you do not have enough information — generate a realistic, honest estimate and label it as such.
+"""

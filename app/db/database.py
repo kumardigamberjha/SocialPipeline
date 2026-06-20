@@ -119,7 +119,44 @@ def init_db():
             last_niche TEXT DEFAULT 'ai',
             last_run_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS blog_posts (
+            id TEXT PRIMARY KEY,
+            run_id TEXT REFERENCES agent_runs(id),
+            user_id TEXT NOT NULL REFERENCES users(id),
+            topic TEXT NOT NULL,
+            title TEXT,
+            content TEXT NOT NULL,          -- full markdown blog post ~20000 words
+            word_count INTEGER,
+            reading_time_minutes INTEGER,
+            niche TEXT,
+            approved INTEGER DEFAULT 0,     -- SQLite has no BOOLEAN, use 0/1
+            deleted_at TEXT,                -- soft delete timestamp; NULL = live
+            published_at TEXT DEFAULT (datetime('now')),
+            slug TEXT UNIQUE                -- URL-safe version of title
+        );
+
+        CREATE TABLE IF NOT EXISTS linkedin_posts (
+            id TEXT PRIMARY KEY,
+            run_id TEXT REFERENCES agent_runs(id),
+            user_id TEXT NOT NULL REFERENCES users(id),
+            topic TEXT NOT NULL,
+            post_text TEXT NOT NULL,
+            hook TEXT,
+            angle_type TEXT,
+            word_count INTEGER,
+            hashtag_count INTEGER,
+            approved INTEGER DEFAULT 0,     -- 0/1 for SQLite boolean
+            niche TEXT,
+            deleted_at TEXT,                 -- soft delete
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_blog_posts_user ON blog_posts(user_id, published_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_blog_posts_slug ON blog_posts(slug);
         
+        CREATE INDEX IF NOT EXISTS idx_linkedin_posts_user ON linkedin_posts(user_id, created_at DESC);
+
         -- Seed niche_state if empty
         INSERT OR IGNORE INTO niche_state (id, last_niche) VALUES (1, 'ai');
         
@@ -137,4 +174,12 @@ def init_db():
         conn.execute("ALTER TABLE usage_limits ADD COLUMN stripe_subscription_id TEXT;")
     except sqlite3.OperationalError:
         pass
-
+    # blog_posts gained approval + soft-delete after the table first shipped.
+    try:
+        conn.execute("ALTER TABLE blog_posts ADD COLUMN approved INTEGER DEFAULT 0;")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        conn.execute("ALTER TABLE blog_posts ADD COLUMN deleted_at TEXT;")
+    except sqlite3.OperationalError:
+        pass

@@ -24,11 +24,11 @@ const ALL_AGENTS: AgentNode[] = [
   { name: "SEO Optimization", role: "Meta & Tags", icon: ShieldCheck },
   { name: "Thumbnail Design", role: "CTR Visuais", icon: Send },
   { name: "Shorts Scripting", role: "Short Form", icon: PenTool },
-  { name: "LinkedIn Content", role: "Professional", icon: PenTool },
   { name: "Twitter Thread", role: "Micro-blogging", icon: PenTool },
-  { name: "Blog Article", role: "Long Form", icon: PenTool },
   { name: "Course Outline", role: "Education", icon: PenTool },
   { name: "Idea Generation", role: "Creative Strategy", icon: Search },
+  { name: "LinkedIn Content", role: "Professional", icon: PenTool },
+  { name: "Blog Article", role: "Long Form", icon: PenTool },
 ];
 
 const statusConfig: Record<

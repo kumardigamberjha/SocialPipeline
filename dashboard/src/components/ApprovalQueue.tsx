@@ -14,6 +14,9 @@ import {
   Send,
   Terminal,
   PenTool,
+  ChevronDown,
+  Linkedin,
+  BookOpen,
 } from "lucide-react";
 
 export interface StreamedTask {
@@ -34,7 +37,48 @@ export default function ApprovalQueue({
   const [topic, setTopic] = useState("");
   const [generatedContent, setGeneratedContent] = useState("");
   const [streamedTasks, setStreamedTasks] = useState<StreamedTask[]>([]);
-  
+  const [provider, setProvider] = useState("ollama");
+  const [isDropdownOpen, setIsDropdownOpen] = useState(false);
+  const [linkedinFinal, setLinkedinFinal] = useState<string | null>(null);
+  const [blogFinal, setBlogFinal] = useState<string | null>(null);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  const [pipelineMode, setPipelineMode] = useState<"multi" | "linkedin" | "blog">("multi");
+  const [isModeDropdownOpen, setIsModeDropdownOpen] = useState(false);
+  const modeDropdownRef = useRef<HTMLDivElement>(null);
+
+  const pipelineModes = [
+    { value: "multi", label: "Full Suite", borderClass: "hover:border-blue-500/50", activeClass: "text-blue-400 bg-blue-500/10" },
+    { value: "linkedin", label: "LinkedIn Post", borderClass: "hover:border-purple-500/50", activeClass: "text-purple-400 bg-purple-500/10" },
+    { value: "blog", label: "Blog Article", borderClass: "hover:border-green-500/50", activeClass: "text-green-400 bg-green-500/10" },
+  ];
+
+  const providers = [
+    { value: "ollama", label: "Local LLM (Ollama)", activeClass: "text-cyan-400 bg-cyan-500/10", borderClass: "hover:border-cyan-500/50" },
+    { value: "groq", label: "Groq (Llama 3.3)", activeClass: "text-orange-400 bg-orange-500/10", borderClass: "hover:border-orange-500/50" },
+    { value: "nvidia", label: "NVIDIA NIM", activeClass: "text-green-400 bg-green-500/10", borderClass: "hover:border-green-500/50" },
+    { value: "openai", label: "ChatGPT (GPT-4o)", activeClass: "text-emerald-400 bg-emerald-500/10", borderClass: "hover:border-emerald-500/50" },
+    { value: "anthropic", label: "Claude (3.5 Sonnet)", activeClass: "text-amber-400 bg-amber-500/10", borderClass: "hover:border-amber-500/50" },
+    { value: "google", label: "Gemini (3.5 Flash)", activeClass: "text-blue-400 bg-blue-500/10", borderClass: "hover:border-blue-500/50" },
+    { value: "gemma", label: "Gemma (gemma4:31b-cloud)", activeClass: "text-pink-400 bg-pink-500/10", borderClass: "hover:border-pink-500/50" },
+  ];
+
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target as Node)) {
+        setIsDropdownOpen(false);
+      }
+      if (modeDropdownRef.current && !modeDropdownRef.current.contains(event.target as Node)) {
+        setIsModeDropdownOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  const selectedProvider = providers.find(p => p.value === provider) || providers[0];
+  const selectedMode = pipelineModes.find(m => m.value === pipelineMode) || pipelineModes[0];
+
   // Image Generation State
   const [imageStatus, setImageStatus] = useState<"idle" | "generating" | "done" | "error">("idle");
   const [generatedImages, setGeneratedImages] = useState<string[]>([]);
@@ -63,64 +107,125 @@ export default function ApprovalQueue({
     setTimeout(() => setStatus("pending"), 3000);
   };
 
-  const handleRegenerate = (isAuto: boolean = false) => {
+  const handleRegenerate = async (isAuto: boolean = false) => {
     if (!isAuto && !topic) return alert("Please enter a topic first");
     
     // Clear previous state
     setStreamedTasks([]);
     setGeneratedContent("");
+    setLinkedinFinal(null);
+    setBlogFinal(null);
     setStatus("regenerating");
     onGeneratingChange?.(true);
 
-    // Generate a pseudo-random client ID for the socket
-    const clientId = Math.random().toString(36).substring(7);
-    const endpoint = isAuto ? `auto-generate/${clientId}` : `generate/${clientId}`;
-    
-    // Support both ws:// and wss:// dynamically based on the env string
     const baseUrl = process.env.NEXT_PUBLIC_BACKEND_API || "http://localhost:8000";
     const wsProtocol = baseUrl.startsWith("https") ? "wss" : "ws";
     const wsHost = baseUrl.replace(/^https?:\/\//, "");
-    const wsUrl = `${wsProtocol}://${wsHost}/api/ws/${endpoint}`;
-    
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
 
-    ws.onopen = () => {
-      console.log(`WebSocket connected. Mode: ${isAuto ? "Auto" : "Manual"}`);
-      // Send the payload. The auto-generate endpoint ignores the topic field, 
-      // but we send it for safety to prevent JSON parse errors.
-      ws.send(JSON.stringify({ topic: isAuto ? "auto" : topic, provider: "ollama" }));
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        console.log("WS Message:", data);
-
-        if (data.type === "task_finished") {
-          setStreamedTasks(prev => [...prev, { task: data.task, output: data.output }]);
-        } else if (data.type === "complete") {
-          setGeneratedContent(data.result);
-          setStatus("pending");
-          onGeneratingChange?.(false);
-          ws.close();
-        } else if (data.type === "error") {
-          alert(`Generation failed: ${data.message}`);
-          setStatus("idle");
-          onGeneratingChange?.(false);
-          ws.close();
+    try {
+      let wsUrl = "";
+      
+      if (pipelineMode === "linkedin") {
+        // LinkedIn pipeline requires a POST request to start the Celery task first
+        const res = await fetch(`${baseUrl}/api/linkedin/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topic, niche: "ai", provider })
+        });
+        
+        if (!res.ok) {
+          const errData = await res.json();
+          throw new Error(errData.detail || "Failed to start LinkedIn pipeline");
         }
-      } catch (err) {
-        console.error("Failed to parse WS message", err);
+        
+        const data = await res.json();
+        const runId = data.run_id;
+        wsUrl = `${wsProtocol}://${wsHost}/api/ws/linkedin/${runId}`;
+      } else if (pipelineMode === "blog") {
+         const res = await fetch(`${baseUrl}/api/blog/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ topic, niche: "ai", provider })
+        });
+        
+        if (!res.ok) {
+          const errData = await res.json();
+          throw new Error(errData.detail || "Failed to start Blog pipeline");
+        }
+        
+        const data = await res.json();
+        const runId = data.run_id;
+        wsUrl = `${wsProtocol}://${wsHost}/api/ws/blog/${runId}`;
+      } else {
+        // Multi-platform pipeline (default)
+        const clientId = Math.random().toString(36).substring(7);
+        const endpoint = isAuto ? `auto-generate/${clientId}` : `generate/${clientId}`;
+        wsUrl = `${wsProtocol}://${wsHost}/api/ws/${endpoint}`;
       }
-    };
+      
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-    ws.onerror = (err) => {
-      console.error("WebSocket error:", err);
-      alert("WebSocket connection failed. Ensure backend is running.");
+      ws.onopen = () => {
+        console.log(`WebSocket connected. Mode: ${isAuto ? "Auto" : "Manual"}, Pipeline: ${pipelineMode}`);
+        // Send payload for endpoints that start via WS (multi and blog)
+        // blog actually starts via POST now, but we'll send it anyway just in case
+        if (pipelineMode === "multi" || pipelineMode === "blog") {
+          ws.send(JSON.stringify({ topic: isAuto ? "auto" : topic, provider: provider }));
+        }
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          console.log("WS Message:", data);
+
+          if (data.type === "task_finished" || data.type === "agent_update") {
+            setStreamedTasks(prev => [...prev, { task: data.task || data.agent, output: data.output || "Running..." }]);
+          } else if (data.type === "linkedin_final") {
+            setLinkedinFinal(data.content || "");
+          } else if (data.type === "blog_final") {
+            setBlogFinal(data.content || "");
+          } else if (data.type === "qa_result") {
+            // Handle LinkedIn custom QA event
+            let qaOutput = `QA Results [${data.cycle || 'final'}]:\n`;
+            if (data.word_count !== undefined) qaOutput += `Word count: ${data.word_count}\n`;
+            qaOutput += `Overall Pass: ${data.overall_pass ? '✅' : '❌'}\n`;
+            if (data.violations && data.violations.length > 0) {
+              qaOutput += `Violations:\n- ${data.violations.join('\n- ')}`;
+            } else if (data.thin_sections) { // Blog QA
+              qaOutput += `Thin Sections: ${data.thin_sections}`;
+            }
+            setStreamedTasks(prev => [...prev, { task: "QA Metrics", output: qaOutput }]);
+          } else if (data.type === "complete" || data.type === "blog_complete") {
+            // "post_text" is for linkedin, "result" for multi, "content" for blog
+            setGeneratedContent(data.result || data.post_text || data.content || "Completed successfully.");
+            setStatus("pending");
+            onGeneratingChange?.(false);
+            ws.close();
+          } else if (data.type === "error") {
+            alert(`Generation failed: ${data.message}`);
+            setStatus("idle");
+            onGeneratingChange?.(false);
+            ws.close();
+          }
+        } catch (err) {
+          console.error("Failed to parse WS message", err);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.error("WebSocket error:", err);
+        alert("WebSocket connection failed. Ensure backend is running.");
+        setStatus("idle");
+        onGeneratingChange?.(false);
+      };
+    } catch (error: any) {
+      console.error(error);
+      alert(error.message);
       setStatus("idle");
       onGeneratingChange?.(false);
-    };
+    }
   };
 
   const handleGenerateImage = async () => {
@@ -176,9 +281,9 @@ export default function ApprovalQueue({
         </div>
 
         {/* Topic Input Bar */}
-        <div className="mb-6 flex gap-3">
+        <div className="mb-6 flex flex-col xl:flex-row gap-3">
           <div className="flex-1 glass-card rounded-xl px-4 py-2 flex items-center gap-3 border border-white/10 focus-within:border-blue-500/50 transition-colors">
-            <MessageSquare className="w-4 h-4 text-slate-500" />
+            <MessageSquare className="w-4 h-4 text-slate-500 shrink-0" />
             <input 
               type="text" 
               placeholder="Enter viral topic (e.g. FastAPI vs Django for AI)..."
@@ -193,7 +298,93 @@ export default function ApprovalQueue({
               }}
             />
           </div>
-            <div className="flex gap-2">
+          
+          <div ref={modeDropdownRef} className="relative w-full xl:w-48 shrink-0">
+            <button
+              type="button"
+              disabled={status === "regenerating"}
+              onClick={() => setIsModeDropdownOpen(!isModeDropdownOpen)}
+              className={`w-full glass-card rounded-xl px-4 py-2.5 flex items-center justify-between border border-white/10 transition-colors text-sm text-slate-300 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${selectedMode.borderClass}`}
+            >
+              <span className={pipelineMode === selectedMode.value ? selectedMode.activeClass.split(' ')[0] : ''}>{selectedMode.label}</span>
+              <ChevronDown className={`w-4 h-4 text-slate-400 transition-transform duration-200 ${isModeDropdownOpen ? 'rotate-180' : ''}`} />
+            </button>
+
+            <AnimatePresence>
+              {isModeDropdownOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 10 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute left-0 right-0 mt-2 z-50 rounded-xl border border-white/10 bg-[#0b0f19]/95 backdrop-blur-md shadow-2xl overflow-hidden py-1"
+                >
+                  {pipelineModes.map((m) => (
+                    <button
+                      key={m.value}
+                      type="button"
+                      onClick={() => {
+                        setPipelineMode(m.value as "multi" | "linkedin" | "blog");
+                        setIsModeDropdownOpen(false);
+                      }}
+                      className={`w-full text-left px-4 py-2.5 text-xs transition-colors cursor-pointer ${
+                        pipelineMode === m.value 
+                          ? `${m.activeClass} font-semibold` 
+                          : 'text-slate-300 hover:text-white hover:bg-white/5'
+                      }`}
+                    >
+                      <div className="font-bold mb-0.5">{m.label}</div>
+                      <div className="text-[9px] opacity-70">{m.description}</div>
+                    </button>
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          <div ref={dropdownRef} className="relative w-full xl:w-48 shrink-0">
+            <button
+              type="button"
+              disabled={status === "regenerating"}
+              onClick={() => setIsDropdownOpen(!isDropdownOpen)}
+              className={`w-full glass-card rounded-xl px-4 py-2.5 flex items-center justify-between border border-white/10 transition-colors text-sm text-slate-300 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${selectedProvider.borderClass}`}
+            >
+              <span className={provider === selectedProvider.value ? selectedProvider.activeClass.split(' ')[0] : ''}>{selectedProvider.label}</span>
+              <ChevronDown className={`w-4 h-4 text-slate-400 transition-transform duration-200 ${isDropdownOpen ? 'rotate-180' : ''}`} />
+            </button>
+
+            <AnimatePresence>
+              {isDropdownOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: 10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: 10 }}
+                  transition={{ duration: 0.15 }}
+                  className="absolute left-0 right-0 mt-2 z-50 rounded-xl border border-white/10 bg-[#0b0f19]/95 backdrop-blur-md shadow-2xl overflow-hidden py-1"
+                >
+                  {providers.map((p) => (
+                    <button
+                      key={p.value}
+                      type="button"
+                      onClick={() => {
+                        setProvider(p.value);
+                        setIsDropdownOpen(false);
+                      }}
+                      className={`w-full text-left px-4 py-2.5 text-xs transition-colors cursor-pointer ${
+                        provider === p.value 
+                          ? `${p.activeClass} font-semibold` 
+                          : 'text-slate-300 hover:text-white hover:bg-white/5'
+                      }`}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+          
+          <div className="flex gap-2">
               <button 
                 onClick={() => handleRegenerate(true)}
                 disabled={status === "regenerating"}
@@ -431,6 +622,8 @@ export default function ApprovalQueue({
                         onClick={() => {
                           setStreamedTasks([]);
                           setGeneratedContent("");
+                          setLinkedinFinal(null);
+                          setBlogFinal(null);
                           setStatus("idle");
                         }}
                         className="
@@ -468,7 +661,67 @@ export default function ApprovalQueue({
             </motion.div>
           ) : null}
         </AnimatePresence>
-        
+
+        {/* LinkedIn Final Card — only shown in full-suite mode after pipeline completes */}
+        <AnimatePresence>
+          {linkedinFinal !== null && (status === "pending" || status === "approved") && (
+            <motion.div
+              layout
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 20 }}
+              className="glass-card-elevated rounded-2xl overflow-hidden mt-6"
+            >
+              <div className="flex items-center gap-3 px-5 sm:px-6 py-4 border-b border-white/5 bg-gradient-to-r from-blue-900/20 to-indigo-900/20">
+                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/20">
+                  <Linkedin className="w-3.5 h-3.5 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-white">LinkedIn Final Post</h3>
+                  <p className="text-[10px] text-slate-400 tracking-wide uppercase">Ready to Publish</p>
+                </div>
+              </div>
+              <div className="px-5 sm:px-6 py-5">
+                <div className="bg-slate-900/80 rounded-xl border border-white/10 p-5 sm:p-6 max-h-96 overflow-y-auto custom-scrollbar shadow-inner">
+                  <div className="text-sm text-slate-200 leading-relaxed whitespace-pre-line font-sans">
+                    {linkedinFinal}
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Blog Final Card — only shown in full-suite mode after pipeline completes */}
+        <AnimatePresence>
+          {blogFinal !== null && (status === "pending" || status === "approved") && (
+            <motion.div
+              layout
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 20 }}
+              className="glass-card-elevated rounded-2xl overflow-hidden mt-6"
+            >
+              <div className="flex items-center gap-3 px-5 sm:px-6 py-4 border-b border-white/5 bg-gradient-to-r from-green-900/20 to-emerald-900/20">
+                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-green-500 to-emerald-600 flex items-center justify-center shadow-lg shadow-green-500/20">
+                  <BookOpen className="w-3.5 h-3.5 text-white" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-white">Blog Final Article</h3>
+                  <p className="text-[10px] text-slate-400 tracking-wide uppercase">Markdown — Ready to Publish</p>
+                </div>
+              </div>
+              <div className="px-5 sm:px-6 py-5">
+                <div className="bg-slate-900/80 rounded-xl border border-white/10 p-5 sm:p-6 max-h-96 overflow-y-auto custom-scrollbar shadow-inner">
+                  <div className="text-sm text-slate-200 leading-relaxed whitespace-pre-line font-sans">
+                    {blogFinal}
+                  </div>
+                </div>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {status === "idle" && streamedTasks.length === 0 && (
           <motion.div 
             initial={{ opacity: 0 }}

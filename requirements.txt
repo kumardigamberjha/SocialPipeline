@@ -4,6 +4,16 @@ uvicorn[standard]>=0.34.0
 crewai>=0.100.0
 python-dotenv>=1.0.0
 pydantic-settings>=2.6.0
+
+# ── LangChain / LLM Providers ────────────────────────────────────────────────
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-anthropic>=0.2.0
+langchain-google-genai>=2.0.0
+langchain-groq>=0.2.0
+langchain-nvidia-ai-endpoints>=0.3.0
+langchain-ollama>=0.2.0
+langchain-community>=0.3.0
 qdrant-client>=1.7.0
 websockets>=12.0
 bcrypt>=4.0.0
@@ -27,3 +37,4 @@ sentence-transformers>=3.0.0
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
 duckduckgo-search>=6.0.0
+aiohttp>=3.9.0  # blog Researcher agent fetches source pages concurrently
