@@ -192,7 +192,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```bash
 celery -A app.tasks:app worker -Q linkedin_queue --concurrency=4 --loglevel=info
 celery -A app.tasks:app worker -Q blog_queue --concurrency=2 --loglevel=info
+celery -A app.tasks:app worker -Q youtube_queue --concurrency=2 --loglevel=info
 ```
+(One combined worker also works: `celery -A app.tasks:app worker -Q linkedin_queue,blog_queue,youtube_queue`.
+If Redis is down, every pipeline falls back to in-process FastAPI BackgroundTasks automatically.)
 
 **Terminal 3 — Frontend**
 ```bash
@@ -203,6 +206,32 @@ cd dashboard && npm run dev
 ```bash
 ./start_comfy.sh
 ```
+
+---
+
+## Content Planner
+
+The dashboard has a **Planner** page (`http://localhost:3000/planner`) for weekly/monthly content plans:
+
+- **Create a plan** — pick weekly or monthly, a niche, and a start date. "Suggest with AI" fills the period with dated topic ideas (deduped against your published-topic history); every row is editable before saving.
+- **Per-item production pipeline** — each topic tracks `pending → script_generated → presentation_created → video_created → video_edited → video_published`. `script_generated` is set automatically when a YouTube script finishes; advance the rest from the dropdown as you produce the video.
+- **Generate content per item** — LinkedIn / Blog / YouTube buttons (or "Generate All") dispatch the existing pipelines for that topic. The page polls while anything is generating.
+- **Review & approve** — open Review to read each generated piece, then Approve / Reject / Reject & Regenerate. Decisions are persisted server-side.
+- **Google Calendar** — once at least one piece is approved, "Add to Calendar" creates a timed event (09:00 local, popup reminders 1 day + 1 hour before) on the item's scheduled date.
+
+### Google Calendar setup (one-time)
+
+1. In [Google Cloud Console](https://console.cloud.google.com/) create a project → **APIs & Services → Credentials → Create OAuth client ID** (type *Web application*).
+2. Add the authorized redirect URI **exactly**: `http://localhost:8000/api/google/callback`.
+3. Enable the **Google Calendar API** for the project, and while the consent screen is in *Testing* mode add your Google account as a **Test user**.
+4. Fill in `app/.env`:
+   - `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` — from the OAuth client
+   - `GOOGLE_REDIRECT_URI` — `http://localhost:8000/api/google/callback`
+   - `GOOGLE_TOKEN_ENCRYPTION_KEY` — Fernet key (already generated; rotate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`)
+   - `FRONTEND_URL`, `DEFAULT_TIMEZONE`
+5. Restart the backend, open the Planner page, and click **Connect** on the Google Calendar card.
+
+OAuth tokens are stored Fernet-encrypted in SQLite and are never returned by any endpoint.
 
 ---
 

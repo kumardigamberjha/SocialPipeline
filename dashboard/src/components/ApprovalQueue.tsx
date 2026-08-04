@@ -48,9 +48,9 @@ export default function ApprovalQueue({
   const modeDropdownRef = useRef<HTMLDivElement>(null);
 
   const pipelineModes = [
-    { value: "multi", label: "Full Suite", borderClass: "hover:border-blue-500/50", activeClass: "text-blue-400 bg-blue-500/10" },
-    { value: "linkedin", label: "LinkedIn Post", borderClass: "hover:border-purple-500/50", activeClass: "text-purple-400 bg-purple-500/10" },
-    { value: "blog", label: "Blog Article", borderClass: "hover:border-green-500/50", activeClass: "text-green-400 bg-green-500/10" },
+    { value: "multi", label: "Full Suite", description: "10-agent multi-platform pipeline", borderClass: "hover:border-blue-500/50", activeClass: "text-blue-400 bg-blue-500/10" },
+    { value: "linkedin", label: "LinkedIn Post", description: "Lean 4-agent LinkedIn pipeline", borderClass: "hover:border-purple-500/50", activeClass: "text-purple-400 bg-purple-500/10" },
+    { value: "blog", label: "Blog Article", description: "Long-form 5-agent blog pipeline", borderClass: "hover:border-green-500/50", activeClass: "text-green-400 bg-green-500/10" },
   ];
 
   const providers = [

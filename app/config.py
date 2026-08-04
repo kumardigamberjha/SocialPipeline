@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     anthropic_api_key: str | None = None
     gemini_api_key: str | None = None
     gemma_api_key: str | None = None
+    ollama_cloud_api_key: str | None = None
 
     # ── Database ──────────────────────────────────────────────
     sqlite_db_path: str = "./data/nexus.db"
@@ -45,6 +46,8 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 4096
     llm_timeout: int = 300
     ollama_model: str = "ollama/mistral:latest"
+    # Model used for the YouTube AI analysis feature (local Ollama qwen).
+    ollama_analysis_model: str = "ollama/qwen2.5:latest"
     ollama_api_base: str = "http://host.docker.internal:11434"
     openai_api_base: str = ""
 
@@ -60,6 +63,16 @@ class Settings(BaseSettings):
     # ── ComfyUI ──────────────────────────────────────────────
     comfy_host: str = "127.0.0.1"
     comfy_port: int = 8188
+
+    # ── Google Calendar (planner) ────────────────────────────
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_redirect_uri: str = "http://localhost:8000/api/google/callback"
+    # Fernet key for encrypting stored OAuth tokens. No default on purpose —
+    # generate one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    google_token_encryption_key: str = ""
+    frontend_url: str = "http://localhost:3000"
+    default_timezone: str = "Asia/Kolkata"
 
     # ── App ───────────────────────────────────────────────────
     app_name: str = "Wings of AI – Content Pipeline"

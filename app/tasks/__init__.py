@@ -19,5 +19,6 @@ app = celery_app
 
 from app.tasks.linkedin_task import run_linkedin_pipeline  # noqa: E402,F401  (registers the task)
 from app.tasks.blog_task import run_blog_pipeline  # noqa: E402,F401  (registers the task)
+from app.tasks.youtube_task import run_youtube_pipeline  # noqa: E402,F401  (registers the task)
 
-__all__ = ["celery_app", "app", "run_linkedin_pipeline", "run_blog_pipeline"]
+__all__ = ["celery_app", "app", "run_linkedin_pipeline", "run_blog_pipeline", "run_youtube_pipeline"]

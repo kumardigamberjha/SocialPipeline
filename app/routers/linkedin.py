@@ -77,18 +77,13 @@ def _run_linkedin_fallback(run_id: str, topic: str, niche: str, user_id: str, pr
         queries.update_run_status(run_id, "failed")
 
 
-import redis
-
-def _is_redis_available() -> bool:
-    try:
-        r = redis.Redis.from_url(get_settings().redis_url, socket_connect_timeout=1)
-        return r.ping()
-    except Exception:
-        return False
+from app.services.dispatch import should_use_celery
 
 def _dispatch(user_id: str, topic: str, niche: str, provider: str, background_tasks: BackgroundTasks) -> dict:
     """Shared launch logic for /generate and /regenerate: enforce usage, create a
-    run, and dispatch the Celery task onto the LinkedIn queue. Falls back to BackgroundTasks if Redis fails."""
+    run, and dispatch the Celery task onto the LinkedIn queue. Falls back to
+    running the pipeline in-process (BackgroundTasks) whenever Celery can't be
+    used — Redis down OR no worker draining the queue."""
     queries.reset_usage_if_expired(user_id)
     usage = queries.get_usage(user_id)
     if not usage:
@@ -100,26 +95,22 @@ def _dispatch(user_id: str, topic: str, niche: str, provider: str, background_ta
     run = queries.create_run(user_id, topic, provider)
     run_id = run["id"]
 
-    if _is_redis_available():
+    dispatched_to_celery = False
+    if should_use_celery(LINKEDIN_QUEUE):
         try:
             run_linkedin_pipeline.apply_async(
                 args=[run_id, topic, niche, user_id, provider],
                 queue=LINKEDIN_QUEUE,
                 ignore_result=True,
             )
+            dispatched_to_celery = True
         except Exception as exc:
-            logger.warning("Redis connection failed for Celery, falling back to BackgroundTasks. Error: %s", exc)
-            background_tasks.add_task(
-                _run_linkedin_fallback,
-                run_id, topic, niche, user_id, provider
-            )
-    else:
-        logger.warning("Redis not available, falling back to BackgroundTasks.")
-        background_tasks.add_task(
-            _run_linkedin_fallback,
-            run_id, topic, niche, user_id, provider
-        )
-        
+            logger.warning("Celery dispatch failed, falling back to BackgroundTasks. Error: %s", exc)
+
+    if not dispatched_to_celery:
+        logger.info("Running LinkedIn pipeline in-process (no Celery worker) ▸ run_id=%s", run_id)
+        background_tasks.add_task(_run_linkedin_fallback, run_id, topic, niche, user_id, provider)
+
     return {"run_id": run_id, "status": "queued", "message": "LinkedIn pipeline started"}
 
 

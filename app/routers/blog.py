@@ -18,12 +18,13 @@ import json
 import logging
 import re
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from app.core.auth_deps import get_current_user
 from app.db import queries
 
+from app.services.dispatch import run_blog_fallback, should_use_celery
 from app.tasks.blog_task import run_blog_pipeline
 
 logger = logging.getLogger(__name__)
@@ -50,8 +51,10 @@ class GenerateRequest(BaseModel):
 
 
 @router.post("/generate")
-def generate_blog(request: GenerateRequest, current_user: dict = Depends(get_current_user)):
-    """Enforce the monthly usage cap, create a run, and dispatch the pipeline."""
+def generate_blog(request: GenerateRequest, background_tasks: BackgroundTasks,
+                  current_user: dict = Depends(get_current_user)):
+    """Enforce the monthly usage cap, create a run, and dispatch the pipeline.
+    Falls back to in-process execution when no Celery worker is draining the queue."""
     user_id = current_user["id"]
 
     queries.reset_usage_if_expired(user_id)
@@ -65,10 +68,22 @@ def generate_blog(request: GenerateRequest, current_user: dict = Depends(get_cur
     run = queries.create_run(user_id, request.topic, request.provider)
     run_id = run["id"]
 
-    run_blog_pipeline.apply_async(
-        args=[run_id, request.topic, request.target_keyword, user_id, request.provider],
-        queue=BLOG_QUEUE,
-    )
+    dispatched_to_celery = False
+    if should_use_celery(BLOG_QUEUE):
+        try:
+            run_blog_pipeline.apply_async(
+                args=[run_id, request.topic, request.target_keyword, user_id, request.provider],
+                queue=BLOG_QUEUE,
+                ignore_result=True,
+            )
+            dispatched_to_celery = True
+        except Exception as exc:
+            logger.warning("Celery dispatch failed, falling back to BackgroundTasks: %s", exc)
+
+    if not dispatched_to_celery:
+        logger.info("Running blog pipeline in-process (no Celery worker) ▸ run_id=%s", run_id)
+        background_tasks.add_task(run_blog_fallback, run_id, request.topic, request.target_keyword, user_id, request.provider)
+
     return {"run_id": run_id, "status": "queued", "message": "Blog pipeline started"}
 
 

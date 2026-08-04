@@ -27,14 +27,22 @@ def build_llm(provider: str, settings: Settings) -> Any:
     provider = provider.lower().strip()
     
     # Always create the local Ollama LLM for fallback
-    ollama_llm = LLM(
-        model="ollama/qwen2.5-coder:latest",
-        base_url=settings.ollama_api_base,
-        temperature=settings.llm_temperature,
-    )
+    model_name = settings.ollama_model
+    if not model_name.startswith("ollama/"):
+        model_name = f"ollama/{model_name}"
+
+    ollama_kwargs = {
+        "model": model_name,
+        "base_url": settings.ollama_api_base,
+        "temperature": settings.llm_temperature,
+    }
+    if hasattr(settings, "ollama_cloud_api_key") and settings.ollama_cloud_api_key:
+        ollama_kwargs["api_key"] = settings.ollama_cloud_api_key
+
+    ollama_llm = LLM(**ollama_kwargs)
 
     if provider == "ollama":
-        logger.info("Building LLM  ▸ provider=ollama  model=qwen2.5-coder:latest  base=%s", settings.ollama_api_base)
+        logger.info("Building LLM  ▸ provider=ollama  model=%s  base=%s", model_name, settings.ollama_api_base)
         return ollama_llm
 
     primary_llm = None

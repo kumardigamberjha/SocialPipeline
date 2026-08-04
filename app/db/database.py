@@ -152,10 +152,130 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS content_plans (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            name TEXT NOT NULL,
+            plan_type TEXT NOT NULL CHECK (plan_type IN ('weekly', 'monthly')),
+            niche TEXT DEFAULT 'ai',
+            start_date TEXT NOT NULL,       -- ISO date 'YYYY-MM-DD'
+            end_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',   -- 'active' | 'archived'
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- production_status / review_status have NO CHECK constraint: SQLite cannot
+        -- alter a CHECK later and the stage list may grow. Validated in Pydantic.
+        CREATE TABLE IF NOT EXISTS plan_items (
+            id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL REFERENCES content_plans(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            topic TEXT NOT NULL,
+            scheduled_date TEXT NOT NULL,   -- ISO date: working / production slot
+            publish_date TEXT,              -- ISO date: when the content goes live (optional)
+            event_time TEXT,                -- 'HH:MM' local time for the calendar reminder (optional)
+            event_duration_minutes INTEGER, -- calendar event length in minutes (optional; default 60)
+            notes TEXT,
+            topic_source TEXT DEFAULT 'manual',  -- 'ai' | 'manual'
+            video_format TEXT DEFAULT 'full',    -- 'short' | 'full' (drives YouTube script length)
+            production_status TEXT NOT NULL DEFAULT 'pending',
+            gcal_event_id TEXT,
+            gcal_event_link TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- One row per (item x content_type) generation attempt; newest wins on
+        -- regenerate. Content bodies stay in linkedin_posts / blog_posts /
+        -- youtube_scripts; this is only the link + human-review state.
+        CREATE TABLE IF NOT EXISTS plan_item_content (
+            id TEXT PRIMARY KEY,
+            item_id TEXT NOT NULL REFERENCES plan_items(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            content_type TEXT NOT NULL,     -- 'linkedin' | 'blog' | 'youtube_script'
+            run_id TEXT REFERENCES agent_runs(id),
+            content_ref_id TEXT,            -- id in the content_type's own table
+            review_status TEXT NOT NULL DEFAULT 'generating',
+            reviewed_at TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- Locally-tracked "pending → published" video ideas attached to a real
+        -- YouTube playlist (by playlist_id). Mirrors plan_items; no CHECK on
+        -- production_status (validated in Pydantic, the stage list may grow).
+        CREATE TABLE IF NOT EXISTS youtube_playlist_items (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            playlist_id TEXT NOT NULL,           -- the YouTube playlist it's attached to
+            playlist_title TEXT,                 -- denormalized for display
+            title TEXT NOT NULL,                 -- video title / topic
+            description TEXT,                    -- angle / notes (trend rationale on add)
+            video_format TEXT DEFAULT 'full',    -- 'short' | 'full'
+            scheduled_date TEXT,                 -- ISO date: working slot (optional)
+            publish_date TEXT,                   -- ISO date: go-live (optional)
+            production_status TEXT NOT NULL DEFAULT 'pending',
+            source TEXT DEFAULT 'manual',        -- 'trend_idea' | 'manual'
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS youtube_scripts (
+            id TEXT PRIMARY KEY,
+            run_id TEXT REFERENCES agent_runs(id),
+            user_id TEXT NOT NULL REFERENCES users(id),
+            topic TEXT NOT NULL,
+            title TEXT,
+            script TEXT NOT NULL,           -- full markdown script with cue tags
+            word_count INTEGER,
+            seo_title TEXT,
+            seo_description TEXT,
+            seo_tags TEXT,                  -- JSON array string
+            approved INTEGER DEFAULT 0,
+            niche TEXT,
+            deleted_at TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS google_oauth_tokens (
+            user_id TEXT PRIMARY KEY REFERENCES users(id),
+            token_json_encrypted TEXT NOT NULL,  -- Fernet-encrypted Credentials JSON
+            scopes TEXT,
+            connected_email TEXT,
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS youtube_traffic_sources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            traffic_source TEXT UNIQUE NOT NULL,
+            views INTEGER DEFAULT 0,
+            watch_time_hours REAL DEFAULT 0.0,
+            avg_view_duration TEXT,
+            impressions INTEGER,
+            impressions_ctr REAL,
+            imported_at TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS youtube_published_videos (
+            video_id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            publish_time TEXT,
+            duration_seconds INTEGER,
+            views INTEGER DEFAULT 0,
+            watch_time_hours REAL DEFAULT 0.0,
+            subscribers INTEGER DEFAULT 0,
+            impressions INTEGER,
+            impressions_ctr REAL,
+            imported_at TEXT DEFAULT (datetime('now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_blog_posts_user ON blog_posts(user_id, published_at DESC);
         CREATE INDEX IF NOT EXISTS idx_blog_posts_slug ON blog_posts(slug);
-        
+
         CREATE INDEX IF NOT EXISTS idx_linkedin_posts_user ON linkedin_posts(user_id, created_at DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_plan_items_plan ON plan_items(plan_id, scheduled_date);
+        CREATE INDEX IF NOT EXISTS idx_plan_item_content_item ON plan_item_content(item_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_youtube_scripts_user ON youtube_scripts(user_id, created_at DESC);
 
         -- Seed niche_state if empty
         INSERT OR IGNORE INTO niche_state (id, last_niche) VALUES (1, 'ai');
@@ -181,5 +301,25 @@ def init_db():
         pass
     try:
         conn.execute("ALTER TABLE blog_posts ADD COLUMN deleted_at TEXT;")
+    except sqlite3.OperationalError:
+        pass
+    # plan_items gained an optional publish_date after the table first shipped.
+    try:
+        conn.execute("ALTER TABLE plan_items ADD COLUMN publish_date TEXT;")
+    except sqlite3.OperationalError:
+        pass
+    # plan_items gained a short/full video_format after the table first shipped.
+    try:
+        conn.execute("ALTER TABLE plan_items ADD COLUMN video_format TEXT DEFAULT 'full';")
+    except sqlite3.OperationalError:
+        pass
+    # plan_items gained an optional calendar event_time after the table first shipped.
+    try:
+        conn.execute("ALTER TABLE plan_items ADD COLUMN event_time TEXT;")
+    except sqlite3.OperationalError:
+        pass
+    # plan_items gained an optional calendar event duration after the table first shipped.
+    try:
+        conn.execute("ALTER TABLE plan_items ADD COLUMN event_duration_minutes INTEGER;")
     except sqlite3.OperationalError:
         pass

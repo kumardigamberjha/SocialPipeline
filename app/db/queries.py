@@ -93,9 +93,12 @@ def get_run_by_id(run_id: str) -> Optional[dict]:
     row = cursor.fetchone()
     return dict_from_row(row) if row else None
 
-def get_runs_by_user(user_id: str, limit: int = 50) -> List[dict]:
+def get_runs_by_user(user_id: str, limit: int = 50, offset: int = 0) -> List[dict]:
     db = get_db()
-    cursor = db.execute("SELECT * FROM agent_runs WHERE user_id = ? ORDER BY created_at DESC LIMIT ?", (user_id, limit))
+    cursor = db.execute(
+        "SELECT * FROM agent_runs WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (user_id, limit, offset),
+    )
     return [dict_from_row(row) for row in cursor.fetchall()]
 
 
@@ -354,5 +357,597 @@ def soft_delete_linkedin_post(post_id: str, user_id: str) -> bool:
         "UPDATE linkedin_posts SET deleted_at = datetime('now') WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
         (post_id, user_id)
     )
+    db.commit()
+    return cursor.rowcount > 0
+
+
+# -- YouTube Script Operations --
+
+def save_youtube_script(
+    run_id: str, user_id: str, topic: str, title: str, script: str,
+    word_count: int, seo_title: str, seo_description: str, seo_tags: str,
+    approved: bool, niche: str,
+) -> dict:
+    db = get_db()
+    script_id = generate_uuid()
+    db.execute(
+        """
+        INSERT INTO youtube_scripts
+            (id, run_id, user_id, topic, title, script, word_count,
+             seo_title, seo_description, seo_tags, approved, niche)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (script_id, run_id, user_id, topic, title, script, word_count,
+         seo_title, seo_description, seo_tags, 1 if approved else 0, niche)
+    )
+    db.commit()
+    cursor = db.execute("SELECT * FROM youtube_scripts WHERE id = ?", (script_id,))
+    return dict_from_row(cursor.fetchone())
+
+def get_youtube_scripts(user_id: str, limit: int = 20) -> List[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT id, run_id, user_id, topic, title, word_count, seo_title, approved, niche, created_at "
+        "FROM youtube_scripts WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
+        (user_id, limit)
+    )
+    return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_youtube_script_by_id(script_id: str, user_id: str) -> Optional[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM youtube_scripts WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+        (script_id, user_id)
+    )
+    row = cursor.fetchone()
+    return dict_from_row(row) if row else None
+
+def get_youtube_scripts_by_run_id(run_id: str) -> List[dict]:
+    db = get_db()
+    cursor = db.execute("SELECT * FROM youtube_scripts WHERE run_id = ?", (run_id,))
+    return [dict_from_row(row) for row in cursor.fetchall()]
+
+def soft_delete_youtube_script(script_id: str, user_id: str) -> bool:
+    db = get_db()
+    cursor = db.execute(
+        "UPDATE youtube_scripts SET deleted_at = datetime('now') WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
+        (script_id, user_id)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+
+# -- Content Plan Operations --
+# NOTE: update_plan() above belongs to usage_limits/billing; everything here is
+# prefixed content_plan / plan_item to avoid collision.
+
+def create_content_plan(user_id: str, name: str, plan_type: str, niche: str,
+                        start_date: str, end_date: str) -> dict:
+    db = get_db()
+    plan_id = generate_uuid()
+    db.execute(
+        "INSERT INTO content_plans (id, user_id, name, plan_type, niche, start_date, end_date) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (plan_id, user_id, name, plan_type, niche, start_date, end_date)
+    )
+    db.commit()
+    return get_content_plan_by_id(plan_id, user_id)
+
+def get_content_plans(user_id: str) -> List[dict]:
+    db = get_db()
+    cursor = db.execute(
+        """
+        SELECT p.*,
+               (SELECT COUNT(*) FROM plan_items i WHERE i.plan_id = p.id) AS item_count,
+               (SELECT COUNT(*) FROM plan_items i WHERE i.plan_id = p.id
+                 AND i.production_status = 'video_published') AS published_count
+        FROM content_plans p
+        WHERE p.user_id = ?
+        ORDER BY p.start_date DESC
+        """,
+        (user_id,)
+    )
+    return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_content_plan_by_id(plan_id: str, user_id: str) -> Optional[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM content_plans WHERE id = ? AND user_id = ?", (plan_id, user_id)
+    )
+    row = cursor.fetchone()
+    return dict_from_row(row) if row else None
+
+def update_content_plan(plan_id: str, user_id: str, name: str = None, status: str = None) -> bool:
+    db = get_db()
+    updates, params = [], []
+    if name is not None:
+        updates.append("name = ?")
+        params.append(name)
+    if status is not None:
+        updates.append("status = ?")
+        params.append(status)
+    if not updates:
+        return False
+    params += [plan_id, user_id]
+    cursor = db.execute(
+        f"UPDATE content_plans SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+        tuple(params)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+def delete_content_plan(plan_id: str, user_id: str) -> bool:
+    """Hard delete; plan_items and plan_item_content cascade (FK pragma is ON)."""
+    db = get_db()
+    cursor = db.execute(
+        "DELETE FROM content_plans WHERE id = ? AND user_id = ?", (plan_id, user_id)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+
+# -- Plan Item Operations --
+
+def create_plan_item(plan_id: str, user_id: str, topic: str, scheduled_date: str,
+                     notes: str = None, topic_source: str = "manual",
+                     publish_date: str = None, video_format: str = "full",
+                     event_time: str = None, event_duration_minutes: int = None) -> dict:
+    db = get_db()
+    item_id = generate_uuid()
+    db.execute(
+        "INSERT INTO plan_items (id, plan_id, user_id, topic, scheduled_date, publish_date, notes, topic_source, video_format, event_time, event_duration_minutes) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (item_id, plan_id, user_id, topic, scheduled_date, publish_date, notes, topic_source, video_format, event_time, event_duration_minutes)
+    )
+    db.commit()
+    return get_plan_item_by_id(item_id, user_id)
+
+def get_plan_items(plan_id: str, user_id: str) -> List[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM plan_items WHERE plan_id = ? AND user_id = ? ORDER BY scheduled_date ASC, created_at ASC",
+        (plan_id, user_id)
+    )
+    return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_plan_item_by_id(item_id: str, user_id: str) -> Optional[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM plan_items WHERE id = ? AND user_id = ?", (item_id, user_id)
+    )
+    row = cursor.fetchone()
+    return dict_from_row(row) if row else None
+
+# Sentinel so callers can clear publish_date (pass None) vs. leave it unchanged (omit).
+_UNSET = object()
+
+def update_plan_item(item_id: str, user_id: str, topic: str = None, scheduled_date: str = None,
+                     notes: str = None, production_status: str = None,
+                     publish_date=_UNSET, video_format: str = None,
+                     event_time=_UNSET, event_duration_minutes: int = None) -> bool:
+    db = get_db()
+    updates, params = [], []
+    if topic is not None:
+        updates.append("topic = ?")
+        params.append(topic)
+    if scheduled_date is not None:
+        updates.append("scheduled_date = ?")
+        params.append(scheduled_date)
+    if publish_date is not _UNSET:
+        updates.append("publish_date = ?")
+        params.append(publish_date)  # None clears it; a date string sets it
+    if event_time is not _UNSET:
+        updates.append("event_time = ?")
+        params.append(event_time)  # None clears it; 'HH:MM' sets it
+    if event_duration_minutes is not None:
+        updates.append("event_duration_minutes = ?")
+        params.append(event_duration_minutes)
+    if video_format is not None:
+        updates.append("video_format = ?")
+        params.append(video_format)
+    if notes is not None:
+        updates.append("notes = ?")
+        params.append(notes)
+    if production_status is not None:
+        updates.append("production_status = ?")
+        params.append(production_status)
+    if not updates:
+        return False
+    updates.append("updated_at = datetime('now')")
+    params += [item_id, user_id]
+    cursor = db.execute(
+        f"UPDATE plan_items SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+        tuple(params)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+def set_plan_item_calendar_event(item_id: str, event_id: str, event_link: str,
+                                 event_time: str = None, event_duration_minutes: int = None) -> None:
+    db = get_db()
+    fields = ["gcal_event_id = ?", "gcal_event_link = ?"]
+    params = [event_id, event_link]
+    if event_time is not None:
+        fields.append("event_time = ?")
+        params.append(event_time)
+    if event_duration_minutes is not None:
+        fields.append("event_duration_minutes = ?")
+        params.append(event_duration_minutes)
+    fields.append("updated_at = datetime('now')")
+    params.append(item_id)
+    db.execute(f"UPDATE plan_items SET {', '.join(fields)} WHERE id = ?", tuple(params))
+    db.commit()
+
+def clear_plan_item_calendar_event(item_id: str) -> None:
+    """Forget the linked calendar event (e.g. it was deleted in Google Calendar)
+    so the UI offers 'Add to Calendar' again."""
+    db = get_db()
+    db.execute(
+        "UPDATE plan_items SET gcal_event_id = NULL, gcal_event_link = NULL, updated_at = datetime('now') WHERE id = ?",
+        (item_id,)
+    )
+    db.commit()
+
+def delete_plan_item(item_id: str, user_id: str) -> bool:
+    db = get_db()
+    cursor = db.execute(
+        "DELETE FROM plan_items WHERE id = ? AND user_id = ?", (item_id, user_id)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+# -- YouTube Playlist Item Operations (local pending → published tracker) --
+
+def create_youtube_playlist_item(user_id: str, playlist_id: str, title: str,
+                                 playlist_title: str = None, description: str = None,
+                                 video_format: str = "full", scheduled_date: str = None,
+                                 publish_date: str = None, source: str = "manual") -> dict:
+    db = get_db()
+    item_id = generate_uuid()
+    db.execute(
+        "INSERT INTO youtube_playlist_items "
+        "(id, user_id, playlist_id, playlist_title, title, description, video_format, scheduled_date, publish_date, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (item_id, user_id, playlist_id, playlist_title, title, description, video_format, scheduled_date, publish_date, source)
+    )
+    db.commit()
+    return get_youtube_playlist_item_by_id(item_id, user_id)
+
+def get_youtube_playlist_items(user_id: str, playlist_id: str = None) -> List[dict]:
+    db = get_db()
+    if playlist_id is not None:
+        cursor = db.execute(
+            "SELECT * FROM youtube_playlist_items WHERE user_id = ? AND playlist_id = ? "
+            "ORDER BY production_status ASC, scheduled_date ASC, created_at ASC",
+            (user_id, playlist_id)
+        )
+    else:
+        cursor = db.execute(
+            "SELECT * FROM youtube_playlist_items WHERE user_id = ? "
+            "ORDER BY production_status ASC, scheduled_date ASC, created_at ASC",
+            (user_id,)
+        )
+    return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_youtube_playlist_item_by_id(item_id: str, user_id: str) -> Optional[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM youtube_playlist_items WHERE id = ? AND user_id = ?", (item_id, user_id)
+    )
+    row = cursor.fetchone()
+    return dict_from_row(row) if row else None
+
+def update_youtube_playlist_item(item_id: str, user_id: str, title: str = None,
+                                 description=_UNSET, video_format: str = None,
+                                 scheduled_date=_UNSET, publish_date=_UNSET,
+                                 production_status: str = None) -> bool:
+    db = get_db()
+    updates, params = [], []
+    if title is not None:
+        updates.append("title = ?")
+        params.append(title)
+    if description is not _UNSET:
+        updates.append("description = ?")
+        params.append(description)  # None clears it
+    if video_format is not None:
+        updates.append("video_format = ?")
+        params.append(video_format)
+    if scheduled_date is not _UNSET:
+        updates.append("scheduled_date = ?")
+        params.append(scheduled_date)  # None clears it
+    if publish_date is not _UNSET:
+        updates.append("publish_date = ?")
+        params.append(publish_date)  # None clears it
+    if production_status is not None:
+        updates.append("production_status = ?")
+        params.append(production_status)
+    if not updates:
+        return False
+    updates.append("updated_at = datetime('now')")
+    params += [item_id, user_id]
+    cursor = db.execute(
+        f"UPDATE youtube_playlist_items SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+        tuple(params)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+def delete_youtube_playlist_item(item_id: str, user_id: str) -> bool:
+    db = get_db()
+    cursor = db.execute(
+        "DELETE FROM youtube_playlist_items WHERE id = ? AND user_id = ?", (item_id, user_id)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+
+def get_recent_plan_topics(user_id: str, days: int = 90) -> List[str]:
+    """Topics already placed in any plan recently — dedup context for the suggester."""
+    db = get_db()
+    cursor = db.execute(
+        "SELECT topic FROM plan_items WHERE user_id = ? AND created_at > datetime('now', ?)",
+        (user_id, f"-{days} days")
+    )
+    return [row["topic"] for row in cursor.fetchall()]
+
+
+# -- Plan Item Content Operations --
+
+def create_plan_item_content(item_id: str, user_id: str, content_type: str, run_id: str) -> dict:
+    db = get_db()
+    content_id = generate_uuid()
+    db.execute(
+        "INSERT INTO plan_item_content (id, item_id, user_id, content_type, run_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (content_id, item_id, user_id, content_type, run_id)
+    )
+    db.commit()
+    return get_plan_item_content_by_id(content_id, user_id)
+
+def get_plan_item_contents(item_id: str, user_id: str) -> List[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM plan_item_content WHERE item_id = ? AND user_id = ? ORDER BY created_at DESC, id DESC",
+        (item_id, user_id)
+    )
+    return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_plan_item_content_by_id(content_id: str, user_id: str) -> Optional[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM plan_item_content WHERE id = ? AND user_id = ?", (content_id, user_id)
+    )
+    row = cursor.fetchone()
+    return dict_from_row(row) if row else None
+
+def update_plan_item_content(content_id: str, content_ref_id: str = None,
+                             review_status: str = None) -> None:
+    db = get_db()
+    updates, params = [], []
+    if content_ref_id is not None:
+        updates.append("content_ref_id = ?")
+        params.append(content_ref_id)
+    if review_status is not None:
+        updates.append("review_status = ?")
+        params.append(review_status)
+        if review_status in ("approved", "rejected"):
+            updates.append("reviewed_at = datetime('now')")
+    if not updates:
+        return
+    params.append(content_id)
+    db.execute(
+        f"UPDATE plan_item_content SET {', '.join(updates)} WHERE id = ?",
+        tuple(params)
+    )
+    db.commit()
+
+
+# -- Planner Analytics --
+
+# Production lifecycle order (mirrors app.models.planner.ProductionStatus).
+PRODUCTION_STATUS_ORDER = [
+    "pending",
+    "script_generated",
+    "presentation_created",
+    "video_created",
+    "video_edited",
+    "video_published",
+]
+CONTENT_TYPES = ["linkedin", "blog", "youtube_script"]
+REVIEW_STATUSES = ["generating", "ready", "approved", "rejected", "failed"]
+
+
+def _count_map(rows, key: str) -> Dict[str, int]:
+    """Turn [{key: 'x', 'n': 3}, ...] rows into {'x': 3}."""
+    return {row[key]: row["n"] for row in rows}
+
+
+def get_planner_analytics(user_id: str) -> dict:
+    """Aggregate planner metrics for the analytics dashboard (scoped to a user).
+
+    Returns status breakdowns, content mix, generation reliability, schedule
+    adherence, per-platform word metrics and top-line KPIs in a single dict.
+    All sub-queries are index-backed GROUP BYs over the planner tables.
+    """
+    db = get_db()
+
+    def rows(sql: str, params=(user_id,)):
+        return [dict_from_row(r) for r in db.execute(sql, params).fetchall()]
+
+    def scalar(sql: str, params=(user_id,)):
+        row = db.execute(sql, params).fetchone()
+        return row[0] if row and row[0] is not None else 0
+
+    # -- Plans --
+    total_plans = scalar("SELECT COUNT(*) FROM content_plans WHERE user_id = ?")
+    plans_by_status = _count_map(
+        rows("SELECT status, COUNT(*) n FROM content_plans WHERE user_id = ? GROUP BY status"),
+        "status",
+    )
+    plans_by_type = _count_map(
+        rows("SELECT plan_type, COUNT(*) n FROM content_plans WHERE user_id = ? GROUP BY plan_type"),
+        "plan_type",
+    )
+    plans_by_niche = _count_map(
+        rows("SELECT niche, COUNT(*) n FROM content_plans WHERE user_id = ? GROUP BY niche"),
+        "niche",
+    )
+
+    # -- Items funnel --
+    status_counts = _count_map(
+        rows(
+            "SELECT production_status, COUNT(*) n FROM plan_items "
+            "WHERE user_id = ? GROUP BY production_status"
+        ),
+        "production_status",
+    )
+    items_funnel = [
+        {"status": s, "count": status_counts.get(s, 0)} for s in PRODUCTION_STATUS_ORDER
+    ]
+    total_items = sum(status_counts.values())
+    published_items = status_counts.get("video_published", 0)
+    items_by_format = _count_map(
+        rows("SELECT video_format, COUNT(*) n FROM plan_items WHERE user_id = ? GROUP BY video_format"),
+        "video_format",
+    )
+    items_by_source = _count_map(
+        rows("SELECT topic_source, COUNT(*) n FROM plan_items WHERE user_id = ? GROUP BY topic_source"),
+        "topic_source",
+    )
+
+    # -- Content mix (type x review status) --
+    mix_rows = rows(
+        "SELECT content_type, review_status, COUNT(*) n FROM plan_item_content "
+        "WHERE user_id = ? GROUP BY content_type, review_status"
+    )
+    content_by_type = {t: 0 for t in CONTENT_TYPES}
+    content_by_review = {s: 0 for s in REVIEW_STATUSES}
+    for r in mix_rows:
+        content_by_type[r["content_type"]] = content_by_type.get(r["content_type"], 0) + r["n"]
+        content_by_review[r["review_status"]] = content_by_review.get(r["review_status"], 0) + r["n"]
+    total_content = sum(content_by_type.values())
+
+    # -- Volume over time (content pieces generated per day) --
+    volume_over_time = rows(
+        "SELECT date(created_at) AS day, COUNT(*) n FROM plan_item_content "
+        "WHERE user_id = ? GROUP BY day ORDER BY day"
+    )
+
+    # -- Schedule adherence --
+    overdue = scalar(
+        "SELECT COUNT(*) FROM plan_items WHERE user_id = ? "
+        "AND production_status != 'video_published' AND date(scheduled_date) < date('now')"
+    )
+    upcoming = scalar(
+        "SELECT COUNT(*) FROM plan_items WHERE user_id = ? "
+        "AND production_status != 'video_published' AND date(scheduled_date) >= date('now')"
+    )
+    schedule = {
+        "published": published_items,
+        "overdue": overdue,
+        "upcoming": upcoming,
+    }
+
+    # -- Generation reliability (runs behind planner content) --
+    gen_rows = rows(
+        "SELECT r.status, COUNT(*) n, AVG(r.duration_seconds) avg_seconds "
+        "FROM agent_runs r JOIN plan_item_content c ON c.run_id = r.id "
+        "WHERE c.user_id = ? GROUP BY r.status"
+    )
+    generation = {
+        r["status"]: {"count": r["n"], "avg_seconds": round(r["avg_seconds"] or 0, 2)}
+        for r in gen_rows
+    }
+    avg_gen_seconds = round(
+        scalar(
+            "SELECT AVG(r.duration_seconds) FROM agent_runs r "
+            "JOIN plan_item_content c ON c.run_id = r.id "
+            "WHERE c.user_id = ? AND r.duration_seconds IS NOT NULL"
+        )
+        or 0,
+        2,
+    )
+
+    # -- Per-platform word metrics (join to source tables via content_ref_id) --
+    word_metrics = {}
+    for content_type, table in (
+        ("linkedin", "linkedin_posts"),
+        ("blog", "blog_posts"),
+        ("youtube_script", "youtube_scripts"),
+    ):
+        row = db.execute(
+            f"SELECT COUNT(*) c, COALESCE(SUM(word_count), 0) total, "
+            f"COALESCE(AVG(word_count), 0) avg FROM {table} WHERE id IN "
+            f"(SELECT content_ref_id FROM plan_item_content "
+            f"WHERE user_id = ? AND content_type = ?)",
+            (user_id, content_type),
+        ).fetchone()
+        word_metrics[content_type] = {
+            "count": row[0],
+            "total_words": row[1],
+            "avg_words": round(row[2], 1),
+        }
+
+    # -- Top-line KPIs --
+    approved = content_by_review.get("approved", 0)
+    rejected = content_by_review.get("rejected", 0)
+    ready = content_by_review.get("ready", 0)
+    reviewed_pool = approved + rejected + ready
+    approval_rate = round(100 * approved / reviewed_pool, 1) if reviewed_pool else 0.0
+
+    return {
+        "kpis": {
+            "total_plans": total_plans,
+            "total_items": total_items,
+            "total_content": total_content,
+            "published_items": published_items,
+            "approval_rate": approval_rate,
+            "avg_gen_seconds": avg_gen_seconds,
+        },
+        "plans": {
+            "by_status": plans_by_status,
+            "by_type": plans_by_type,
+            "by_niche": plans_by_niche,
+        },
+        "items_funnel": items_funnel,
+        "items_by_format": items_by_format,
+        "items_by_source": items_by_source,
+        "content_by_type": content_by_type,
+        "content_by_review": content_by_review,
+        "volume_over_time": volume_over_time,
+        "schedule": schedule,
+        "generation": generation,
+        "word_metrics": word_metrics,
+    }
+
+
+# -- Google OAuth Token Operations --
+
+def save_google_tokens(user_id: str, token_json_encrypted: str, scopes: str = None,
+                       connected_email: str = None) -> None:
+    db = get_db()
+    db.execute(
+        """
+        INSERT INTO google_oauth_tokens (user_id, token_json_encrypted, scopes, connected_email, updated_at)
+        VALUES (?, ?, ?, ?, datetime('now'))
+        ON CONFLICT(user_id) DO UPDATE SET
+            token_json_encrypted = excluded.token_json_encrypted,
+            scopes = COALESCE(excluded.scopes, scopes),
+            connected_email = COALESCE(excluded.connected_email, connected_email),
+            updated_at = datetime('now')
+        """,
+        (user_id, token_json_encrypted, scopes, connected_email)
+    )
+    db.commit()
+
+def get_google_tokens(user_id: str) -> Optional[dict]:
+    db = get_db()
+    cursor = db.execute("SELECT * FROM google_oauth_tokens WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    return dict_from_row(row) if row else None
+
+def delete_google_tokens(user_id: str) -> bool:
+    db = get_db()
+    cursor = db.execute("DELETE FROM google_oauth_tokens WHERE user_id = ?", (user_id,))
     db.commit()
     return cursor.rowcount > 0

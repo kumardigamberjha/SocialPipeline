@@ -8,10 +8,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 @router.get("")
-def get_recent_runs(limit: int = 50, user: dict = Depends(get_current_user)):
-    """Fetch the most recent agent runs for the telemetry ledger."""
+def get_recent_runs(limit: int = 20, offset: int = 0, user: dict = Depends(get_current_user)):
+    """Fetch a page of agent runs for the telemetry ledger."""
     try:
-        runs = queries.get_runs_by_user(user['id'], limit)
+        runs = queries.get_runs_by_user(user['id'], limit, offset)
         return runs
     except Exception as e:
         logger.error(f"Failed to fetch runs from SQLite: {e}")

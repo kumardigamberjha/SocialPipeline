@@ -2,12 +2,21 @@
 
 import { Activity, Radio, Users } from "lucide-react";
 import { motion } from "framer-motion";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api, HealthResponse } from "@/lib/api";
+
+const NAV_LINKS = [
+  { href: "/", label: "Nexus" },
+  { href: "/planner", label: "Planner" },
+  { href: "/youtube-analysis", label: "YouTube" },
+];
 
 export default function Header() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [isOnline, setIsOnline] = useState(false);
+  const pathname = usePathname();
 
   useEffect(() => {
     const checkHealth = async () => {
@@ -52,6 +61,27 @@ export default function Header() {
             </p>
           </div>
         </div>
+
+        {/* Center — Navigation */}
+        <nav className="flex items-center gap-1 rounded-lg border border-white/5 bg-white/[0.02] p-1">
+          {NAV_LINKS.map(({ href, label }) => {
+            // "/planner" stays active on its sub-pages (e.g. /planner-analysis).
+            const isActive = href === "/" ? pathname === "/" : pathname.startsWith(href);
+            return (
+              <Link
+                key={href}
+                href={href}
+                className={`text-xs px-3 py-1.5 rounded-md uppercase tracking-wider transition-colors ${
+                  isActive
+                    ? "bg-blue-600/20 text-blue-300 border border-blue-500/30"
+                    : "text-slate-500 hover:text-slate-200"
+                }`}
+              >
+                {label}
+              </Link>
+            );
+          })}
+        </nav>
 
         {/* Right — Status Indicators */}
         <div className="flex items-center gap-4 sm:gap-6">

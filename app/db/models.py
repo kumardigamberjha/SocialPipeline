@@ -87,3 +87,32 @@ class UsageLogCreate(BaseModel):
 
 class UsageLog(UsageLogCreate):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+
+# ── 8. YouTube Analytics ──
+class YoutubeTrafficSourceCreate(BaseModel):
+    traffic_source: str
+    views: int = 0
+    watch_time_hours: float = 0.0
+    avg_view_duration: Optional[str] = None
+    impressions: Optional[int] = None
+    impressions_ctr: Optional[float] = None
+    imported_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
+
+class YoutubeTrafficSource(YoutubeTrafficSourceCreate):
+    id: int
+
+class YoutubePublishedVideoCreate(BaseModel):
+    video_id: str
+    title: str
+    publish_time: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    views: int = 0
+    watch_time_hours: float = 0.0
+    subscribers: Optional[int] = None
+    impressions: Optional[int] = None
+    impressions_ctr: Optional[float] = None
+    imported_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
+
+class YoutubePublishedVideo(YoutubePublishedVideoCreate):
+    pass
+
