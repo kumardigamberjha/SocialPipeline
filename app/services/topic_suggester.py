@@ -132,15 +132,21 @@ def _filter_duplicates(ideas: list[_TopicIdea], extra_seen: set[str]) -> list[_T
 
 
 async def suggest_topics(user_id: str, plan_type: str, niche: str, start_date: date,
-                         count: int | None = None, provider: str = None) -> list[dict]:
-    """Return [{topic, rationale, scheduled_date}] for a weekly/monthly plan."""
+                         count: int | None = None, provider: str = None,
+                         extra_recent: list[str] | None = None) -> list[dict]:
+    """Return [{topic, rationale, scheduled_date}] for a weekly/monthly plan.
+
+    extra_recent adds more "already covered" titles to the do-not-repeat list —
+    used by auto-research to avoid re-proposing topics already sitting in the
+    saved-topic backlog, which _gather_recent_topics does not know about.
+    """
     from app.config import get_settings
 
     provider = provider or get_settings().default_provider
     end, default_count = _period_bounds(plan_type, start_date)
     count = count or default_count
 
-    recent = _gather_recent_topics(user_id)
+    recent = _gather_recent_topics(user_id) + list(extra_recent or [])
     llm = make_llm(provider, SUGGESTER_TEMPERATURE, max_tokens=4096)
 
     seen: set[str] = set()

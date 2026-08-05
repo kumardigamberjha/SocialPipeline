@@ -105,38 +105,68 @@ async def auto_generate_endpoint(
                     await manager.send_json({"type": "error", "message": msg}, client_id)
                     continue
 
-                if provider == "ollama":
-                    auto_topic = (
-                        "LATEST AI TRENDS: Select one of the absolute most trending AI topics today "
-                        "(e.g., local LLMs, AI agents, RAG, or new reasoning models). Perform a deep trend analysis "
-                        "on it and base every single subsequent task output entirely on that specific topic."
+                from app.crew import run_pipeline_streaming
+                from app.db.content_tracker import rotate_niche
+                from app.services import saved_topic_service
+
+                # auto_select_topic() no longer runs on the happy path, so the
+                # niche is rotated here instead — exactly once per click.
+                niche = rotate_niche()
+
+                # Research one candidate set: [0] is generated now, the rest are
+                # parked as an "uncovered" backlog the user can return to.
+                candidates = []
+                try:
+                    await manager.send_json({
+                        "type": "agent_update",
+                        "agent": "Topic Research",
+                        "output": "Researching candidate topics…",
+                    }, client_id)
+                    candidates = await saved_topic_service.research_candidates(
+                        user_id=user_id, provider=provider, niche=niche,
+                    )
+                except Exception:
+                    # The suggester must never break the button — fall back to
+                    # the original seed-bank behaviour below.
+                    logger.exception("Candidate research failed; falling back to auto_select_topic")
+
+                if candidates:
+                    chosen = candidates[0]["topic"]
+                    run_id = queries.create_run(user_id, chosen, provider)["id"]
+                    saved = saved_topic_service.save_candidates(
+                        user_id, candidates[1:], niche, source_run_id=run_id,
+                    )
+                    if saved:
+                        await manager.send_json(
+                            {"type": "saved_topics", "count": saved}, client_id
+                        )
+                    asyncio.create_task(
+                        run_pipeline_streaming(
+                            topic=chosen,
+                            settings=settings,
+                            provider=provider,
+                            client_id=client_id,
+                            run_id=run_id,
+                            auto_research=False,   # topic already chosen
+                            niche=niche,
+                            user_id=user_id,
+                        )
                     )
                 else:
-                    auto_topic = (
-                        "LATEST AI TRENDS: Use your web search tool to find the most breaking, viral AI news from today. "
-                        "CRITICAL: When using the web_search tool, do NOT query this entire sentence. "
-                        "Use short, specific keywords like 'latest AI trends today' or 'viral tech news 2024'. "
-                        "Pick the absolute #1 most viral AI topic right now, perform a deep trend analysis, "
-                        "and base every single subsequent task output entirely on that specific topic."
+                    # Fallback: original behaviour, topic picked from the seed
+                    # banks inside the pipeline.
+                    run_id = queries.create_run(user_id, "Auto-research (seed banks)", provider)["id"]
+                    asyncio.create_task(
+                        run_pipeline_streaming(
+                            topic="auto",
+                            settings=settings,
+                            provider=provider,
+                            client_id=client_id,
+                            run_id=run_id,
+                            auto_research=True,
+                            user_id=user_id,
+                        )
                     )
-
-                # Create run in SQLite
-                run = queries.create_run(user_id, auto_topic, provider)
-                run_id = run['id']
-
-                # 5) Dispatch streaming pipeline with auto_research=True
-                from app.crew import run_pipeline_streaming
-                asyncio.create_task(
-                    run_pipeline_streaming(
-                        topic="auto",
-                        settings=settings,
-                        provider=provider,
-                        client_id=client_id,
-                        run_id=run_id,
-                        auto_research=True,
-                        user_id=user_id
-                    )
-                )
 
             except json.JSONDecodeError:
                 await manager.send_json({"type": "error", "message": "Invalid JSON"}, client_id)

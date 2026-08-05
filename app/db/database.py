@@ -200,6 +200,41 @@ def init_db():
             created_at TEXT DEFAULT (datetime('now'))
         );
 
+        -- Candidate topics an auto-research run surfaced but did NOT generate
+        -- ("uncovered"), plus anything the user adds by hand. No CHECK on status:
+        -- SQLite cannot alter a CHECK later and the stage list may grow.
+        -- Validated in Pydantic (app/models/saved_topics.py).
+        CREATE TABLE IF NOT EXISTS saved_topics (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            topic TEXT NOT NULL,
+            topic_normalized TEXT NOT NULL,      -- dedup key; content_tracker.normalize_topic()
+            rationale TEXT,                      -- "why now" line from the suggester
+            niche TEXT DEFAULT 'ai',
+            source TEXT DEFAULT 'auto_research', -- 'auto_research' | 'manual'
+            source_run_id TEXT REFERENCES agent_runs(id),  -- run whose sibling was generated
+            status TEXT NOT NULL DEFAULT 'uncovered',      -- 'uncovered'|'generating'|'generated'
+            dismissed_at TEXT,                   -- hidden without generating; NULL = still listed
+            generated_at TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- One row per (saved_topic x content_type) attempt; newest wins on
+        -- regenerate. Mirrors plan_item_content but owned by saved_topics --
+        -- plan_item_content.item_id is a hard FK to plan_items and cannot be
+        -- reused without inventing a fake plan. Bodies stay in the content tables.
+        CREATE TABLE IF NOT EXISTS saved_topic_runs (
+            id TEXT PRIMARY KEY,
+            saved_topic_id TEXT NOT NULL REFERENCES saved_topics(id) ON DELETE CASCADE,
+            user_id TEXT NOT NULL REFERENCES users(id),
+            content_type TEXT NOT NULL,     -- 'linkedin' | 'blog' | 'youtube_script'
+            run_id TEXT REFERENCES agent_runs(id),
+            content_ref_id TEXT,            -- id in the content_type's own table
+            review_status TEXT NOT NULL DEFAULT 'generating',
+            created_at TEXT DEFAULT (datetime('now'))
+        );
+
         -- Locally-tracked "pending → published" video ideas attached to a real
         -- YouTube playlist (by playlist_id). Mirrors plan_items; no CHECK on
         -- production_status (validated in Pydantic, the stage list may grow).
@@ -276,6 +311,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_plan_items_plan ON plan_items(plan_id, scheduled_date);
         CREATE INDEX IF NOT EXISTS idx_plan_item_content_item ON plan_item_content(item_id, created_at DESC);
         CREATE INDEX IF NOT EXISTS idx_youtube_scripts_user ON youtube_scripts(user_id, created_at DESC);
+
+        -- One saved row per normalized topic per user: re-running auto-research
+        -- must not re-save an idea already sitting in the backlog.
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_saved_topics_user_norm ON saved_topics(user_id, topic_normalized);
+        CREATE INDEX IF NOT EXISTS idx_saved_topics_user_status ON saved_topics(user_id, status, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_saved_topic_runs_topic ON saved_topic_runs(saved_topic_id, created_at DESC);
 
         -- Seed niche_state if empty
         INSERT OR IGNORE INTO niche_state (id, last_niche) VALUES (1, 'ai');

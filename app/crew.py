@@ -390,6 +390,7 @@ async def run_pipeline_streaming(
     run_id: str,
     auto_research: bool = False,
     user_id: str = "system",
+    niche: str = "",
 ):
     loop = asyncio.get_running_loop()
 
@@ -405,10 +406,12 @@ async def run_pipeline_streaming(
         })
 
     def _run():
-        nonlocal topic
+        # niche is nonlocal so the caller-supplied value survives when the topic
+        # was already chosen upstream; auto-research overwrites it with the one
+        # auto_select_topic() rotated to.
+        nonlocal topic, niche
 
         # Auto-research or manual enrichment
-        niche = ""
         if auto_research:
             topic_selected, niche, enriched_topic = auto_select_topic()
             # Update topic to the auto-selected one

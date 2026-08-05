@@ -742,6 +742,179 @@ def update_plan_item_content(content_id: str, content_ref_id: str = None,
     db.commit()
 
 
+# -- Saved Topic Operations --
+
+def create_saved_topic(user_id: str, topic: str, rationale: str = None, niche: str = "ai",
+                       source: str = "auto_research",
+                       source_run_id: str = None) -> Optional[dict]:
+    """Save one candidate topic as 'uncovered'.
+
+    Returns None when the user already has a topic with the same normalized
+    form — INSERT OR IGNORE against idx_saved_topics_user_norm, so re-running
+    auto-research quietly skips ideas already in the backlog.
+    """
+    # Imported here: queries.py does not otherwise depend on content_tracker,
+    # which opens a different database file (./data/content_tracker.db).
+    from app.db.content_tracker import normalize_topic
+
+    db = get_db()
+    topic_id = generate_uuid()
+    cursor = db.execute(
+        "INSERT OR IGNORE INTO saved_topics "
+        "(id, user_id, topic, topic_normalized, rationale, niche, source, source_run_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (topic_id, user_id, topic, normalize_topic(topic), rationale, niche, source, source_run_id)
+    )
+    db.commit()
+    if cursor.rowcount == 0:
+        return None
+    return get_saved_topic_by_id(topic_id, user_id)
+
+def get_saved_topics(user_id: str, status: str = None,
+                     include_dismissed: bool = False) -> List[dict]:
+    db = get_db()
+    conditions = ["user_id = ?"]
+    params: list = [user_id]
+    if status:
+        conditions.append("status = ?")
+        params.append(status)
+    if not include_dismissed:
+        conditions.append("dismissed_at IS NULL")
+    cursor = db.execute(
+        f"SELECT * FROM saved_topics WHERE {' AND '.join(conditions)} "
+        "ORDER BY created_at DESC, id DESC",
+        tuple(params)
+    )
+    return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_saved_topic_by_id(topic_id: str, user_id: str) -> Optional[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM saved_topics WHERE id = ? AND user_id = ?", (topic_id, user_id)
+    )
+    row = cursor.fetchone()
+    return dict_from_row(row) if row else None
+
+def count_uncovered_topics(user_id: str) -> int:
+    """Backlog size — the only query the banner needs."""
+    db = get_db()
+    cursor = db.execute(
+        "SELECT COUNT(*) AS c FROM saved_topics "
+        "WHERE user_id = ? AND status = 'uncovered' AND dismissed_at IS NULL",
+        (user_id,)
+    )
+    return cursor.fetchone()["c"]
+
+def get_latest_saved_topic_at(user_id: str) -> Optional[str]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT MAX(created_at) AS latest FROM saved_topics "
+        "WHERE user_id = ? AND status = 'uncovered' AND dismissed_at IS NULL",
+        (user_id,)
+    )
+    return cursor.fetchone()["latest"]
+
+def update_saved_topic(topic_id: str, user_id: str, status: str = None,
+                       dismissed_at=_UNSET, topic: str = None) -> bool:
+    db = get_db()
+    updates, params = [], []
+    if status is not None:
+        updates.append("status = ?")
+        params.append(status)
+        if status == "generated":
+            # First success wins; regenerating must not move the timestamp.
+            updates.append("generated_at = COALESCE(generated_at, datetime('now'))")
+    if dismissed_at is not _UNSET:
+        updates.append("dismissed_at = ?")
+        params.append(dismissed_at)
+    if topic is not None:
+        from app.db.content_tracker import normalize_topic
+        updates.append("topic = ?")
+        params.append(topic)
+        updates.append("topic_normalized = ?")
+        params.append(normalize_topic(topic))
+    if not updates:
+        return False
+    updates.append("updated_at = datetime('now')")
+    params += [topic_id, user_id]
+    cursor = db.execute(
+        f"UPDATE saved_topics SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
+        tuple(params)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+def delete_saved_topic(topic_id: str, user_id: str) -> bool:
+    db = get_db()
+    cursor = db.execute(
+        "DELETE FROM saved_topics WHERE id = ? AND user_id = ?", (topic_id, user_id)
+    )
+    db.commit()
+    return cursor.rowcount > 0
+
+def get_uncovered_topic_titles(user_id: str) -> List[str]:
+    """Titles still awaiting generation — extra DO-NOT-REPEAT context for the
+    suggester, so it stops re-proposing what is already in the backlog."""
+    db = get_db()
+    cursor = db.execute(
+        "SELECT topic FROM saved_topics WHERE user_id = ? AND status != 'generated' "
+        "ORDER BY created_at DESC LIMIT 40",
+        (user_id,)
+    )
+    return [row["topic"] for row in cursor.fetchall()]
+
+
+# -- Saved Topic Run Operations --
+
+def create_saved_topic_run(saved_topic_id: str, user_id: str, content_type: str,
+                           run_id: str) -> dict:
+    db = get_db()
+    row_id = generate_uuid()
+    db.execute(
+        "INSERT INTO saved_topic_runs (id, saved_topic_id, user_id, content_type, run_id) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (row_id, saved_topic_id, user_id, content_type, run_id)
+    )
+    db.commit()
+    return get_saved_topic_run_by_id(row_id, user_id)
+
+def get_saved_topic_runs(saved_topic_id: str, user_id: str) -> List[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM saved_topic_runs WHERE saved_topic_id = ? AND user_id = ? "
+        "ORDER BY created_at DESC, id DESC",
+        (saved_topic_id, user_id)
+    )
+    return [dict_from_row(row) for row in cursor.fetchall()]
+
+def get_saved_topic_run_by_id(row_id: str, user_id: str) -> Optional[dict]:
+    db = get_db()
+    cursor = db.execute(
+        "SELECT * FROM saved_topic_runs WHERE id = ? AND user_id = ?", (row_id, user_id)
+    )
+    row = cursor.fetchone()
+    return dict_from_row(row) if row else None
+
+def update_saved_topic_run(row_id: str, content_ref_id: str = None,
+                           review_status: str = None) -> None:
+    db = get_db()
+    updates, params = [], []
+    if content_ref_id is not None:
+        updates.append("content_ref_id = ?")
+        params.append(content_ref_id)
+    if review_status is not None:
+        updates.append("review_status = ?")
+        params.append(review_status)
+    if not updates:
+        return
+    params.append(row_id)
+    db.execute(
+        f"UPDATE saved_topic_runs SET {', '.join(updates)} WHERE id = ?",
+        tuple(params)
+    )
+    db.commit()
+
+
 # -- Planner Analytics --
 
 # Production lifecycle order (mirrors app.models.planner.ProductionStatus).

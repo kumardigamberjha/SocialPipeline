@@ -19,25 +19,16 @@ from fastapi import BackgroundTasks, HTTPException
 
 from app.db import queries
 from app.services.dispatch import (
-    BLOG_QUEUE,
-    LINKEDIN_QUEUE,
-    YOUTUBE_QUEUE,
-    run_blog_fallback,
-    run_linkedin_fallback,
-    run_youtube_fallback,
-    should_use_celery,
+    CONTENT_LOOKUP,
+    CONTENT_TYPES,
+    dispatch_pipeline,
 )
 
 logger = logging.getLogger(__name__)
 
-CONTENT_TYPES = ("linkedin", "blog", "youtube_script")
-
-# content_type -> lookup for the produced row by run_id
-_CONTENT_LOOKUP = {
-    "linkedin": queries.get_linkedin_posts_by_run_id,
-    "blog": queries.get_blog_posts_by_run_id,
-    "youtube_script": queries.get_youtube_scripts_by_run_id,
-}
+# Re-exported under the names this module has always used, so existing callers
+# and the reconcile path below are unaffected by the move into dispatch.py.
+_CONTENT_LOOKUP = CONTENT_LOOKUP
 
 
 # ── Reconciliation ───────────────────────────────────────────────────────────
@@ -169,43 +160,22 @@ def dispatch_item_content(item: dict, content_type: str, provider: str, niche: s
                           background_tasks: BackgroundTasks) -> dict:
     """Create a run + plan_item_content link and dispatch one pipeline.
     Returns {content_type, run_id, content_id}."""
-    # Lazy imports so a broken Celery import can never take the API down.
-    from app.tasks.blog_task import run_blog_pipeline
-    from app.tasks.linkedin_task import run_linkedin_pipeline
-    from app.tasks.youtube_task import run_youtube_pipeline
-
     user_id = item["user_id"]
     topic = item["topic"]
-    video_format = item.get("video_format") or "full"
     run = queries.create_run(user_id, topic, provider)
     run_id = run["id"]
     content = queries.create_plan_item_content(item["id"], user_id, content_type, run_id)
 
-    celery_specs = {
-        "linkedin": (run_linkedin_pipeline, LINKEDIN_QUEUE, [run_id, topic, niche, user_id, provider]),
-        "blog": (run_blog_pipeline, BLOG_QUEUE, [run_id, topic, topic, user_id, provider]),  # target_keyword = topic
-        "youtube_script": (run_youtube_pipeline, YOUTUBE_QUEUE, [run_id, topic, niche, user_id, provider, video_format]),
-    }
-    fallback_specs = {
-        "linkedin": (run_linkedin_fallback, (run_id, topic, niche, user_id, provider)),
-        "blog": (run_blog_fallback, (run_id, topic, topic, user_id, provider)),
-        "youtube_script": (run_youtube_fallback, (run_id, topic, niche, user_id, provider, video_format)),
-    }
-
-    task, queue, args = celery_specs[content_type]
-    fb_fn, fb_args = fallback_specs[content_type]
-
-    dispatched_to_celery = False
-    if should_use_celery(queue):
-        try:
-            task.apply_async(args=args, queue=queue, ignore_result=True)
-            dispatched_to_celery = True
-        except Exception as exc:
-            logger.warning("Celery dispatch failed for %s, using BackgroundTasks: %s", content_type, exc)
-
-    if not dispatched_to_celery:
-        logger.info("Running %s pipeline in-process (no Celery worker) ▸ run_id=%s", content_type, run_id)
-        background_tasks.add_task(fb_fn, *fb_args)
+    dispatch_pipeline(
+        content_type=content_type,
+        run_id=run_id,
+        topic=topic,
+        niche=niche,
+        user_id=user_id,
+        provider=provider,
+        video_format=item.get("video_format") or "full",
+        background_tasks=background_tasks,
+    )
 
     return {"content_type": content_type, "run_id": run_id, "content_id": content["id"]}
 

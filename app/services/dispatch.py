@@ -165,3 +165,56 @@ def run_youtube_fallback(run_id: str, topic: str, niche: str, user_id: str, prov
     except Exception:
         logger.exception("YouTube pipeline FAILED (fallback) ▸ run_id=%s", run_id)
         queries.update_run_status(run_id, "failed")
+
+
+# ── Shared pipeline launcher ─────────────────────────────────────────────────
+
+CONTENT_TYPES = ("linkedin", "blog", "youtube_script")
+
+# content_type -> lookup for the produced row by run_id
+CONTENT_LOOKUP = {
+    "linkedin": queries.get_linkedin_posts_by_run_id,
+    "blog": queries.get_blog_posts_by_run_id,
+    "youtube_script": queries.get_youtube_scripts_by_run_id,
+}
+
+
+def dispatch_pipeline(content_type: str, run_id: str, topic: str, niche: str, user_id: str,
+                      provider: str, video_format: str, background_tasks) -> None:
+    """Launch one content pipeline for an already-created run.
+
+    Owner-agnostic on purpose: the caller has already created whatever link row
+    it needs (plan_item_content, saved_topic_runs, ...). Everything here — the
+    per-type task signatures, the queue names, the Celery-vs-BackgroundTasks
+    decision — is shared, so a new owner type never has to copy it.
+    """
+    # Lazy imports so a broken Celery import can never take the API down.
+    from app.tasks.blog_task import run_blog_pipeline
+    from app.tasks.linkedin_task import run_linkedin_pipeline
+    from app.tasks.youtube_task import run_youtube_pipeline
+
+    celery_specs = {
+        "linkedin": (run_linkedin_pipeline, LINKEDIN_QUEUE, [run_id, topic, niche, user_id, provider]),
+        "blog": (run_blog_pipeline, BLOG_QUEUE, [run_id, topic, topic, user_id, provider]),  # target_keyword = topic
+        "youtube_script": (run_youtube_pipeline, YOUTUBE_QUEUE, [run_id, topic, niche, user_id, provider, video_format]),
+    }
+    fallback_specs = {
+        "linkedin": (run_linkedin_fallback, (run_id, topic, niche, user_id, provider)),
+        "blog": (run_blog_fallback, (run_id, topic, topic, user_id, provider)),
+        "youtube_script": (run_youtube_fallback, (run_id, topic, niche, user_id, provider, video_format)),
+    }
+
+    task, queue, args = celery_specs[content_type]
+    fb_fn, fb_args = fallback_specs[content_type]
+
+    dispatched_to_celery = False
+    if should_use_celery(queue):
+        try:
+            task.apply_async(args=args, queue=queue, ignore_result=True)
+            dispatched_to_celery = True
+        except Exception as exc:
+            logger.warning("Celery dispatch failed for %s, using BackgroundTasks: %s", content_type, exc)
+
+    if not dispatched_to_celery:
+        logger.info("Running %s pipeline in-process (no Celery worker) ▸ run_id=%s", content_type, run_id)
+        background_tasks.add_task(fb_fn, *fb_args)

@@ -97,7 +97,7 @@ def create_app() -> FastAPI:
     )
 
     # ── Routers ──────────────────────────────────────────────────────────
-    from app.routers import ws, auth, rag, memory, runs, billing, linkedin, blog, youtube, planner, google_auth, youtube_analytics, youtube_playlist_items, instagram_analytics
+    from app.routers import ws, auth, rag, memory, runs, billing, linkedin, blog, youtube, planner, google_auth, youtube_analytics, youtube_playlist_items, instagram_analytics, instagram_auth, saved_topics
     application.include_router(health.router)
     application.include_router(generate.router)
     application.include_router(ws.router)
@@ -107,6 +107,8 @@ def create_app() -> FastAPI:
     application.include_router(runs.router)
     application.include_router(instagram.router)
     application.include_router(instagram_analytics.router)
+    application.include_router(instagram_auth.router)
+    application.include_router(instagram_auth.oauth_callback_router)
     application.include_router(billing.router)
     application.include_router(linkedin.router)
     application.include_router(linkedin.ws_router)
@@ -115,6 +117,7 @@ def create_app() -> FastAPI:
     application.include_router(youtube.router)
     application.include_router(youtube.ws_router)
     application.include_router(planner.router)
+    application.include_router(saved_topics.router)
     application.include_router(google_auth.router)
     application.include_router(youtube_analytics.router)
     application.include_router(youtube_playlist_items.router)
