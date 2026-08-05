@@ -50,6 +50,8 @@ def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
     settings = get_settings()
 
+    is_production = settings.environment == "production"
+
     application = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
@@ -58,8 +60,11 @@ def create_app() -> FastAPI:
             "Researches, writes, and deploys multi-platform developer content."
         ),
         lifespan=lifespan,
-        docs_url="/docs",
-        redoc_url="/redoc",
+        # Interactive docs publish the full endpoint surface. Keep them in
+        # development, withhold them in production.
+        docs_url=None if is_production else "/docs",
+        redoc_url=None if is_production else "/redoc",
+        openapi_url=None if is_production else "/openapi.json",
     )
 
     # ── Rate Limiting ────────────────────────────────────────────────────
@@ -67,20 +72,21 @@ def create_app() -> FastAPI:
     setup_rate_limiter(application)
 
     # ── CORS ─────────────────────────────────────────────────────────────
-    origins = [o.strip() for o in settings.cors_origins.split(",")]
-    if "*" in origins:
-        origins.remove("*")
+    # settings.cors_origins is the source of truth. The localhost origins are
+    # a development convenience only — appending them unconditionally (as this
+    # previously did) both discarded the configured value, since the default is
+    # "*", and left production permanently trusting localhost with credentials.
+    origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip() and o.strip() != "*"]
 
-    # Always include localhost/127.0.0.1 for development
-    dev_origins = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-    ]
-    for origin in dev_origins:
-        if origin not in origins:
-            origins.append(origin)
+    if not is_production:
+        for origin in (
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:3001",
+            "http://127.0.0.1:3001",
+        ):
+            if origin not in origins:
+                origins.append(origin)
 
     application.add_middleware(
         CORSMiddleware,
@@ -91,7 +97,7 @@ def create_app() -> FastAPI:
     )
 
     # ── Routers ──────────────────────────────────────────────────────────
-    from app.routers import ws, auth, rag, memory, runs, billing, linkedin, blog, youtube, planner, google_auth, youtube_analytics, youtube_playlist_items
+    from app.routers import ws, auth, rag, memory, runs, billing, linkedin, blog, youtube, planner, google_auth, youtube_analytics, youtube_playlist_items, instagram_analytics
     application.include_router(health.router)
     application.include_router(generate.router)
     application.include_router(ws.router)
@@ -100,6 +106,7 @@ def create_app() -> FastAPI:
     application.include_router(memory.router)
     application.include_router(runs.router)
     application.include_router(instagram.router)
+    application.include_router(instagram_analytics.router)
     application.include_router(billing.router)
     application.include_router(linkedin.router)
     application.include_router(linkedin.ws_router)
