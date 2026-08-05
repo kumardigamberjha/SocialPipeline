@@ -31,11 +31,17 @@ def trigger_youtube_import():
     if result.get("status") == "error":
         raise HTTPException(status_code=500, detail=result.get("message"))
     
+    # Cache invalidation is best-effort. redis.Redis.from_url() connects
+    # lazily, so redis_client is truthy even when Redis is down — without this
+    # guard a dead cache turned a *successful* import into a 500.
     if redis_client:
-        keys = redis_client.keys("yt:*")
-        if keys:
-            redis_client.delete(*keys)
-            
+        try:
+            keys = redis_client.keys("yt:*")
+            if keys:
+                redis_client.delete(*keys)
+        except redis.RedisError as exc:
+            logger.warning("Could not flush YouTube cache after import: %s", exc)
+
     return result
 
 

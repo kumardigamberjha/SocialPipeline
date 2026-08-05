@@ -11,13 +11,12 @@ services:
   # ── Redis (Message Broker + Result Backend) ─────────────────────────────
   redis:
     image: redis:7-alpine
-    # Not published to the host: every consumer (api, workers, flower) reaches
-    # Redis over the compose network. Publishing it exposed an unauthenticated
-    # broker holding task payloads. Uncomment only for local debugging, and
-    # bind to loopback if you do:
-    #   ports: ["127.0.0.1:6379:6379"]
-    expose:
-      - "6379"
+    # Bound to loopback rather than 0.0.0.0: an unauthenticated broker holding
+    # task payloads must not be reachable off-host. Still published (not just
+    # `expose`d) because the API and workers are commonly run directly on the
+    # host against a containerised Redis, and those reach it via localhost:6379.
+    ports:
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
