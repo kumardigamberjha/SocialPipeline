@@ -5,6 +5,7 @@ import Header from "@/components/Header";
 import AgentPipeline from "@/components/AgentPipeline";
 import ApprovalQueue, { StreamedTask } from "@/components/ApprovalQueue";
 import TelemetryLedger from "@/components/TelemetryLedger";
+import UncoveredTopicsBanner from "@/components/topics/UncoveredTopicsBanner";
 
 export default function Home() {
   const [isGenerating, setIsGenerating] = useState(false);
@@ -26,6 +27,11 @@ export default function Home() {
 
       {/* ── Content ── */}
       <div className="flex-1 flex flex-col gap-8 sm:gap-10 py-8 sm:py-10 overflow-hidden">
+        {/* Backlog nudge: renders nothing unless uncovered topics exist */}
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 w-full">
+          <UncoveredTopicsBanner />
+        </div>
+
         {/* Section 1: Agent Pipeline */}
         <AgentPipeline isProcessing={isGenerating} completedTasks={completedTasks} />
 

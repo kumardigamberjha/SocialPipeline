@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { SAVED_TOPICS_UPDATED_EVENT } from "@/lib/savedTopicsApi";
 import {
   Rocket,
   RefreshCw,
@@ -182,6 +183,10 @@ export default function ApprovalQueue({
 
           if (data.type === "task_finished" || data.type === "agent_update") {
             setStreamedTasks(prev => [...prev, { task: data.task || data.agent, output: data.output || "Running..." }]);
+          } else if (data.type === "saved_topics") {
+            // Auto-research parked its unused candidates — tell the backlog
+            // banner to refetch instead of making it poll.
+            window.dispatchEvent(new Event(SAVED_TOPICS_UPDATED_EVENT));
           } else if (data.type === "linkedin_final") {
             setLinkedinFinal(data.content || "");
           } else if (data.type === "blog_final") {
