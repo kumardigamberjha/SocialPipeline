@@ -29,6 +29,7 @@ from app.task_factories import create_all_tasks
 from app.services.linkedin_pipeline.orchestrator import LinkedInPipelineOrchestrator
 from app.services.blog_pipeline.orchestrator import BlogPipelineOrchestrator
 from app.tools.research_engine import run_multi_source_search
+from app.tools.custom import sanitize_search_results
 from app.db.content_tracker import (
     is_duplicate_topic,
     mark_topic_published,
@@ -187,12 +188,9 @@ def enrich_topic_with_search(topic: str) -> str:
 
         if search_results and "no results" not in search_results.lower():
             logger.info("Multi-source research succeeded. Appending results to context.")
-            context = (
-                "\n\n=== MULTI-SOURCE RESEARCH CONTEXT ===\n"
-                f"{search_results}\n"
-                "=== END RESEARCH CONTEXT ===\n\n"
-            )
-            return topic + context
+            # Scraped third-party text — fence it as untrusted data so it cannot
+            # pose as an instruction to the agents downstream.
+            return topic + "\n\n" + sanitize_search_results(search_results) + "\n\n"
         else:
             logger.warning("Multi-source research returned no valid results.")
     except Exception as e:

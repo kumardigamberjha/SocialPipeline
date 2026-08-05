@@ -13,10 +13,6 @@ from crewai import Agent, LLM
 from app.services.style_guide import NICHE_SYSTEM_PROMPT
 from app.tools.custom import (
     web_search_tool,
-    file_reader_tool,
-    code_execution_tool,
-    db_query_tool,
-    api_request_tool,
     generate_instagram_image_tool,
 )
 
@@ -141,7 +137,6 @@ def create_blog_agent(llm: LLM) -> Agent:
             "Focuses on clarity, code examples, and practical value."
         ),
         llm=llm,
-        tools=[file_reader_tool, code_execution_tool],
         verbose=True,
     )
 
@@ -168,7 +163,7 @@ def create_idea_agent(llm: LLM) -> Agent:
             "Generates creative, data-informed ideas that resonate with developers."
         ),
         llm=llm,
-        tools=[web_search_tool, api_request_tool, db_query_tool],
+        tools=[web_search_tool],
         verbose=True,
     )
 
@@ -215,7 +210,7 @@ def create_longform_blog_agent(llm: LLM) -> Agent:
             "who will immediately know if you're bullshitting them."
         ),
         llm=llm,
-        tools=[file_reader_tool, code_execution_tool, web_search_tool],
+        tools=[web_search_tool],
         verbose=True,
         allow_delegation=False,
         max_iter=5,
