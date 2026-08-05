@@ -34,11 +34,17 @@ ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 
 # Copy application code
+# NOTE: app/.env is excluded by .dockerignore — secrets are supplied at run
+# time via `env_file:` / `--env-file`, never baked into a layer.
 COPY app/ ./app/
-COPY requirements.txt .
 
-# Create output directory
-RUN mkdir -p output
+# Run as an unprivileged user. Created before the chown so the writable
+# directories (output/, data/) belong to it.
+RUN useradd --system --create-home --shell /usr/sbin/nologin appuser && \
+    mkdir -p output data && \
+    chown -R appuser:appuser /app
+
+USER appuser
 
 EXPOSE 8000
 

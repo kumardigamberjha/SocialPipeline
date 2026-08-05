@@ -11,8 +11,13 @@ services:
   # ── Redis (Message Broker + Result Backend) ─────────────────────────────
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    # Not published to the host: every consumer (api, workers, flower) reaches
+    # Redis over the compose network. Publishing it exposed an unauthenticated
+    # broker holding task payloads. Uncomment only for local debugging, and
+    # bind to loopback if you do:
+    #   ports: ["127.0.0.1:6379:6379"]
+    expose:
+      - "6379"
     volumes:
       - redis_data:/data
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
@@ -178,9 +183,14 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Flower exposes task inspection, task revocation and remote worker
+    # shutdown, and was previously published on 0.0.0.0:5555 with no auth.
+    # Bound to loopback so it is not reachable off-host. Flower natively reads
+    # FLOWER_BASIC_AUTH from its environment — set it in app/.env as
+    # `FLOWER_BASIC_AUTH=user:somelongpassword` to require credentials too.
     command: celery -A app.celery_app flower --port=5555 --broker_api=redis://redis:6379/0
     ports:
-      - "5555:5555"
+      - "127.0.0.1:5555:5555"
     env_file:
       - app/.env
     environment:
