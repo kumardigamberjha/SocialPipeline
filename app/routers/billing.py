@@ -7,10 +7,11 @@ Handles subscription lifecycle for pro and enterprise tiers.
 import logging
 
 import stripe
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from app.config import get_settings
+from app.core.auth_deps import get_current_user
 from app.db import queries
 
 logger = logging.getLogger(__name__)
@@ -38,27 +39,27 @@ def _get_stripe():
 
 class CheckoutRequest(BaseModel):
     tier: str  # "pro" or "enterprise"
-    user_id: str
-    success_url: str = "http://localhost:3000/billing/success"
-    cancel_url: str = "http://localhost:3000/billing/cancel"
 
 
-class PortalRequest(BaseModel):
-    user_id: str
-    return_url: str = "http://localhost:3000/dashboard"
+# Redirect targets are built from settings.frontend_url rather than accepted
+# from the caller — a caller-supplied URL here is an open redirect off the back
+# of a Stripe session.
+def _frontend(path: str) -> str:
+    return f"{get_settings().frontend_url.rstrip('/')}{path}"
 
 
 # ── Endpoints ───────────────────────────────────────────────────────────────
 
 
 @router.post("/checkout", summary="Create a Stripe Checkout Session")
-async def create_checkout(req: CheckoutRequest):
+async def create_checkout(req: CheckoutRequest, user: dict = Depends(get_current_user)):
     """
     Create a Stripe Checkout Session for upgrading to pro or enterprise.
     Returns the checkout URL for the client to redirect to.
     """
     s = _get_stripe()
     settings = get_settings()
+    user_id = user["id"]
 
     if req.tier == "pro":
         price_id = settings.stripe_pro_price_id
@@ -73,7 +74,7 @@ async def create_checkout(req: CheckoutRequest):
     # Check if user already has a Stripe customer ID
     customer_id = None
     try:
-        usage = queries.get_usage(req.user_id)
+        usage = queries.get_usage(user_id)
         if usage and usage.get("stripe_customer_id"):
             customer_id = usage["stripe_customer_id"]
     except Exception as e:
@@ -83,11 +84,11 @@ async def create_checkout(req: CheckoutRequest):
         session_params = {
             "mode": "subscription",
             "line_items": [{"price": price_id, "quantity": 1}],
-            "success_url": req.success_url + "?session_id={CHECKOUT_SESSION_ID}",
-            "cancel_url": req.cancel_url,
-            "metadata": {"user_id": req.user_id, "tier": req.tier},
+            "success_url": _frontend("/billing/success") + "?session_id={CHECKOUT_SESSION_ID}",
+            "cancel_url": _frontend("/billing/cancel"),
+            "metadata": {"user_id": user_id, "tier": req.tier},
             "subscription_data": {
-                "metadata": {"user_id": req.user_id, "tier": req.tier},
+                "metadata": {"user_id": user_id, "tier": req.tier},
             },
         }
 
@@ -157,11 +158,12 @@ async def stripe_webhook(request: Request):
 
 
 @router.get("/portal", summary="Create Stripe Customer Portal session")
-async def create_portal(user_id: str, return_url: str = "http://localhost:3000/dashboard"):
+async def create_portal(user: dict = Depends(get_current_user)):
     """
     Create a Stripe billing portal session for the user to manage their subscription.
     """
     s = _get_stripe()
+    user_id = user["id"]
 
     # Look up the user's Stripe customer ID
     try:
@@ -177,7 +179,7 @@ async def create_portal(user_id: str, return_url: str = "http://localhost:3000/d
     try:
         session = s.billing_portal.Session.create(
             customer=customer_id,
-            return_url=return_url,
+            return_url=_frontend("/dashboard"),
         )
         return {"portal_url": session.url}
     except s.error.StripeError as e:
