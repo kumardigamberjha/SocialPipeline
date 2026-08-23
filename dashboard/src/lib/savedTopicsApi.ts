@@ -5,10 +5,9 @@
  * how the Topics page and the backlog banner read and act on them.
  */
 
-import type { ContentType, GenerateType, ReviewStatus } from "./plannerApi";
+import { request } from "@/lib/apiClient";
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_API || "http://localhost:8000";
-const API_BASE = `${BACKEND_URL}/api`;
+import type { ContentType, GenerateType, ReviewStatus } from "./plannerApi";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -51,36 +50,9 @@ export interface HydratedContent extends SavedTopicRun {
   meta: Record<string, unknown>;
 }
 
-// ── Fetch helper ─────────────────────────────────────────────────────────────
-
-function authHeaders(): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (typeof window !== "undefined") {
-    const token = window.localStorage.getItem("token");
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-  }
-  return headers;
-}
-
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: { ...authHeaders(), ...(options.headers || {}) },
-  });
-  if (!response.ok) {
-    let detail = `Request failed (${response.status})`;
-    try {
-      const data = await response.json();
-      if (data?.detail) detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new Error(detail);
-  }
-  return response.json();
-}
-
 // ── API ──────────────────────────────────────────────────────────────────────
+//
+// `request()` now lives in apiClient.ts — see plannerApi.ts for why.
 
 /** Fired after auto-research saves new topics, so the banner can refetch
  *  without polling. Dispatched from ApprovalQueue's WebSocket handler. */

@@ -26,7 +26,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 from app.config import get_settings
-from app.db import queries
+from app.db import sync_queries
+from app.db.sync_session import sync_session_scope
 
 # Google may echo back extra previously-granted scopes when include_granted_scopes
 # is used, which oauthlib treats as a scope-change error. Relax that check so the
@@ -41,8 +42,14 @@ SCOPES = [
     # uploads (for the playlist-wise trending-topics feature). Existing
     # calendar-only connections keep working; users must reconnect to grant this.
     "https://www.googleapis.com/auth/youtube.readonly",
+    # Read-only access to the channel's YouTube Analytics data (impressions,
+    # CTR, average view duration/percentage) — the Data API above never
+    # exposes these. Existing connections keep working; users must reconnect
+    # to grant this too.
+    "https://www.googleapis.com/auth/yt-analytics.readonly",
 ]
 YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+YT_ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"
 EVENT_START_HOUR = 9  # local time in settings.default_timezone
 DEFAULT_DURATION_MINUTES = 60
 STATE_TTL_SECONDS = 600
@@ -105,19 +112,30 @@ def _make_flow() -> Flow:
     return flow
 
 
-def make_state_token(user_id: str) -> str:
+def make_state_token(user_id: str, next_url: str = "") -> str:
     """Short-lived signed state so the callback can identify the user without a
-    session and reject CSRF token-planting."""
+    session and reject CSRF token-planting.
+
+    ``next_url`` is an optional frontend path (e.g. ``/youtube-analysis``) that
+    the callback redirects to after a successful exchange, rather than always
+    landing on ``/planner``.
+    """
     settings = get_settings()
-    return jwt.encode(
-        {"sub": user_id, "purpose": "google_oauth", "exp": int(_time.time()) + STATE_TTL_SECONDS},
-        settings.secret_key,
-        algorithm=settings.jwt_algorithm,
-    )
+    payload: dict = {
+        "sub": user_id,
+        "purpose": "google_oauth",
+        "exp": int(_time.time()) + STATE_TTL_SECONDS,
+    }
+    if next_url:
+        payload["next"] = next_url
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.jwt_algorithm)
 
 
-def verify_state_token(state: str) -> str:
-    """Return the user_id carried in a valid state token, or raise CalendarError."""
+def verify_state_token(state: str) -> tuple[str, str]:
+    """Return ``(user_id, next_url)`` from a valid state token, or raise CalendarError.
+
+    ``next_url`` is ``""`` when the token was minted without one.
+    """
     settings = get_settings()
     try:
         payload = jwt.decode(state, settings.secret_key, algorithms=[settings.jwt_algorithm])
@@ -125,24 +143,29 @@ def verify_state_token(state: str) -> str:
         raise CalendarError(f"Invalid OAuth state: {exc}")
     if payload.get("purpose") != "google_oauth" or not payload.get("sub"):
         raise CalendarError("Invalid OAuth state payload")
-    return payload["sub"]
+    return payload["sub"], payload.get("next", "")
 
 
-def build_authorize_url(user_id: str) -> str:
+def build_authorize_url(user_id: str, next_url: str = "") -> str:
+    """Build the Google OAuth authorization URL.
+
+    ``next_url`` is embedded in the signed state JWT and replayed by the
+    callback so the browser lands on the right frontend page after connect.
+    """
     flow = _make_flow()
     url, _ = flow.authorization_url(
         access_type="offline",
         prompt="consent",  # force a refresh_token on every connect
         include_granted_scopes="true",
-        state=make_state_token(user_id),
+        state=make_state_token(user_id, next_url=next_url),
     )
     return url
 
 
-def exchange_code(code: str, state: str) -> str:
+def exchange_code(code: str, state: str) -> tuple[str, str]:
     """Complete the OAuth flow: validate state, exchange the code, store the
-    encrypted credentials. Returns the user_id the tokens were stored for."""
-    user_id = verify_state_token(state)
+    encrypted credentials. Returns ``(user_id, next_url)``."""
+    user_id, next_url = verify_state_token(state)
     flow = _make_flow()
     try:
         flow.fetch_token(code=code)
@@ -160,22 +183,30 @@ def exchange_code(code: str, state: str) -> str:
         pass
 
     _store_credentials(user_id, creds, connected_email=connected_email)
-    return user_id
+    return user_id, next_url
+
+
+# Everything below stays synchronous on purpose. Loading a credential can
+# trigger a token refresh over HTTPS, so the whole path is blocking regardless
+# of how the database is reached; async callers wrap these in asyncio.to_thread
+# rather than pretending they are cheap.
 
 
 def _store_credentials(user_id: str, creds: Credentials, connected_email: str = None) -> None:
     encrypted = get_fernet().encrypt(creds.to_json().encode()).decode()
-    queries.save_google_tokens(
-        user_id, encrypted,
-        scopes=" ".join(creds.scopes or SCOPES),
-        connected_email=connected_email,
-    )
+    with sync_session_scope() as session:
+        sync_queries.save_google_tokens(
+            session, user_id, encrypted,
+            scopes=" ".join(creds.scopes or SCOPES),
+            connected_email=connected_email,
+        )
 
 
 def load_credentials(user_id: str) -> Credentials:
     """Decrypt stored credentials, refreshing (and re-persisting) if expired.
     Raises NotConnectedError when there is nothing usable."""
-    row = queries.get_google_tokens(user_id)
+    with sync_session_scope() as session:
+        row = sync_queries.get_google_tokens(session, user_id)
     if not row:
         raise NotConnectedError("Google Calendar is not connected.")
     try:
@@ -194,7 +225,8 @@ def load_credentials(user_id: str) -> Credentials:
 
 
 def connection_status(user_id: str) -> dict:
-    row = queries.get_google_tokens(user_id)
+    with sync_session_scope() as session:
+        row = sync_queries.get_google_tokens(session, user_id)
     if not row:
         return {"connected": False}
     return {
@@ -207,7 +239,8 @@ def connection_status(user_id: str) -> dict:
 
 def revoke_and_disconnect(user_id: str) -> bool:
     """Best-effort token revocation at Google, then delete the stored row."""
-    row = queries.get_google_tokens(user_id)
+    with sync_session_scope() as session:
+        row = sync_queries.get_google_tokens(session, user_id)
     if row:
         try:
             import httpx
@@ -218,7 +251,8 @@ def revoke_and_disconnect(user_id: str) -> bool:
                 httpx.post("https://oauth2.googleapis.com/revoke", params={"token": token}, timeout=10)
         except Exception as exc:
             logger.warning("Google token revocation failed (continuing): %s", exc)
-    return queries.delete_google_tokens(user_id)
+    with sync_session_scope() as session:
+        return sync_queries.delete_google_tokens(session, user_id)
 
 
 # ── Event creation ───────────────────────────────────────────────────────────
@@ -239,8 +273,13 @@ def _parse_hh_mm(value, default_hour: int) -> tuple[int, int]:
 def _event_body(item: dict, plan_name: str, event_time: str, settings,
                 duration_minutes: int = None) -> dict:
     """Build the summary/description/start/end for an item's calendar event."""
-    # Use the publish date when set, else the working/scheduled date.
-    date_str = item.get("publish_date") or item["scheduled_date"]  # 'YYYY-MM-DD'
+    # Use the publish date when set, else the working/scheduled date. Both can
+    # be null since scheduled_date became nullable (undated backlog cards), and
+    # there is no sensible event without a date — the callers guard for this, so
+    # reaching here with neither is a bug worth surfacing rather than guessing.
+    date_str = item.get("publish_date") or item.get("scheduled_date")  # 'YYYY-MM-DD'
+    if not date_str:
+        raise CalendarError("Item has no scheduled or publish date to place on the calendar.")
     hour, minute = _parse_hh_mm(event_time or item.get("event_time"), EVENT_START_HOUR)
 
     duration = duration_minutes or item.get("event_duration_minutes") or DEFAULT_DURATION_MINUTES
@@ -258,7 +297,7 @@ def _event_body(item: dict, plan_name: str, event_time: str, settings,
         f"Content plan: {plan_name}",
         f"Topic: {item['topic']}",
         f"Status: {item['production_status']}",
-        f"Scheduled: {item['scheduled_date']}",
+        f"Scheduled: {item.get('scheduled_date') or 'unscheduled'}",
     ]
     if item.get("publish_date"):
         description_lines.append(f"Publish: {item['publish_date']}")

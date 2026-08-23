@@ -1,31 +1,32 @@
+"""
+Interactive generation WebSockets.
+
+Each socket is authenticated during the handshake by
+``get_current_user_ws``, which closes with 4401 before ``accept()`` when there
+are no valid credentials.
+
+This replaces ``_extract_user_id``, which read a JWT from the ``?token=`` query
+parameter and, on any failure, returned a shared dummy user id — so an
+unauthenticated client got a working socket that spent compute and wrote rows
+into one shared tenant.
+"""
+
 import asyncio
 import json
 import logging
-import jwt
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends
+
+from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import Settings, get_settings
+from app.core.auth_deps import WebSocketAuthError, get_current_user_ws
 from app.db import queries
+from app.db.session import get_session
 from app.ws_manager import manager
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/ws", tags=["websocket"])
-
-DUMMY_USER_ID = "00000000-0000-0000-0000-000000000000"
-
-
-def _extract_user_id(websocket: WebSocket, settings: Settings) -> str:
-    """Extract user_id from the ?token= query parameter via JWT verification."""
-    token = websocket.query_params.get("token")
-    if token:
-        try:
-            payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
-            user_id = payload.get("sub")
-            if user_id:
-                return user_id
-        except jwt.PyJWTError:
-            logger.warning("Invalid or expired JWT token provided on WebSocket connect")
-    return DUMMY_USER_ID
 
 
 @router.websocket("/generate/{client_id}")
@@ -33,7 +34,10 @@ async def websocket_endpoint(
     websocket: WebSocket,
     client_id: str,
     settings: Settings = Depends(get_settings),
+    user: dict = Depends(get_current_user_ws),
+    session: AsyncSession = Depends(get_session),
 ):
+    user_id = user["id"]
     await manager.connect(client_id, websocket)
     try:
         while True:
@@ -47,17 +51,14 @@ async def websocket_endpoint(
                     await manager.send_json({"type": "error", "message": "Topic is required"}, client_id)
                     continue
 
-                user_id = _extract_user_id(websocket, settings)
-
                 from app.services.usage import check_and_increment
-                allowed, msg = check_and_increment(user_id)
+                allowed, msg = await check_and_increment(session, user_id)
                 if not allowed:
                     await manager.send_json({"type": "error", "message": msg}, client_id)
                     continue
 
-                # Create run in SQLite
-                run = queries.create_run(user_id, topic, provider)
-                run_id = run['id']
+                run = await queries.create_run(session, user_id, topic, provider)
+                run_id = run["id"]
 
                 # Dispatch pipeline natively via asyncio.create_task
                 from app.crew import run_pipeline_streaming
@@ -75,7 +76,7 @@ async def websocket_endpoint(
 
             except json.JSONDecodeError:
                 await manager.send_json({"type": "error", "message": "Invalid JSON"}, client_id)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, WebSocketAuthError):
         manager.disconnect(client_id)
         logger.info("Client %s disconnected", client_id)
     except Exception as e:
@@ -88,7 +89,10 @@ async def auto_generate_endpoint(
     websocket: WebSocket,
     client_id: str,
     settings: Settings = Depends(get_settings),
+    user: dict = Depends(get_current_user_ws),
+    session: AsyncSession = Depends(get_session),
 ):
+    user_id = user["id"]
     await manager.connect(client_id, websocket)
     try:
         while True:
@@ -97,10 +101,8 @@ async def auto_generate_endpoint(
                 payload = json.loads(data)
                 provider = payload.get("provider", settings.default_provider)
 
-                user_id = _extract_user_id(websocket, settings)
-
                 from app.services.usage import check_and_increment
-                allowed, msg = check_and_increment(user_id)
+                allowed, msg = await check_and_increment(session, user_id)
                 if not allowed:
                     await manager.send_json({"type": "error", "message": msg}, client_id)
                     continue
@@ -123,7 +125,7 @@ async def auto_generate_endpoint(
                         "output": "Researching candidate topics…",
                     }, client_id)
                     candidates = await saved_topic_service.research_candidates(
-                        user_id=user_id, provider=provider, niche=niche,
+                        session, user_id=user_id, provider=provider, niche=niche,
                     )
                 except Exception:
                     # The suggester must never break the button — fall back to
@@ -132,9 +134,9 @@ async def auto_generate_endpoint(
 
                 if candidates:
                     chosen = candidates[0]["topic"]
-                    run_id = queries.create_run(user_id, chosen, provider)["id"]
-                    saved = saved_topic_service.save_candidates(
-                        user_id, candidates[1:], niche, source_run_id=run_id,
+                    run_id = (await queries.create_run(session, user_id, chosen, provider))["id"]
+                    saved = await saved_topic_service.save_candidates(
+                        session, user_id, candidates[1:], niche, source_run_id=run_id,
                     )
                     if saved:
                         await manager.send_json(
@@ -155,7 +157,9 @@ async def auto_generate_endpoint(
                 else:
                     # Fallback: original behaviour, topic picked from the seed
                     # banks inside the pipeline.
-                    run_id = queries.create_run(user_id, "Auto-research (seed banks)", provider)["id"]
+                    run_id = (await queries.create_run(
+                        session, user_id, "Auto-research (seed banks)", provider
+                    ))["id"]
                     asyncio.create_task(
                         run_pipeline_streaming(
                             topic="auto",
@@ -170,7 +174,7 @@ async def auto_generate_endpoint(
 
             except json.JSONDecodeError:
                 await manager.send_json({"type": "error", "message": "Invalid JSON"}, client_id)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, WebSocketAuthError):
         manager.disconnect(client_id)
         logger.info("Auto-generate client %s disconnected", client_id)
     except Exception as e:
@@ -183,6 +187,8 @@ async def blog_endpoint(
     websocket: WebSocket,
     client_id: str,
     settings: Settings = Depends(get_settings),
+    user: dict = Depends(get_current_user_ws),
+    session: AsyncSession = Depends(get_session),
 ):
     """Stream long-form blog generation.
 
@@ -190,6 +196,7 @@ async def blog_endpoint(
     Server emits: status, section_started, section_complete (with word_count),
     blog_complete (full markdown + word_count + reading_time), error.
     """
+    user_id = user["id"]
     await manager.connect(client_id, websocket)
     try:
         while True:
@@ -204,17 +211,14 @@ async def blog_endpoint(
                     await manager.send_json({"type": "error", "message": "Topic is required"}, client_id)
                     continue
 
-                user_id = _extract_user_id(websocket, settings)
-
                 from app.services.usage import check_and_increment
-                allowed, msg = check_and_increment(user_id)
+                allowed, msg = await check_and_increment(session, user_id)
                 if not allowed:
                     await manager.send_json({"type": "error", "message": msg}, client_id)
                     continue
 
-                # Create run in SQLite
-                run = queries.create_run(user_id, topic, provider)
-                run_id = run['id']
+                run = await queries.create_run(session, user_id, topic, provider)
+                run_id = run["id"]
 
                 # Dispatch blog generation natively via asyncio.create_task
                 from app.crew import run_blog_pipeline_streaming
@@ -232,7 +236,7 @@ async def blog_endpoint(
 
             except json.JSONDecodeError:
                 await manager.send_json({"type": "error", "message": "Invalid JSON"}, client_id)
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, WebSocketAuthError):
         manager.disconnect(client_id)
         logger.info("Blog client %s disconnected", client_id)
     except Exception as e:

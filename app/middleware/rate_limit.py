@@ -22,28 +22,31 @@ logger = logging.getLogger(__name__)
 
 
 def _get_user_key(request: Request) -> str:
+    """Rate-limit key: the authenticated user when known, else the client IP.
+
+    Reads the same two token sources as the auth dependency — the Authorization
+    header and the access cookie. It deliberately does *not* read ``?token=``:
+    that parameter was removed because query strings leak into access and proxy
+    logs, and a rate limiter honouring it would keep that shape alive.
+
+    Verification failures fall through to the IP key rather than raising. This
+    is a throttle, not an authorization check; the real one runs in
+    app.core.auth_deps and fails closed.
     """
-    Extract rate-limit key from request.
-    Priority: JWT user_id from Authorization header > client IP.
-    """
+    from app.core.cookies import cookie_names
+
     auth_header = request.headers.get("authorization", "")
     token = None
-    if auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-
-    # Also check query params (used by WebSocket upgrade requests)
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header[7:].strip()
     if not token:
-        token = request.query_params.get("token")
+        token = request.cookies.get(cookie_names().access)
 
     if token:
         try:
-            import jwt
-            from app.config import get_settings
-            settings = get_settings()
-            payload = jwt.decode(token, settings.secret_key, algorithms=[settings.jwt_algorithm])
-            user_id = payload.get("sub")
-            if user_id:
-                return f"user:{user_id}"
+            from app.core.tokens import decode_access_token
+
+            return f"user:{decode_access_token(token).user_id}"
         except Exception:
             pass
 

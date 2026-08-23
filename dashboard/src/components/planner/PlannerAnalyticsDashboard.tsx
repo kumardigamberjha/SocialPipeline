@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import Link from "next/link";
 import {
   LayoutGrid,
@@ -36,6 +36,8 @@ import {
   PlannerStats,
   Plan,
   PRODUCTION_STATUSES,
+  PLATFORMS,
+  Platform,
   ContentType,
   ReviewStatus,
 } from "@/lib/plannerApi";
@@ -128,17 +130,27 @@ function KpiCard({
   );
 }
 
+/** "" means every platform. */
+type PlatformFilter = Platform | "";
+
 export default function PlannerAnalyticsDashboard() {
   const [stats, setStats] = useState<PlannerStats | null>(null);
   const [plans, setPlans] = useState<Plan[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [platform, setPlatform] = useState<PlatformFilter>("");
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const [s, p] = await Promise.all([plannerApi.getStats(), plannerApi.listPlans()]);
+      // Both calls take the same filter, so the KPI tiles and the plan list
+      // never disagree about which platform they are describing.
+      const scope = platform || undefined;
+      const [s, p] = await Promise.all([
+        plannerApi.getStats(scope),
+        plannerApi.listPlans(scope),
+      ]);
       setStats(s);
       setPlans(p);
     } catch (e) {
@@ -146,11 +158,11 @@ export default function PlannerAnalyticsDashboard() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [platform]);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load]);
 
   if (loading) {
     return (
@@ -178,7 +190,17 @@ export default function PlannerAnalyticsDashboard() {
     return (
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-20 text-center">
         <BarChart3 className="w-10 h-10 text-slate-600 mx-auto mb-4" />
-        <p className="text-slate-400 text-sm mb-2">No planner data yet.</p>
+        <p className="text-slate-400 text-sm mb-2">
+          No planner data{platform ? ` for ${platform}` : ""} yet.
+        </p>
+        {platform && (
+          <button
+            onClick={() => setPlatform("")}
+            className="text-xs text-blue-300 hover:text-blue-200 underline underline-offset-2 mb-4 block mx-auto"
+          >
+            Show all platforms
+          </button>
+        )}
         <p className="text-slate-600 text-xs mb-6">
           Create a content plan and generate some content to see analytics here.
         </p>
@@ -232,6 +254,27 @@ export default function PlannerAnalyticsDashboard() {
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-10">
+      {/* Platform filter. Unfiltered totals span every platform, and the funnel
+          below then lists only one status vocabulary — so it will not sum to
+          the Topics tile. Picking a platform makes the two agree. */}
+      <div className="flex items-center justify-end">
+        <label className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-slate-500">
+          Platform
+          <select
+            value={platform}
+            onChange={(e) => setPlatform(e.target.value as PlatformFilter)}
+            className="rounded-lg bg-white/5 border border-white/10 px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-blue-500/50"
+          >
+            <option value="" className="bg-[#0f172a]">All platforms</option>
+            {PLATFORMS.map((p) => (
+              <option key={p.value} value={p.value} className="bg-[#0f172a]">
+                {p.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
       {/* KPI row */}
       <section>
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">

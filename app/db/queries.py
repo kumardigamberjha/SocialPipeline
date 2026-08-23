@@ -1,921 +1,1815 @@
-import re
-from typing import Dict, List, Optional
-from app.db.database import get_db, dict_from_row, generate_uuid
+"""
+Async query layer — the API path.
 
-# -- User Operations --
+Every function takes an :class:`~sqlalchemy.ext.asyncio.AsyncSession` as its
+first argument and returns plain dicts (or lists of dicts), matching what the
+old ``sqlite3.Row``-based layer returned so callers did not have to change
+shape.
 
-def create_user(email: str, password_hash: str) -> dict:
-    db = get_db()
-    user_id = generate_uuid()
-    db.execute(
-        "INSERT INTO users (id, email, password_hash) VALUES (?, ?, ?)",
-        (user_id, email, password_hash)
-    )
-    db.commit()
-    return get_user_by_id(user_id)
+Two rules this module enforces that its predecessor did not:
 
-def get_user_by_email(email: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM users WHERE email = ?", (email,))
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
+**Ownership is a parameter, not an afterthought.** Every function touching a
+tenant-owned table takes ``user_id`` and puts it in the WHERE clause. Thirteen
+functions previously keyed on a resource id alone — ``get_run_by_id``,
+``update_run_status``, ``update_plan_item_content`` and friends — so anyone who
+learned or guessed an id could read or mutate another tenant's row. Reads that
+are *deliberately* public say so in their name (``get_public_blog_by_slug``).
 
-def get_user_by_id(user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM users WHERE id = ?", (user_id,))
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
+**No duplicated logic with the worker path.** The eight functions Celery also
+needs are implemented once in :mod:`app.db.sync_queries` and exposed here via
+``AsyncSession.run_sync()``, which runs them inside SQLAlchemy's greenlet
+context — still fully non-blocking, but with one implementation.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta, timezone
+from typing import Any
+
+from sqlalchemy import and_, cast, delete, func, insert, or_, select, text, update
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.planner import PUBLISHED_STATUSES, default_status, status_order
+
+from app.db import sync_queries
+from app.db._util import (
+    UNSET,
+    generate_uuid,
+    row_to_dict,
+    rows_to_dicts,
+    slugify,  # noqa: F401  (re-exported; callers import it from here)
+)
+from app.db.tables import (
+    AgentRun,
+    ApiKey,
+    AssistantAction,
+    AssistantConversation,
+    AssistantMessage,
+    BlogPost,
+    ContentPlan,
+    GoogleOAuthToken,
+    InstagramAiReport,
+    LinkedinPost,
+    PlanItem,
+    PlanItemContent,
+    SavedTopic,
+    SavedTopicRun,
+    TaskStep,
+    UsageLimit,
+    User,
+    UserGoal,
+    UserRule,
+    YoutubeAnalysis,
+    YoutubeCompetitor,
+    YoutubeCompetitorDiscoveryRun,
+    YoutubeCompetitorVideo,
+    YoutubePlaylistItem,
+    YoutubeScript,
+    YoutubeVideoLive,
+)
+
+_UNSET = UNSET  # backwards-compatible alias for callers that imported it
 
 
-# -- Agent Run Operations --
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
-def create_run(user_id: str, topic: str, provider: str) -> dict:
-    db = get_db()
-    run_id = generate_uuid()
-    db.execute(
-        "INSERT INTO agent_runs (id, user_id, topic, provider_used, status) VALUES (?, ?, ?, ?, ?)",
-        (run_id, user_id, topic, provider, 'pending')
-    )
-    db.commit()
-    return get_run_by_id(run_id)
 
-def create_agent_run(run_id: str, user_id: str, topic: str, provider: str) -> None:
-    db = get_db()
-    db.execute(
-        "INSERT INTO agent_runs (id, user_id, topic, provider_used, status) VALUES (?, ?, ?, ?, ?)",
-        (run_id, user_id, topic, provider, 'pending')
-    )
-    db.commit()
+async def _one(session: AsyncSession, stmt) -> dict | None:
+    return row_to_dict((await session.execute(stmt)).one_or_none())
 
-def update_run_status(run_id: str, status: str, final_result: str = None, duration: float = None) -> None:
-    db = get_db()
-    if status in ('completed', 'failed'):
-        db.execute(
-            "UPDATE agent_runs SET status = ?, final_result = ?, duration_seconds = ?, completed_at = datetime('now') WHERE id = ?",
-            (status, final_result, duration, run_id)
+
+async def _all(session: AsyncSession, stmt) -> list[dict]:
+    return rows_to_dicts(await session.execute(stmt))
+
+
+async def _touched(session: AsyncSession, stmt) -> bool:
+    return (await session.execute(stmt)).rowcount > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Users
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def create_user(session: AsyncSession, email: str, password_hash: str) -> dict:
+    row = (
+        await session.execute(
+            insert(User)
+            .values(id=generate_uuid(), email=email, password_hash=password_hash)
+            .returning(User)
         )
-    else:
-        db.execute(
-            "UPDATE agent_runs SET status = ?, final_result = ?, duration_seconds = ? WHERE id = ?",
-            (status, final_result, duration, run_id)
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_user_by_email(session: AsyncSession, email: str) -> dict | None:
+    # Case-insensitive to match the uq_users_email_lower index; otherwise
+    # someone who signed up as Bob@x.com could not log in as bob@x.com.
+    return await _one(
+        session, select(User).where(func.lower(User.email) == (email or "").lower())
+    )
+
+
+async def get_user_by_id(session: AsyncSession, user_id: str) -> dict | None:
+    return await _one(session, select(User).where(User.id == user_id))
+
+
+async def set_user_password(
+    session: AsyncSession, user_id: str, password_hash: str
+) -> bool:
+    return await _touched(
+        session,
+        update(User)
+        .where(User.id == user_id)
+        .values(password_hash=password_hash, updated_at=_now()),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Agent runs
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def create_run(
+    session: AsyncSession, user_id: str, topic: str, provider: str
+) -> dict:
+    row = (
+        await session.execute(
+            insert(AgentRun)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                topic=topic,
+                provider_used=provider,
+                status="pending",
+            )
+            .returning(AgentRun)
         )
-    db.commit()
+    ).one()
+    return row_to_dict(row)
 
-def update_agent_run(run_id: str, final_result: str, duration: float, status: str, image_url: str = None, topic: str = None) -> None:
-    db = get_db()
-    updates = ["status = ?", "final_result = ?", "duration_seconds = ?"]
-    params = [status, final_result, duration]
-    
-    if status in ('completed', 'failed'):
-        updates.append("completed_at = datetime('now')")
-        
-    if image_url is not None:
-        updates.append("image_url = ?")
-        params.append(image_url)
-        
-    if topic is not None:
-        updates.append("topic = ?")
-        params.append(topic)
-        
-    params.append(run_id)
-    query = f"UPDATE agent_runs SET {', '.join(updates)} WHERE id = ?"
-    db.execute(query, tuple(params))
-    db.commit()
 
-def update_run_image(run_id: str, image_url: str) -> None:
-    db = get_db()
-    db.execute("UPDATE agent_runs SET image_url = ? WHERE id = ?", (image_url, run_id))
-    db.commit()
-
-def get_run_by_id(run_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM agent_runs WHERE id = ?", (run_id,))
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
-
-def get_runs_by_user(user_id: str, limit: int = 50, offset: int = 0) -> List[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM agent_runs WHERE user_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-        (user_id, limit, offset),
+async def create_agent_run(
+    session: AsyncSession, run_id: str, user_id: str, topic: str, provider: str
+) -> None:
+    await session.execute(
+        insert(AgentRun).values(
+            id=run_id,
+            user_id=user_id,
+            topic=topic,
+            provider_used=provider,
+            status="pending",
+        )
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
 
-# -- Task Step Operations --
-
-def insert_task_step(run_id: str, agent_name: str, task_name: str, output: str, status: str = 'done') -> dict:
-    db = get_db()
-    cursor = db.execute(
-        "INSERT INTO task_steps (run_id, agent_name, task_name, output, status) VALUES (?, ?, ?, ?, ?)",
-        (run_id, agent_name, task_name, output, status)
-    )
-    db.commit()
-    step_id = cursor.lastrowid
-    cursor = db.execute("SELECT * FROM task_steps WHERE id = ?", (step_id,))
-    return dict_from_row(cursor.fetchone())
-
-def save_task_step(run_id: str, agent_name: str, task_name: str, output: str, status: str = 'done') -> dict:
-    return insert_task_step(run_id, agent_name, task_name, output, status)
-
-def get_steps_by_run(run_id: str) -> List[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM task_steps WHERE run_id = ? ORDER BY id ASC", (run_id,))
-    return [dict_from_row(row) for row in cursor.fetchall()]
-
-def get_new_steps_since(run_id: str, last_step_id: int) -> List[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM task_steps WHERE run_id = ? AND id > ? ORDER BY id ASC", (run_id, last_step_id))
-    return [dict_from_row(row) for row in cursor.fetchall()]
-
-
-# -- Usage Limit Operations --
-
-def get_usage(user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM usage_limits WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
-
-def init_usage(user_id: str) -> None:
-    db = get_db()
-    db.execute(
-        "INSERT OR IGNORE INTO usage_limits (user_id, plan, runs_this_month, max_runs_per_month, reset_at) VALUES (?, 'free', 0, 10, datetime('now', '+1 month'))",
-        (user_id,)
-    )
-    db.commit()
-
-def increment_usage(user_id: str) -> None:
-    db = get_db()
-    db.execute("UPDATE usage_limits SET runs_this_month = runs_this_month + 1 WHERE user_id = ?", (user_id,))
-    db.commit()
-
-def reset_usage_if_expired(user_id: str) -> None:
-    db = get_db()
-    cursor = db.execute("SELECT reset_at FROM usage_limits WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    if row and row['reset_at']:
-        # Check if reset_at is in the past
-        check_cursor = db.execute("SELECT datetime('now') > ?", (row['reset_at'],))
-        is_expired = check_cursor.fetchone()[0]
-        if is_expired:
-            db.execute("UPDATE usage_limits SET runs_this_month = 0, reset_at = datetime('now', '+1 month') WHERE user_id = ?", (user_id,))
-            db.commit()
-
-def update_plan(user_id: str, plan: str, max_runs: int) -> None:
-    db = get_db()
-    db.execute(
-        "UPDATE usage_limits SET plan = ?, max_runs_per_month = ? WHERE user_id = ?",
-        (plan, max_runs, user_id)
-    )
-    db.commit()
-
-
-# -- API Key Operations --
-
-def save_api_key(user_id: str, provider: str, encrypted_key: str) -> None:
-    db = get_db()
-    db.execute(
-        "INSERT INTO api_keys (user_id, provider, api_key_encrypted) VALUES (?, ?, ?)",
-        (user_id, provider, encrypted_key)
-    )
-    db.commit()
-
-def get_api_key(user_id: str, provider: str) -> Optional[str]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT api_key_encrypted FROM api_keys WHERE user_id = ? AND provider = ? ORDER BY created_at DESC LIMIT 1",
-        (user_id, provider)
-    )
-    row = cursor.fetchone()
-    return row['api_key_encrypted'] if row else None
-
-
-# -- Blog Post Operations --
-
-# Average adult reads ~238 words per minute (Brysbaert, 2019 meta-analysis).
-WORDS_PER_MINUTE = 238
-
-
-def slugify(text: str) -> str:
-    """Convert a title into a URL-safe slug: lowercase, hyphenated, ASCII-only."""
-    text = (text or "").lower().strip()
-    text = re.sub(r"[^a-z0-9\s-]", "", text)   # drop punctuation
-    text = re.sub(r"[\s_-]+", "-", text)        # collapse whitespace/underscores to single hyphen
-    text = text.strip("-")
-    return text[:80] or "untitled-post"
-
-
-def save_blog_post(
+async def update_run_status(
+    session: AsyncSession,
     run_id: str,
     user_id: str,
-    topic: str,
-    title: str,
-    content: str,
-    niche: str,
-    approved: bool = False,
-    word_count: int = None,
-) -> dict:
-    """Persist a generated long-form blog post and return the full row.
+    status: str,
+    final_result: str | None = None,
+    duration: float | None = None,
+) -> bool:
+    return await session.run_sync(
+        lambda s: sync_queries.update_run_status(
+            s, run_id, user_id, status, final_result, duration
+        )
+    )
 
-    word_count may be supplied by the pipeline (Python-counted) or computed here
-    from the content. reading_time_minutes and a unique URL-safe slug (from the
-    title, falling back to the topic) are always derived.
+
+async def update_agent_run(
+    session: AsyncSession,
+    run_id: str,
+    user_id: str,
+    final_result: str,
+    duration: float,
+    status: str,
+    image_url: str | None = None,
+    topic: str | None = None,
+) -> bool:
+    values: dict[str, Any] = {
+        "status": status,
+        "final_result": final_result,
+        "duration_seconds": duration,
+    }
+    if status in ("completed", "failed"):
+        values["completed_at"] = _now()
+    if image_url is not None:
+        values["image_url"] = image_url
+    if topic is not None:
+        values["topic"] = topic
+
+    return await _touched(
+        session,
+        update(AgentRun)
+        .where(AgentRun.id == run_id, AgentRun.user_id == user_id)
+        .values(**values),
+    )
+
+
+async def update_run_image(
+    session: AsyncSession, run_id: str, user_id: str, image_url: str
+) -> bool:
+    return await _touched(
+        session,
+        update(AgentRun)
+        .where(AgentRun.id == run_id, AgentRun.user_id == user_id)
+        .values(image_url=image_url),
+    )
+
+
+async def get_run_by_id(
+    session: AsyncSession, run_id: str, user_id: str
+) -> dict | None:
+    """Fetch one run, scoped to its owner.
+
+    ``user_id`` is required: the previous signature took only ``run_id``, so a
+    guessed id leaked another tenant's run and its full generated output.
     """
-    db = get_db()
-    blog_id = generate_uuid()
+    return await _one(
+        session,
+        select(AgentRun).where(AgentRun.id == run_id, AgentRun.user_id == user_id),
+    )
 
-    if word_count is None:
-        word_count = len(content.split())
-    reading_time_minutes = max(1, word_count // WORDS_PER_MINUTE)
 
-    base_slug = slugify(title or topic)
-    slug = base_slug
-    # The slug column is UNIQUE — disambiguate collisions with a short id suffix.
-    existing = db.execute("SELECT 1 FROM blog_posts WHERE slug = ?", (slug,)).fetchone()
-    if existing:
-        slug = f"{base_slug}-{blog_id[:8]}"
+async def get_runs_by_user(
+    session: AsyncSession, user_id: str, limit: int = 50, offset: int = 0
+) -> list[dict]:
+    return await _all(
+        session,
+        select(AgentRun)
+        .where(AgentRun.user_id == user_id)
+        .order_by(AgentRun.created_at.desc())
+        .limit(limit)
+        .offset(offset),
+    )
 
-    db.execute(
-        """
-        INSERT INTO blog_posts
-            (id, run_id, user_id, topic, title, content, word_count,
-             reading_time_minutes, niche, approved, slug)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            blog_id, run_id, user_id, topic, title, content, word_count,
-            reading_time_minutes, niche, 1 if approved else 0, slug,
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task steps
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def insert_task_step(
+    session: AsyncSession,
+    run_id: str,
+    user_id: str,
+    agent_name: str,
+    task_name: str,
+    output: str | None,
+    status: str = "done",
+) -> dict:
+    return await session.run_sync(
+        lambda s: sync_queries.insert_task_step(
+            s, run_id, user_id, agent_name, task_name, output, status
+        )
+    )
+
+
+# Historical alias.
+save_task_step = insert_task_step
+
+
+async def get_steps_by_run(
+    session: AsyncSession, run_id: str, user_id: str
+) -> list[dict]:
+    return await _all(
+        session,
+        select(TaskStep)
+        .where(TaskStep.run_id == run_id, TaskStep.user_id == user_id)
+        .order_by(TaskStep.id.asc()),
+    )
+
+
+async def get_new_steps_since(
+    session: AsyncSession, run_id: str, user_id: str, last_step_id: int
+) -> list[dict]:
+    return await _all(
+        session,
+        select(TaskStep)
+        .where(
+            TaskStep.run_id == run_id,
+            TaskStep.user_id == user_id,
+            TaskStep.id > last_step_id,
+        )
+        .order_by(TaskStep.id.asc()),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage limits
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def get_usage(session: AsyncSession, user_id: str) -> dict | None:
+    return await session.run_sync(lambda s: sync_queries.get_usage(s, user_id))
+
+
+async def init_usage(session: AsyncSession, user_id: str) -> None:
+    await session.execute(
+        pg_insert(UsageLimit)
+        .values(
+            user_id=user_id,
+            plan="free",
+            runs_this_month=0,
+            max_runs_per_month=10,
+            reset_at=_now() + timedelta(days=30),
+        )
+        .on_conflict_do_nothing(index_elements=[UsageLimit.user_id])
+    )
+
+
+async def increment_usage(session: AsyncSession, user_id: str) -> None:
+    await session.run_sync(lambda s: sync_queries.increment_usage(s, user_id))
+
+
+async def reset_usage_if_expired(session: AsyncSession, user_id: str) -> None:
+    await session.run_sync(lambda s: sync_queries.reset_usage_if_expired(s, user_id))
+
+
+async def update_plan(
+    session: AsyncSession, user_id: str, plan: str, max_runs: int
+) -> None:
+    await session.execute(
+        update(UsageLimit)
+        .where(UsageLimit.user_id == user_id)
+        .values(plan=plan, max_runs_per_month=max_runs)
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# API keys
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def save_api_key(
+    session: AsyncSession, user_id: str, provider: str, encrypted_key: str
+) -> None:
+    await session.execute(
+        insert(ApiKey).values(
+            user_id=user_id, provider=provider, api_key_encrypted=encrypted_key
+        )
+    )
+
+
+async def get_api_key(
+    session: AsyncSession, user_id: str, provider: str
+) -> str | None:
+    return (
+        await session.execute(
+            select(ApiKey.api_key_encrypted)
+            .where(ApiKey.user_id == user_id, ApiKey.provider == provider)
+            .order_by(ApiKey.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Blog posts
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def save_blog_post(
+    session: AsyncSession,
+    run_id: str | None,
+    user_id: str,
+    topic: str,
+    title: str | None,
+    content: str,
+    niche: str | None,
+    approved: bool = False,
+    word_count: int | None = None,
+) -> dict:
+    return await session.run_sync(
+        lambda s: sync_queries.save_blog_post(
+            s, run_id, user_id, topic, title, content, niche, approved, word_count
+        )
+    )
+
+
+async def get_blog_posts(
+    session: AsyncSession, user_id: str, limit: int = 20
+) -> list[dict]:
+    return await _all(
+        session,
+        select(BlogPost)
+        .where(BlogPost.user_id == user_id, BlogPost.deleted_at.is_(None))
+        .order_by(BlogPost.published_at.desc())
+        .limit(limit),
+    )
+
+
+async def get_blog_by_id(
+    session: AsyncSession, blog_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(BlogPost).where(
+            BlogPost.id == blog_id,
+            BlogPost.user_id == user_id,
+            BlogPost.deleted_at.is_(None),
         ),
     )
-    db.commit()
-
-    cursor = db.execute("SELECT * FROM blog_posts WHERE id = ?", (blog_id,))
-    return dict_from_row(cursor.fetchone())
 
 
-def get_blog_posts(user_id: str, limit: int = 20) -> List[dict]:
-    """Return the most recent non-deleted blog posts for a user (newest first)."""
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM blog_posts WHERE user_id = ? AND deleted_at IS NULL "
-        "ORDER BY published_at DESC LIMIT ?",
-        (user_id, limit),
+async def get_public_blog_by_slug(session: AsyncSession, slug: str) -> dict | None:
+    """Fetch a post by slug with **no ownership check**.
+
+    Deliberately public — this backs the shareable blog reader. The name says so
+    out loud so it is not mistaken for an accidentally-unscoped query and
+    "fixed" into the tenant-scoped shape, or copied as a template for one.
+    """
+    return await _one(
+        session,
+        select(BlogPost).where(BlogPost.slug == slug, BlogPost.deleted_at.is_(None)),
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
 
-def get_blog_by_id(blog_id: str, user_id: str) -> Optional[dict]:
-    """Return a single non-deleted post, enforcing user ownership."""
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM blog_posts WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-        (blog_id, user_id),
+async def soft_delete_blog(
+    session: AsyncSession, blog_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        update(BlogPost)
+        .where(
+            BlogPost.id == blog_id,
+            BlogPost.user_id == user_id,
+            BlogPost.deleted_at.is_(None),
+        )
+        .values(deleted_at=_now()),
     )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
 
 
-def get_blog_by_slug(slug: str) -> Optional[dict]:
-    """Return a single non-deleted post by slug. Public — no ownership check."""
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM blog_posts WHERE slug = ? AND deleted_at IS NULL", (slug,)
+async def get_blog_posts_by_run_id(
+    session: AsyncSession, run_id: str, user_id: str
+) -> list[dict]:
+    return await _all(
+        session,
+        select(BlogPost).where(
+            BlogPost.run_id == run_id, BlogPost.user_id == user_id
+        ),
     )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
 
 
-def soft_delete_blog(blog_id: str, user_id: str) -> bool:
-    """Soft-delete a post (set deleted_at). Returns True if a live row was updated."""
-    db = get_db()
-    cursor = db.execute(
-        "UPDATE blog_posts SET deleted_at = datetime('now') "
-        "WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-        (blog_id, user_id),
-    )
-    db.commit()
-    return cursor.rowcount > 0
+# ─────────────────────────────────────────────────────────────────────────────
+# LinkedIn posts
+# ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_blog_posts_by_run_id(run_id: str) -> List[dict]:
-    """Return all blog posts produced by a given run (used by the WS on completion)."""
-    db = get_db()
-    cursor = db.execute("SELECT * FROM blog_posts WHERE run_id = ?", (run_id,))
-    return [dict_from_row(row) for row in cursor.fetchall()]
-
-
-# -- LinkedIn Post Operations --
-
-def save_linkedin_post(
-    run_id: str, user_id: str, topic: str, post_text: str,
-    hook: str, angle_type: str, word_count: int, approved: bool, niche: str
+async def save_linkedin_post(
+    session: AsyncSession,
+    run_id: str | None,
+    user_id: str,
+    topic: str,
+    post_text: str,
+    hook: str | None,
+    angle_type: str | None,
+    word_count: int | None,
+    approved: bool,
+    niche: str | None,
 ) -> dict:
-    db = get_db()
-    post_id = generate_uuid()
-    
-    hashtag_count = len(re.findall(r'#\w+', post_text))
-    
-    db.execute(
-        """
-        INSERT INTO linkedin_posts
-            (id, run_id, user_id, topic, post_text, hook, angle_type, word_count, hashtag_count, approved, niche)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (post_id, run_id, user_id, topic, post_text, hook, angle_type, word_count, hashtag_count, 1 if approved else 0, niche)
+    return await session.run_sync(
+        lambda s: sync_queries.save_linkedin_post(
+            s, run_id, user_id, topic, post_text, hook, angle_type,
+            word_count, approved, niche,
+        )
     )
-    db.commit()
-    
-    cursor = db.execute("SELECT * FROM linkedin_posts WHERE id = ?", (post_id,))
-    return dict_from_row(cursor.fetchone())
 
-def get_linkedin_posts(user_id: str, limit: int = 20) -> list[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT id, run_id, user_id, topic, hook, angle_type, word_count, hashtag_count, approved, niche, created_at, deleted_at FROM linkedin_posts WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
-        (user_id, limit)
+
+async def get_linkedin_posts(
+    session: AsyncSession, user_id: str, limit: int = 20
+) -> list[dict]:
+    # post_text is deliberately omitted: the list view never renders it and it
+    # is the largest column in the row.
+    return await _all(
+        session,
+        select(
+            LinkedinPost.id,
+            LinkedinPost.run_id,
+            LinkedinPost.user_id,
+            LinkedinPost.topic,
+            LinkedinPost.hook,
+            LinkedinPost.angle_type,
+            LinkedinPost.word_count,
+            LinkedinPost.hashtag_count,
+            LinkedinPost.approved,
+            LinkedinPost.niche,
+            LinkedinPost.created_at,
+            LinkedinPost.deleted_at,
+        )
+        .where(LinkedinPost.user_id == user_id, LinkedinPost.deleted_at.is_(None))
+        .order_by(LinkedinPost.created_at.desc())
+        .limit(limit),
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
-def get_linkedin_post_by_id(post_id: str, user_id: str) -> dict | None:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM linkedin_posts WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-        (post_id, user_id)
+
+async def get_linkedin_post_by_id(
+    session: AsyncSession, post_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(LinkedinPost).where(
+            LinkedinPost.id == post_id,
+            LinkedinPost.user_id == user_id,
+            LinkedinPost.deleted_at.is_(None),
+        ),
     )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
 
-def get_linkedin_posts_by_run_id(run_id: str) -> list[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM linkedin_posts WHERE run_id = ?", (run_id,))
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
-def soft_delete_linkedin_post(post_id: str, user_id: str) -> bool:
-    db = get_db()
-    cursor = db.execute(
-        "UPDATE linkedin_posts SET deleted_at = datetime('now') WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-        (post_id, user_id)
+async def get_linkedin_posts_by_run_id(
+    session: AsyncSession, run_id: str, user_id: str
+) -> list[dict]:
+    return await _all(
+        session,
+        select(LinkedinPost).where(
+            LinkedinPost.run_id == run_id, LinkedinPost.user_id == user_id
+        ),
     )
-    db.commit()
-    return cursor.rowcount > 0
 
 
-# -- YouTube Script Operations --
+async def soft_delete_linkedin_post(
+    session: AsyncSession, post_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        update(LinkedinPost)
+        .where(
+            LinkedinPost.id == post_id,
+            LinkedinPost.user_id == user_id,
+            LinkedinPost.deleted_at.is_(None),
+        )
+        .values(deleted_at=_now()),
+    )
 
-def save_youtube_script(
-    run_id: str, user_id: str, topic: str, title: str, script: str,
-    word_count: int, seo_title: str, seo_description: str, seo_tags: str,
-    approved: bool, niche: str,
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YouTube scripts
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def save_youtube_script(
+    session: AsyncSession,
+    run_id: str | None,
+    user_id: str,
+    topic: str,
+    title: str | None,
+    script: str,
+    word_count: int | None,
+    seo_title: str | None,
+    seo_description: str | None,
+    seo_tags: list | str | None,
+    approved: bool,
+    niche: str | None,
 ) -> dict:
-    db = get_db()
-    script_id = generate_uuid()
-    db.execute(
-        """
-        INSERT INTO youtube_scripts
-            (id, run_id, user_id, topic, title, script, word_count,
-             seo_title, seo_description, seo_tags, approved, niche)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (script_id, run_id, user_id, topic, title, script, word_count,
-         seo_title, seo_description, seo_tags, 1 if approved else 0, niche)
+    return await session.run_sync(
+        lambda s: sync_queries.save_youtube_script(
+            s, run_id, user_id, topic, title, script, word_count,
+            seo_title, seo_description, seo_tags, approved, niche,
+        )
     )
-    db.commit()
-    cursor = db.execute("SELECT * FROM youtube_scripts WHERE id = ?", (script_id,))
-    return dict_from_row(cursor.fetchone())
 
-def get_youtube_scripts(user_id: str, limit: int = 20) -> List[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT id, run_id, user_id, topic, title, word_count, seo_title, approved, niche, created_at "
-        "FROM youtube_scripts WHERE user_id = ? AND deleted_at IS NULL ORDER BY created_at DESC LIMIT ?",
-        (user_id, limit)
+
+async def get_youtube_scripts(
+    session: AsyncSession, user_id: str, limit: int = 20
+) -> list[dict]:
+    return await _all(
+        session,
+        select(
+            YoutubeScript.id,
+            YoutubeScript.run_id,
+            YoutubeScript.user_id,
+            YoutubeScript.topic,
+            YoutubeScript.title,
+            YoutubeScript.word_count,
+            YoutubeScript.seo_title,
+            YoutubeScript.approved,
+            YoutubeScript.niche,
+            YoutubeScript.created_at,
+        )
+        .where(YoutubeScript.user_id == user_id, YoutubeScript.deleted_at.is_(None))
+        .order_by(YoutubeScript.created_at.desc())
+        .limit(limit),
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
-def get_youtube_script_by_id(script_id: str, user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM youtube_scripts WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-        (script_id, user_id)
+
+async def get_youtube_script_by_id(
+    session: AsyncSession, script_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(YoutubeScript).where(
+            YoutubeScript.id == script_id,
+            YoutubeScript.user_id == user_id,
+            YoutubeScript.deleted_at.is_(None),
+        ),
     )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
 
-def get_youtube_scripts_by_run_id(run_id: str) -> List[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM youtube_scripts WHERE run_id = ?", (run_id,))
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
-def soft_delete_youtube_script(script_id: str, user_id: str) -> bool:
-    db = get_db()
-    cursor = db.execute(
-        "UPDATE youtube_scripts SET deleted_at = datetime('now') WHERE id = ? AND user_id = ? AND deleted_at IS NULL",
-        (script_id, user_id)
+async def get_youtube_scripts_by_run_id(
+    session: AsyncSession, run_id: str, user_id: str
+) -> list[dict]:
+    return await _all(
+        session,
+        select(YoutubeScript).where(
+            YoutubeScript.run_id == run_id, YoutubeScript.user_id == user_id
+        ),
     )
-    db.commit()
-    return cursor.rowcount > 0
 
 
-# -- Content Plan Operations --
-# NOTE: update_plan() above belongs to usage_limits/billing; everything here is
-# prefixed content_plan / plan_item to avoid collision.
-
-def create_content_plan(user_id: str, name: str, plan_type: str, niche: str,
-                        start_date: str, end_date: str) -> dict:
-    db = get_db()
-    plan_id = generate_uuid()
-    db.execute(
-        "INSERT INTO content_plans (id, user_id, name, plan_type, niche, start_date, end_date) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (plan_id, user_id, name, plan_type, niche, start_date, end_date)
+async def soft_delete_youtube_script(
+    session: AsyncSession, script_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        update(YoutubeScript)
+        .where(
+            YoutubeScript.id == script_id,
+            YoutubeScript.user_id == user_id,
+            YoutubeScript.deleted_at.is_(None),
+        )
+        .values(deleted_at=_now()),
     )
-    db.commit()
-    return get_content_plan_by_id(plan_id, user_id)
 
-def get_content_plans(user_id: str) -> List[dict]:
-    db = get_db()
-    cursor = db.execute(
-        """
-        SELECT p.*,
-               (SELECT COUNT(*) FROM plan_items i WHERE i.plan_id = p.id) AS item_count,
-               (SELECT COUNT(*) FROM plan_items i WHERE i.plan_id = p.id
-                 AND i.production_status = 'video_published') AS published_count
-        FROM content_plans p
-        WHERE p.user_id = ?
-        ORDER BY p.start_date DESC
-        """,
-        (user_id,)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Content plans
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def create_content_plan(
+    session: AsyncSession,
+    user_id: str,
+    name: str,
+    plan_type: str,
+    niche: str,
+    start_date: str,
+    end_date: str,
+    platform: str = "youtube",
+) -> dict:
+    row = (
+        await session.execute(
+            insert(ContentPlan)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                name=name,
+                plan_type=plan_type,
+                niche=niche,
+                start_date=start_date,
+                end_date=end_date,
+                platform=platform,
+            )
+            .returning(ContentPlan)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_content_plans(
+    session: AsyncSession, user_id: str, platform: str | None = None
+) -> list[dict]:
+    """Plans with their item counts. ``platform=None`` returns every platform."""
+    item_count = (
+        select(func.count())
+        .select_from(PlanItem)
+        .where(PlanItem.plan_id == ContentPlan.id)
+        .scalar_subquery()
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
-
-def get_content_plan_by_id(plan_id: str, user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM content_plans WHERE id = ? AND user_id = ?", (plan_id, user_id)
+    published_count = (
+        select(func.count())
+        .select_from(PlanItem)
+        .where(
+            PlanItem.plan_id == ContentPlan.id,
+            # Both status vocabularies: 'video_published' is the YouTube
+            # pipeline's terminal stage, 'published' every other platform's.
+            PlanItem.production_status.in_(PUBLISHED_STATUSES),
+        )
+        .scalar_subquery()
     )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
+    stmt = select(
+        ContentPlan,
+        item_count.label("item_count"),
+        published_count.label("published_count"),
+    ).where(ContentPlan.user_id == user_id)
+    if platform is not None:
+        stmt = stmt.where(ContentPlan.platform == platform)
+    return await _all(session, stmt.order_by(ContentPlan.start_date.desc()))
 
-def update_content_plan(plan_id: str, user_id: str, name: str = None, status: str = None) -> bool:
-    db = get_db()
-    updates, params = [], []
+
+async def get_or_create_board_plan(
+    session: AsyncSession, user_id: str, platform: str
+) -> dict:
+    """The user's open-ended Kanban plan for a platform, created on first use.
+
+    Uses ON CONFLICT rather than try/except: in asyncio a failed statement
+    aborts the whole transaction, so catching IntegrityError would poison every
+    later write in the same request. The partial unique index
+    ``uq_content_plans_user_platform_board`` is what makes this race-free.
+    """
+    today = date.today().isoformat()
+    await session.execute(
+        pg_insert(ContentPlan)
+        .values(
+            id=generate_uuid(),
+            user_id=user_id,
+            name=f"{platform.title()} Board",
+            plan_type="board",
+            niche=platform,
+            start_date=today,
+            end_date=today,
+            platform=platform,
+        )
+        .on_conflict_do_nothing(
+            index_elements=[ContentPlan.user_id, ContentPlan.platform],
+            index_where=text("plan_type = 'board'"),
+        )
+    )
+    return await _one(
+        session,
+        select(ContentPlan).where(
+            ContentPlan.user_id == user_id,
+            ContentPlan.platform == platform,
+            ContentPlan.plan_type == "board",
+        ),
+    )
+
+
+async def get_content_plan_by_id(
+    session: AsyncSession, plan_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(ContentPlan).where(
+            ContentPlan.id == plan_id, ContentPlan.user_id == user_id
+        ),
+    )
+
+
+async def update_content_plan(
+    session: AsyncSession,
+    plan_id: str,
+    user_id: str,
+    name: str | None = None,
+    status: str | None = None,
+    end_date: str | None = None,
+) -> bool:
+    values: dict[str, Any] = {}
     if name is not None:
-        updates.append("name = ?")
-        params.append(name)
+        values["name"] = name
     if status is not None:
-        updates.append("status = ?")
-        params.append(status)
-    if not updates:
+        values["status"] = status
+    # Extended when an import schedules items past the plan's current window.
+    if end_date is not None:
+        values["end_date"] = end_date
+    if not values:
         return False
-    params += [plan_id, user_id]
-    cursor = db.execute(
-        f"UPDATE content_plans SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
-        tuple(params)
+
+    return await _touched(
+        session,
+        update(ContentPlan)
+        .where(ContentPlan.id == plan_id, ContentPlan.user_id == user_id)
+        .values(**values),
     )
-    db.commit()
-    return cursor.rowcount > 0
 
-def delete_content_plan(plan_id: str, user_id: str) -> bool:
-    """Hard delete; plan_items and plan_item_content cascade (FK pragma is ON)."""
-    db = get_db()
-    cursor = db.execute(
-        "DELETE FROM content_plans WHERE id = ? AND user_id = ?", (plan_id, user_id)
+
+async def delete_content_plan(
+    session: AsyncSession, plan_id: str, user_id: str
+) -> bool:
+    """Hard delete; plan_items and plan_item_content cascade."""
+    return await _touched(
+        session,
+        delete(ContentPlan).where(
+            ContentPlan.id == plan_id, ContentPlan.user_id == user_id
+        ),
     )
-    db.commit()
-    return cursor.rowcount > 0
 
 
-# -- Plan Item Operations --
+# ─────────────────────────────────────────────────────────────────────────────
+# Plan items
+# ─────────────────────────────────────────────────────────────────────────────
 
-def create_plan_item(plan_id: str, user_id: str, topic: str, scheduled_date: str,
-                     notes: str = None, topic_source: str = "manual",
-                     publish_date: str = None, video_format: str = "full",
-                     event_time: str = None, event_duration_minutes: int = None) -> dict:
-    db = get_db()
-    item_id = generate_uuid()
-    db.execute(
-        "INSERT INTO plan_items (id, plan_id, user_id, topic, scheduled_date, publish_date, notes, topic_source, video_format, event_time, event_duration_minutes) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (item_id, plan_id, user_id, topic, scheduled_date, publish_date, notes, topic_source, video_format, event_time, event_duration_minutes)
+
+async def create_plan_item(
+    session: AsyncSession,
+    plan_id: str,
+    user_id: str,
+    topic: str,
+    scheduled_date: str | None = None,
+    notes: str | None = None,
+    topic_source: str = "manual",
+    publish_date: str | None = None,
+    video_format: str = "full",
+    event_time: str | None = None,
+    event_duration_minutes: int | None = None,
+    platform: str | None = None,
+    meta: dict | None = None,
+    production_status: str | None = None,
+) -> dict:
+    """Create one scheduled slot.
+
+    ``platform`` is resolved from the parent plan when not given. This is the
+    single place the plan/item platform invariant is enforced — nothing else
+    writes ``plan_items``, and no endpoint moves an item between plans.
+    """
+    if platform is None:
+        platform = (
+            await session.execute(
+                select(ContentPlan.platform).where(
+                    ContentPlan.id == plan_id, ContentPlan.user_id == user_id
+                )
+            )
+        ).scalar_one_or_none() or "youtube"
+    row = (
+        await session.execute(
+            insert(PlanItem)
+            .values(
+                id=generate_uuid(),
+                plan_id=plan_id,
+                user_id=user_id,
+                topic=topic,
+                scheduled_date=scheduled_date,
+                publish_date=publish_date,
+                notes=notes,
+                topic_source=topic_source,
+                video_format=video_format,
+                event_time=event_time,
+                event_duration_minutes=event_duration_minutes,
+                platform=platform,
+                meta=meta or {},
+                production_status=production_status or default_status(platform),
+            )
+            .returning(PlanItem)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_plan_items(
+    session: AsyncSession, plan_id: str, user_id: str
+) -> list[dict]:
+    return await _all(
+        session,
+        select(PlanItem)
+        .where(PlanItem.plan_id == plan_id, PlanItem.user_id == user_id)
+        # NULLS LAST: Postgres sorts NULLs first on ASC, which would float every
+        # undated backlog idea to the top of the list.
+        .order_by(
+            PlanItem.scheduled_date.asc().nulls_last(), PlanItem.created_at.asc()
+        ),
     )
-    db.commit()
-    return get_plan_item_by_id(item_id, user_id)
 
-def get_plan_items(plan_id: str, user_id: str) -> List[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM plan_items WHERE plan_id = ? AND user_id = ? ORDER BY scheduled_date ASC, created_at ASC",
-        (plan_id, user_id)
+
+async def get_plan_items_by_platform(
+    session: AsyncSession,
+    user_id: str,
+    platform: str,
+    statuses: list[str] | None = None,
+    plan_id: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    order: str = "created_desc",
+) -> list[dict]:
+    """Every item on a platform, across plans — the Kanban and calendar read.
+
+    Deliberately not routed through ``plan_service.get_plan_detail``, which
+    issues a content query per item; a 200-card board would be 200+ queries.
+    Index-backed by ix_plan_items_user_platform_status / _scheduled.
+    """
+    stmt = select(PlanItem).where(
+        PlanItem.user_id == user_id, PlanItem.platform == platform
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
+    if statuses:
+        stmt = stmt.where(PlanItem.production_status.in_(statuses))
+    if plan_id is not None:
+        stmt = stmt.where(PlanItem.plan_id == plan_id)
+    if date_from is not None:
+        stmt = stmt.where(PlanItem.scheduled_date >= date_from)
+    if date_to is not None:
+        stmt = stmt.where(PlanItem.scheduled_date <= date_to)
 
-def get_plan_item_by_id(item_id: str, user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM plan_items WHERE id = ? AND user_id = ?", (item_id, user_id)
-    )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
-
-# Sentinel so callers can clear publish_date (pass None) vs. leave it unchanged (omit).
-_UNSET = object()
-
-def update_plan_item(item_id: str, user_id: str, topic: str = None, scheduled_date: str = None,
-                     notes: str = None, production_status: str = None,
-                     publish_date=_UNSET, video_format: str = None,
-                     event_time=_UNSET, event_duration_minutes: int = None) -> bool:
-    db = get_db()
-    updates, params = [], []
-    if topic is not None:
-        updates.append("topic = ?")
-        params.append(topic)
-    if scheduled_date is not None:
-        updates.append("scheduled_date = ?")
-        params.append(scheduled_date)
-    if publish_date is not _UNSET:
-        updates.append("publish_date = ?")
-        params.append(publish_date)  # None clears it; a date string sets it
-    if event_time is not _UNSET:
-        updates.append("event_time = ?")
-        params.append(event_time)  # None clears it; 'HH:MM' sets it
-    if event_duration_minutes is not None:
-        updates.append("event_duration_minutes = ?")
-        params.append(event_duration_minutes)
-    if video_format is not None:
-        updates.append("video_format = ?")
-        params.append(video_format)
-    if notes is not None:
-        updates.append("notes = ?")
-        params.append(notes)
-    if production_status is not None:
-        updates.append("production_status = ?")
-        params.append(production_status)
-    if not updates:
-        return False
-    updates.append("updated_at = datetime('now')")
-    params += [item_id, user_id]
-    cursor = db.execute(
-        f"UPDATE plan_items SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
-        tuple(params)
-    )
-    db.commit()
-    return cursor.rowcount > 0
-
-def set_plan_item_calendar_event(item_id: str, event_id: str, event_link: str,
-                                 event_time: str = None, event_duration_minutes: int = None) -> None:
-    db = get_db()
-    fields = ["gcal_event_id = ?", "gcal_event_link = ?"]
-    params = [event_id, event_link]
-    if event_time is not None:
-        fields.append("event_time = ?")
-        params.append(event_time)
-    if event_duration_minutes is not None:
-        fields.append("event_duration_minutes = ?")
-        params.append(event_duration_minutes)
-    fields.append("updated_at = datetime('now')")
-    params.append(item_id)
-    db.execute(f"UPDATE plan_items SET {', '.join(fields)} WHERE id = ?", tuple(params))
-    db.commit()
-
-def clear_plan_item_calendar_event(item_id: str) -> None:
-    """Forget the linked calendar event (e.g. it was deleted in Google Calendar)
-    so the UI offers 'Add to Calendar' again."""
-    db = get_db()
-    db.execute(
-        "UPDATE plan_items SET gcal_event_id = NULL, gcal_event_link = NULL, updated_at = datetime('now') WHERE id = ?",
-        (item_id,)
-    )
-    db.commit()
-
-def delete_plan_item(item_id: str, user_id: str) -> bool:
-    db = get_db()
-    cursor = db.execute(
-        "DELETE FROM plan_items WHERE id = ? AND user_id = ?", (item_id, user_id)
-    )
-    db.commit()
-    return cursor.rowcount > 0
-
-# -- YouTube Playlist Item Operations (local pending → published tracker) --
-
-def create_youtube_playlist_item(user_id: str, playlist_id: str, title: str,
-                                 playlist_title: str = None, description: str = None,
-                                 video_format: str = "full", scheduled_date: str = None,
-                                 publish_date: str = None, source: str = "manual") -> dict:
-    db = get_db()
-    item_id = generate_uuid()
-    db.execute(
-        "INSERT INTO youtube_playlist_items "
-        "(id, user_id, playlist_id, playlist_title, title, description, video_format, scheduled_date, publish_date, source) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (item_id, user_id, playlist_id, playlist_title, title, description, video_format, scheduled_date, publish_date, source)
-    )
-    db.commit()
-    return get_youtube_playlist_item_by_id(item_id, user_id)
-
-def get_youtube_playlist_items(user_id: str, playlist_id: str = None) -> List[dict]:
-    db = get_db()
-    if playlist_id is not None:
-        cursor = db.execute(
-            "SELECT * FROM youtube_playlist_items WHERE user_id = ? AND playlist_id = ? "
-            "ORDER BY production_status ASC, scheduled_date ASC, created_at ASC",
-            (user_id, playlist_id)
+    if order == "scheduled":
+        stmt = stmt.order_by(
+            PlanItem.scheduled_date.asc().nulls_last(), PlanItem.created_at.asc()
         )
     else:
-        cursor = db.execute(
-            "SELECT * FROM youtube_playlist_items WHERE user_id = ? "
-            "ORDER BY production_status ASC, scheduled_date ASC, created_at ASC",
-            (user_id,)
+        # Reproduces the old list_board_items ordering exactly.
+        stmt = stmt.order_by(PlanItem.created_at.desc())
+    return await _all(session, stmt)
+
+
+async def get_plan_items_across_platforms(
+    session: AsyncSession,
+    user_id: str,
+    platforms: list[str] | None = None,
+    statuses: list[str] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    include_undated: bool = False,
+    order: str = "scheduled",
+    limit: int = 60,
+) -> list[dict]:
+    """Items across every platform at once — the assistant's schedule read.
+
+    ``get_plan_items_by_platform`` takes a single platform, which for a
+    cross-channel question ("aaj kya post karna hai?") means one round trip per
+    platform *and* an unenforceable row cap: capping per-platform then merging in
+    Python can drop the only YouTube item of the day. This caps in SQL instead.
+
+    ``platforms=None`` means every channel. ``include_undated`` widens the date
+    predicate to also admit backlog cards, which have no ``scheduled_date`` —
+    off by default, since an undated idea is not part of "today".
+
+    Index-backed by ix_plan_items_user_platform_scheduled; with an explicit
+    platform list Postgres drives it as an array scan, and with none the leading
+    user_id column still carries it.
+    """
+    stmt = select(PlanItem).where(PlanItem.user_id == user_id)
+    if platforms:
+        stmt = stmt.where(PlanItem.platform.in_(platforms))
+    if statuses:
+        stmt = stmt.where(PlanItem.production_status.in_(statuses))
+
+    date_clauses = []
+    if date_from is not None:
+        date_clauses.append(PlanItem.scheduled_date >= date_from)
+    if date_to is not None:
+        date_clauses.append(PlanItem.scheduled_date <= date_to)
+    if date_clauses:
+        ranged = and_(*date_clauses)
+        stmt = stmt.where(
+            or_(PlanItem.scheduled_date.is_(None), ranged) if include_undated else ranged
         )
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
-def get_youtube_playlist_item_by_id(item_id: str, user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM youtube_playlist_items WHERE id = ? AND user_id = ?", (item_id, user_id)
+    if order == "scheduled":
+        stmt = stmt.order_by(
+            PlanItem.scheduled_date.asc().nulls_last(),
+            PlanItem.event_time.asc().nulls_last(),
+            PlanItem.created_at.asc(),
+        )
+    else:
+        stmt = stmt.order_by(PlanItem.created_at.desc())
+    return await _all(session, stmt.limit(limit))
+
+
+async def get_pending_review_contents(
+    session: AsyncSession,
+    user_id: str,
+    review_statuses: tuple[str, ...] = ("ready", "generating"),
+    platforms: list[str] | None = None,
+    limit: int = 25,
+) -> list[dict]:
+    """The user-wide review queue: every draft awaiting a decision.
+
+    ``get_plan_item_contents`` answers "what belongs to this item"; nothing
+    answered "what is waiting on me". ``plan_item_content`` carries no platform
+    of its own (see the note in get_planner_analytics), so the parent item is
+    joined for topic and platform.
+
+    The ``user_id`` predicate is applied to *both* sides of the join. Scoping
+    only the content row would still be correct today, but the redundancy is the
+    point: this is the first query in the codebase to read this table
+    user-wide, and it must stay obviously tenant-safe as it is edited.
+
+    Index-backed by ix_plan_item_content_user_review (added in 0008).
+    """
+    stmt = (
+        select(
+            PlanItemContent,
+            PlanItem.topic.label("topic"),
+            PlanItem.platform.label("platform"),
+            PlanItem.plan_id.label("plan_id"),
+        )
+        .join(PlanItem, PlanItemContent.item_id == PlanItem.id)
+        .where(
+            PlanItemContent.user_id == user_id,
+            PlanItem.user_id == user_id,
+            PlanItemContent.review_status.in_(review_statuses),
+        )
+        .order_by(PlanItemContent.created_at.desc(), PlanItemContent.id.desc())
+        .limit(limit)
     )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
+    # _all flattens the mixed entity+label row: the PlanItemContent columns are
+    # expanded and the three joined labels merged alongside them.
+    return await _all(session, stmt)
 
-def update_youtube_playlist_item(item_id: str, user_id: str, title: str = None,
-                                 description=_UNSET, video_format: str = None,
-                                 scheduled_date=_UNSET, publish_date=_UNSET,
-                                 production_status: str = None) -> bool:
-    db = get_db()
-    updates, params = [], []
-    if title is not None:
-        updates.append("title = ?")
-        params.append(title)
-    if description is not _UNSET:
-        updates.append("description = ?")
-        params.append(description)  # None clears it
+
+async def count_plan_items_by_status(
+    session: AsyncSession, user_id: str, platform: str
+) -> dict[str, int]:
+    """Kanban column counts without shipping every row."""
+    return await _group_count(
+        session,
+        PlanItem.production_status,
+        PlanItem.user_id == user_id,
+        PlanItem.platform == platform,
+    )
+
+
+async def get_plan_item_by_id(
+    session: AsyncSession, item_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(PlanItem).where(PlanItem.id == item_id, PlanItem.user_id == user_id),
+    )
+
+
+async def update_plan_item(
+    session: AsyncSession,
+    item_id: str,
+    user_id: str,
+    topic: str | None = None,
+    scheduled_date: str | None = None,
+    notes: str | None = None,
+    production_status: str | None = None,
+    publish_date: Any = UNSET,
+    video_format: str | None = None,
+    event_time: Any = UNSET,
+    event_duration_minutes: int | None = None,
+    meta_patch: dict | None = None,
+    scheduled_date_unset: Any = UNSET,
+) -> bool:
+    values: dict[str, Any] = {}
+    if meta_patch:
+        # Shallow merge, so a caller touching one key leaves the rest alone.
+        # This is why meta is NOT NULL with a '{}' default and why its keys are
+        # flat: `NULL || x` is NULL, and `||` replaces nested objects wholesale.
+        values["meta"] = PlanItem.meta.op("||")(cast(meta_patch, JSONB))
+    if scheduled_date_unset is not UNSET:
+        values["scheduled_date"] = scheduled_date_unset  # None clears it
+    if topic is not None:
+        values["topic"] = topic
+    if scheduled_date is not None:
+        values["scheduled_date"] = scheduled_date
+    if publish_date is not UNSET:
+        values["publish_date"] = publish_date  # None clears it
+    if event_time is not UNSET:
+        values["event_time"] = event_time  # None clears it
+    if event_duration_minutes is not None:
+        values["event_duration_minutes"] = event_duration_minutes
     if video_format is not None:
-        updates.append("video_format = ?")
-        params.append(video_format)
-    if scheduled_date is not _UNSET:
-        updates.append("scheduled_date = ?")
-        params.append(scheduled_date)  # None clears it
-    if publish_date is not _UNSET:
-        updates.append("publish_date = ?")
-        params.append(publish_date)  # None clears it
+        values["video_format"] = video_format
+    if notes is not None:
+        values["notes"] = notes
     if production_status is not None:
-        updates.append("production_status = ?")
-        params.append(production_status)
-    if not updates:
+        values["production_status"] = production_status
+    if not values:
         return False
-    updates.append("updated_at = datetime('now')")
-    params += [item_id, user_id]
-    cursor = db.execute(
-        f"UPDATE youtube_playlist_items SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
-        tuple(params)
+    values["updated_at"] = _now()
+
+    return await _touched(
+        session,
+        update(PlanItem)
+        .where(PlanItem.id == item_id, PlanItem.user_id == user_id)
+        .values(**values),
     )
-    db.commit()
-    return cursor.rowcount > 0
 
-def delete_youtube_playlist_item(item_id: str, user_id: str) -> bool:
-    db = get_db()
-    cursor = db.execute(
-        "DELETE FROM youtube_playlist_items WHERE id = ? AND user_id = ?", (item_id, user_id)
+
+async def set_plan_item_calendar_event(
+    session: AsyncSession,
+    item_id: str,
+    user_id: str,
+    event_id: str,
+    event_link: str,
+    event_time: str | None = None,
+    event_duration_minutes: int | None = None,
+) -> bool:
+    values: dict[str, Any] = {
+        "gcal_event_id": event_id,
+        "gcal_event_link": event_link,
+        "updated_at": _now(),
+    }
+    if event_time is not None:
+        values["event_time"] = event_time
+    if event_duration_minutes is not None:
+        values["event_duration_minutes"] = event_duration_minutes
+
+    return await _touched(
+        session,
+        update(PlanItem)
+        .where(PlanItem.id == item_id, PlanItem.user_id == user_id)
+        .values(**values),
     )
-    db.commit()
-    return cursor.rowcount > 0
 
 
-def get_recent_plan_topics(user_id: str, days: int = 90) -> List[str]:
-    """Topics already placed in any plan recently — dedup context for the suggester."""
-    db = get_db()
-    cursor = db.execute(
-        "SELECT topic FROM plan_items WHERE user_id = ? AND created_at > datetime('now', ?)",
-        (user_id, f"-{days} days")
+async def clear_plan_item_calendar_event(
+    session: AsyncSession, item_id: str, user_id: str
+) -> bool:
+    """Forget the linked calendar event (e.g. it was deleted in Google Calendar)
+    so the UI offers 'Add to Calendar' again."""
+    return await _touched(
+        session,
+        update(PlanItem)
+        .where(PlanItem.id == item_id, PlanItem.user_id == user_id)
+        .values(gcal_event_id=None, gcal_event_link=None, updated_at=_now()),
     )
-    return [row["topic"] for row in cursor.fetchall()]
 
 
-# -- Plan Item Content Operations --
-
-def create_plan_item_content(item_id: str, user_id: str, content_type: str, run_id: str) -> dict:
-    db = get_db()
-    content_id = generate_uuid()
-    db.execute(
-        "INSERT INTO plan_item_content (id, item_id, user_id, content_type, run_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (content_id, item_id, user_id, content_type, run_id)
+async def delete_plan_item(
+    session: AsyncSession, item_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        delete(PlanItem).where(PlanItem.id == item_id, PlanItem.user_id == user_id),
     )
-    db.commit()
-    return get_plan_item_content_by_id(content_id, user_id)
 
-def get_plan_item_contents(item_id: str, user_id: str) -> List[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM plan_item_content WHERE item_id = ? AND user_id = ? ORDER BY created_at DESC, id DESC",
-        (item_id, user_id)
+
+async def get_recent_plan_topics(
+    session: AsyncSession, user_id: str, days: int = 90, platform: str | None = None
+) -> list[str]:
+    """Topics already placed in any plan recently — dedup context for the suggester.
+
+    Pass ``platform`` to keep the vocabularies apart: unfiltered, YouTube topic
+    suggestion would start deduping against Instagram carousel titles.
+    """
+    cutoff = _now() - timedelta(days=days)
+    stmt = select(PlanItem.topic).where(
+        PlanItem.user_id == user_id, PlanItem.created_at > cutoff
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
+    if platform is not None:
+        stmt = stmt.where(PlanItem.platform == platform)
+    result = await session.execute(stmt)
+    return [r[0] for r in result]
 
-def get_plan_item_content_by_id(content_id: str, user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM plan_item_content WHERE id = ? AND user_id = ?", (content_id, user_id)
+
+async def get_recent_youtube_titles(
+    session: AsyncSession, user_id: str, limit: int = 12
+) -> list[dict]:
+    """This channel's actual synced videos (title/description/tags), best-performing first.
+
+    Grounding context for the topic suggester — real content, not a guess from
+    the free-text niche field.
+    """
+    result = await session.execute(
+        select(
+            YoutubeVideoLive.title,
+            YoutubeVideoLive.description,
+            YoutubeVideoLive.tags,
+        )
+        .where(YoutubeVideoLive.user_id == user_id)
+        .order_by(YoutubeVideoLive.views.desc())
+        .limit(limit)
     )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
+    return [
+        {"title": title, "description": description, "tags": tags}
+        for title, description, tags in result
+    ]
 
-def update_plan_item_content(content_id: str, content_ref_id: str = None,
-                             review_status: str = None) -> None:
-    db = get_db()
-    updates, params = [], []
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Instagram board items
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Gone. Migration 0006 made the board plan_items rows with platform='instagram',
+# and 0007 dropped the orphaned table once the dashboard cut over. Use the
+# generic plan-item helpers above with platform="instagram"; there is no longer
+# a separate Instagram board API, model or translation shim.
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Instagram AI reports (strategy brief / content roadmap)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def save_instagram_ai_report(
+    session: AsyncSession, user_id: str, report_type: str, payload: dict
+) -> dict:
+    row = (
+        await session.execute(
+            insert(InstagramAiReport)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                report_type=report_type,
+                payload=payload,
+            )
+            .returning(InstagramAiReport)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_latest_instagram_ai_report(
+    session: AsyncSession, user_id: str, report_type: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(InstagramAiReport)
+        .where(
+            InstagramAiReport.user_id == user_id,
+            InstagramAiReport.report_type == report_type,
+        )
+        .order_by(InstagramAiReport.created_at.desc())
+        .limit(1),
+    )
+
+
+async def list_instagram_ai_reports(
+    session: AsyncSession, user_id: str, report_type: str | None = None, limit: int = 20
+) -> list[dict]:
+    """History list: metadata only, no payload (keeps the dropdown response small).
+
+    Mirrors :func:`get_youtube_analyses` so both platforms' history pickers can
+    be driven by the same component.
+    """
+    stmt = select(
+        InstagramAiReport.id,
+        InstagramAiReport.report_type,
+        InstagramAiReport.created_at,
+    ).where(InstagramAiReport.user_id == user_id)
+    if report_type is not None:
+        stmt = stmt.where(InstagramAiReport.report_type == report_type)
+    return await _all(
+        session, stmt.order_by(InstagramAiReport.created_at.desc()).limit(limit)
+    )
+
+
+async def get_instagram_ai_report_by_id(
+    session: AsyncSession, report_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(InstagramAiReport).where(
+            InstagramAiReport.id == report_id,
+            InstagramAiReport.user_id == user_id,
+        ),
+    )
+
+
+async def delete_instagram_ai_report(
+    session: AsyncSession, report_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        delete(InstagramAiReport).where(
+            InstagramAiReport.id == report_id,
+            InstagramAiReport.user_id == user_id,
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Plan item content
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def create_plan_item_content(
+    session: AsyncSession, item_id: str, user_id: str, content_type: str, run_id: str
+) -> dict:
+    row = (
+        await session.execute(
+            insert(PlanItemContent)
+            .values(
+                id=generate_uuid(),
+                item_id=item_id,
+                user_id=user_id,
+                content_type=content_type,
+                run_id=run_id,
+            )
+            .returning(PlanItemContent)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_plan_item_contents(
+    session: AsyncSession, item_id: str, user_id: str
+) -> list[dict]:
+    return await _all(
+        session,
+        select(PlanItemContent)
+        .where(
+            PlanItemContent.item_id == item_id, PlanItemContent.user_id == user_id
+        )
+        .order_by(PlanItemContent.created_at.desc(), PlanItemContent.id.desc()),
+    )
+
+
+async def get_plan_item_content_by_id(
+    session: AsyncSession, content_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(PlanItemContent).where(
+            PlanItemContent.id == content_id, PlanItemContent.user_id == user_id
+        ),
+    )
+
+
+async def update_plan_item_content(
+    session: AsyncSession,
+    content_id: str,
+    user_id: str,
+    content_ref_id: str | None = None,
+    review_status: str | None = None,
+) -> bool:
+    values: dict[str, Any] = {}
     if content_ref_id is not None:
-        updates.append("content_ref_id = ?")
-        params.append(content_ref_id)
+        values["content_ref_id"] = content_ref_id
     if review_status is not None:
-        updates.append("review_status = ?")
-        params.append(review_status)
+        values["review_status"] = review_status
         if review_status in ("approved", "rejected"):
-            updates.append("reviewed_at = datetime('now')")
-    if not updates:
-        return
-    params.append(content_id)
-    db.execute(
-        f"UPDATE plan_item_content SET {', '.join(updates)} WHERE id = ?",
-        tuple(params)
+            values["reviewed_at"] = _now()
+    if not values:
+        return False
+
+    return await _touched(
+        session,
+        update(PlanItemContent)
+        .where(PlanItemContent.id == content_id, PlanItemContent.user_id == user_id)
+        .values(**values),
     )
-    db.commit()
 
 
-# -- Saved Topic Operations --
+# ─────────────────────────────────────────────────────────────────────────────
+# Saved topics
+# ─────────────────────────────────────────────────────────────────────────────
 
-def create_saved_topic(user_id: str, topic: str, rationale: str = None, niche: str = "ai",
-                       source: str = "auto_research",
-                       source_run_id: str = None) -> Optional[dict]:
+
+async def create_saved_topic(
+    session: AsyncSession,
+    user_id: str,
+    topic: str,
+    rationale: str | None = None,
+    niche: str = "ai",
+    source: str = "auto_research",
+    source_run_id: str | None = None,
+) -> dict | None:
     """Save one candidate topic as 'uncovered'.
 
     Returns None when the user already has a topic with the same normalized
-    form — INSERT OR IGNORE against idx_saved_topics_user_norm, so re-running
-    auto-research quietly skips ideas already in the backlog.
+    form, so re-running auto-research quietly skips ideas already in the backlog.
     """
-    # Imported here: queries.py does not otherwise depend on content_tracker,
-    # which opens a different database file (./data/content_tracker.db).
+    # Imported here: this module does not otherwise depend on content_tracker.
     from app.db.content_tracker import normalize_topic
 
-    db = get_db()
-    topic_id = generate_uuid()
-    cursor = db.execute(
-        "INSERT OR IGNORE INTO saved_topics "
-        "(id, user_id, topic, topic_normalized, rationale, niche, source, source_run_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (topic_id, user_id, topic, normalize_topic(topic), rationale, niche, source, source_run_id)
-    )
-    db.commit()
-    if cursor.rowcount == 0:
-        return None
-    return get_saved_topic_by_id(topic_id, user_id)
+    row = (
+        await session.execute(
+            pg_insert(SavedTopic)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                topic=topic,
+                topic_normalized=normalize_topic(topic),
+                rationale=rationale,
+                niche=niche,
+                source=source,
+                source_run_id=source_run_id,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[SavedTopic.user_id, SavedTopic.topic_normalized]
+            )
+            .returning(SavedTopic)
+        )
+    ).one_or_none()
+    return row_to_dict(row)
 
-def get_saved_topics(user_id: str, status: str = None,
-                     include_dismissed: bool = False) -> List[dict]:
-    db = get_db()
-    conditions = ["user_id = ?"]
-    params: list = [user_id]
+
+async def get_saved_topics(
+    session: AsyncSession,
+    user_id: str,
+    status: str | None = None,
+    include_dismissed: bool = False,
+) -> list[dict]:
+    stmt = select(SavedTopic).where(SavedTopic.user_id == user_id)
     if status:
-        conditions.append("status = ?")
-        params.append(status)
+        stmt = stmt.where(SavedTopic.status == status)
     if not include_dismissed:
-        conditions.append("dismissed_at IS NULL")
-    cursor = db.execute(
-        f"SELECT * FROM saved_topics WHERE {' AND '.join(conditions)} "
-        "ORDER BY created_at DESC, id DESC",
-        tuple(params)
+        stmt = stmt.where(SavedTopic.dismissed_at.is_(None))
+    return await _all(
+        session, stmt.order_by(SavedTopic.created_at.desc(), SavedTopic.id.desc())
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
-def get_saved_topic_by_id(topic_id: str, user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM saved_topics WHERE id = ? AND user_id = ?", (topic_id, user_id)
+
+async def get_saved_topic_by_id(
+    session: AsyncSession, topic_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(SavedTopic).where(
+            SavedTopic.id == topic_id, SavedTopic.user_id == user_id
+        ),
     )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
 
-def count_uncovered_topics(user_id: str) -> int:
+
+async def count_uncovered_topics(session: AsyncSession, user_id: str) -> int:
     """Backlog size — the only query the banner needs."""
-    db = get_db()
-    cursor = db.execute(
-        "SELECT COUNT(*) AS c FROM saved_topics "
-        "WHERE user_id = ? AND status = 'uncovered' AND dismissed_at IS NULL",
-        (user_id,)
-    )
-    return cursor.fetchone()["c"]
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(SavedTopic)
+            .where(
+                SavedTopic.user_id == user_id,
+                SavedTopic.status == "uncovered",
+                SavedTopic.dismissed_at.is_(None),
+            )
+        )
+    ).scalar_one()
 
-def get_latest_saved_topic_at(user_id: str) -> Optional[str]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT MAX(created_at) AS latest FROM saved_topics "
-        "WHERE user_id = ? AND status = 'uncovered' AND dismissed_at IS NULL",
-        (user_id,)
-    )
-    return cursor.fetchone()["latest"]
 
-def update_saved_topic(topic_id: str, user_id: str, status: str = None,
-                       dismissed_at=_UNSET, topic: str = None) -> bool:
-    db = get_db()
-    updates, params = [], []
+async def get_latest_saved_topic_at(
+    session: AsyncSession, user_id: str
+) -> str | None:
+    """Newest backlog entry, as an ISO string (the model field is Optional[str])."""
+    latest = (
+        await session.execute(
+            select(func.max(SavedTopic.created_at)).where(
+                SavedTopic.user_id == user_id,
+                SavedTopic.status == "uncovered",
+                SavedTopic.dismissed_at.is_(None),
+            )
+        )
+    ).scalar()
+    return latest.isoformat() if latest is not None else None
+
+
+async def update_saved_topic(
+    session: AsyncSession,
+    topic_id: str,
+    user_id: str,
+    status: str | None = None,
+    dismissed_at: Any = UNSET,
+    topic: str | None = None,
+) -> bool:
+    values: dict[str, Any] = {}
     if status is not None:
-        updates.append("status = ?")
-        params.append(status)
+        values["status"] = status
         if status == "generated":
             # First success wins; regenerating must not move the timestamp.
-            updates.append("generated_at = COALESCE(generated_at, datetime('now'))")
-    if dismissed_at is not _UNSET:
-        updates.append("dismissed_at = ?")
-        params.append(dismissed_at)
+            values["generated_at"] = func.coalesce(SavedTopic.generated_at, _now())
+    if dismissed_at is not UNSET:
+        values["dismissed_at"] = dismissed_at
     if topic is not None:
         from app.db.content_tracker import normalize_topic
-        updates.append("topic = ?")
-        params.append(topic)
-        updates.append("topic_normalized = ?")
-        params.append(normalize_topic(topic))
-    if not updates:
+
+        values["topic"] = topic
+        values["topic_normalized"] = normalize_topic(topic)
+    if not values:
         return False
-    updates.append("updated_at = datetime('now')")
-    params += [topic_id, user_id]
-    cursor = db.execute(
-        f"UPDATE saved_topics SET {', '.join(updates)} WHERE id = ? AND user_id = ?",
-        tuple(params)
-    )
-    db.commit()
-    return cursor.rowcount > 0
+    values["updated_at"] = _now()
 
-def delete_saved_topic(topic_id: str, user_id: str) -> bool:
-    db = get_db()
-    cursor = db.execute(
-        "DELETE FROM saved_topics WHERE id = ? AND user_id = ?", (topic_id, user_id)
+    return await _touched(
+        session,
+        update(SavedTopic)
+        .where(SavedTopic.id == topic_id, SavedTopic.user_id == user_id)
+        .values(**values),
     )
-    db.commit()
-    return cursor.rowcount > 0
 
-def get_uncovered_topic_titles(user_id: str) -> List[str]:
+
+async def delete_saved_topic(
+    session: AsyncSession, topic_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        delete(SavedTopic).where(
+            SavedTopic.id == topic_id, SavedTopic.user_id == user_id
+        ),
+    )
+
+
+async def get_uncovered_topic_titles(
+    session: AsyncSession, user_id: str
+) -> list[str]:
     """Titles still awaiting generation — extra DO-NOT-REPEAT context for the
     suggester, so it stops re-proposing what is already in the backlog."""
-    db = get_db()
-    cursor = db.execute(
-        "SELECT topic FROM saved_topics WHERE user_id = ? AND status != 'generated' "
-        "ORDER BY created_at DESC LIMIT 40",
-        (user_id,)
+    result = await session.execute(
+        select(SavedTopic.topic)
+        .where(SavedTopic.user_id == user_id, SavedTopic.status != "generated")
+        .order_by(SavedTopic.created_at.desc())
+        .limit(40)
     )
-    return [row["topic"] for row in cursor.fetchall()]
+    return [r[0] for r in result]
 
 
-# -- Saved Topic Run Operations --
+# ─────────────────────────────────────────────────────────────────────────────
+# Saved topic runs
+# ─────────────────────────────────────────────────────────────────────────────
 
-def create_saved_topic_run(saved_topic_id: str, user_id: str, content_type: str,
-                           run_id: str) -> dict:
-    db = get_db()
-    row_id = generate_uuid()
-    db.execute(
-        "INSERT INTO saved_topic_runs (id, saved_topic_id, user_id, content_type, run_id) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (row_id, saved_topic_id, user_id, content_type, run_id)
+
+async def create_saved_topic_run(
+    session: AsyncSession,
+    saved_topic_id: str,
+    user_id: str,
+    content_type: str,
+    run_id: str,
+) -> dict:
+    row = (
+        await session.execute(
+            insert(SavedTopicRun)
+            .values(
+                id=generate_uuid(),
+                saved_topic_id=saved_topic_id,
+                user_id=user_id,
+                content_type=content_type,
+                run_id=run_id,
+            )
+            .returning(SavedTopicRun)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_saved_topic_runs(
+    session: AsyncSession, saved_topic_id: str, user_id: str
+) -> list[dict]:
+    return await _all(
+        session,
+        select(SavedTopicRun)
+        .where(
+            SavedTopicRun.saved_topic_id == saved_topic_id,
+            SavedTopicRun.user_id == user_id,
+        )
+        .order_by(SavedTopicRun.created_at.desc(), SavedTopicRun.id.desc()),
     )
-    db.commit()
-    return get_saved_topic_run_by_id(row_id, user_id)
 
-def get_saved_topic_runs(saved_topic_id: str, user_id: str) -> List[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM saved_topic_runs WHERE saved_topic_id = ? AND user_id = ? "
-        "ORDER BY created_at DESC, id DESC",
-        (saved_topic_id, user_id)
+
+async def get_saved_topic_run_by_id(
+    session: AsyncSession, row_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(SavedTopicRun).where(
+            SavedTopicRun.id == row_id, SavedTopicRun.user_id == user_id
+        ),
     )
-    return [dict_from_row(row) for row in cursor.fetchall()]
 
-def get_saved_topic_run_by_id(row_id: str, user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute(
-        "SELECT * FROM saved_topic_runs WHERE id = ? AND user_id = ?", (row_id, user_id)
-    )
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
 
-def update_saved_topic_run(row_id: str, content_ref_id: str = None,
-                           review_status: str = None) -> None:
-    db = get_db()
-    updates, params = [], []
+async def update_saved_topic_run(
+    session: AsyncSession,
+    row_id: str,
+    user_id: str,
+    content_ref_id: str | None = None,
+    review_status: str | None = None,
+) -> bool:
+    values: dict[str, Any] = {}
     if content_ref_id is not None:
-        updates.append("content_ref_id = ?")
-        params.append(content_ref_id)
+        values["content_ref_id"] = content_ref_id
     if review_status is not None:
-        updates.append("review_status = ?")
-        params.append(review_status)
-    if not updates:
-        return
-    params.append(row_id)
-    db.execute(
-        f"UPDATE saved_topic_runs SET {', '.join(updates)} WHERE id = ?",
-        tuple(params)
+        values["review_status"] = review_status
+    if not values:
+        return False
+
+    return await _touched(
+        session,
+        update(SavedTopicRun)
+        .where(SavedTopicRun.id == row_id, SavedTopicRun.user_id == user_id)
+        .values(**values),
     )
-    db.commit()
 
 
-# -- Planner Analytics --
+# ─────────────────────────────────────────────────────────────────────────────
+# YouTube playlist items
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def create_youtube_playlist_item(
+    session: AsyncSession,
+    user_id: str,
+    playlist_id: str,
+    title: str,
+    playlist_title: str | None = None,
+    description: str | None = None,
+    video_format: str = "full",
+    scheduled_date: str | None = None,
+    publish_date: str | None = None,
+    source: str = "manual",
+) -> dict:
+    row = (
+        await session.execute(
+            insert(YoutubePlaylistItem)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                playlist_id=playlist_id,
+                playlist_title=playlist_title,
+                title=title,
+                description=description,
+                video_format=video_format,
+                scheduled_date=scheduled_date,
+                publish_date=publish_date,
+                source=source,
+            )
+            .returning(YoutubePlaylistItem)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_youtube_playlist_items(
+    session: AsyncSession, user_id: str, playlist_id: str | None = None
+) -> list[dict]:
+    stmt = select(YoutubePlaylistItem).where(YoutubePlaylistItem.user_id == user_id)
+    if playlist_id is not None:
+        stmt = stmt.where(YoutubePlaylistItem.playlist_id == playlist_id)
+    return await _all(
+        session,
+        stmt.order_by(
+            YoutubePlaylistItem.production_status.asc(),
+            YoutubePlaylistItem.scheduled_date.asc(),
+            YoutubePlaylistItem.created_at.asc(),
+        ),
+    )
+
+
+async def get_youtube_playlist_item_by_id(
+    session: AsyncSession, item_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(YoutubePlaylistItem).where(
+            YoutubePlaylistItem.id == item_id, YoutubePlaylistItem.user_id == user_id
+        ),
+    )
+
+
+async def update_youtube_playlist_item(
+    session: AsyncSession,
+    item_id: str,
+    user_id: str,
+    title: str | None = None,
+    description: Any = UNSET,
+    video_format: str | None = None,
+    scheduled_date: Any = UNSET,
+    publish_date: Any = UNSET,
+    production_status: str | None = None,
+) -> bool:
+    values: dict[str, Any] = {}
+    if title is not None:
+        values["title"] = title
+    if description is not UNSET:
+        values["description"] = description  # None clears it
+    if video_format is not None:
+        values["video_format"] = video_format
+    if scheduled_date is not UNSET:
+        values["scheduled_date"] = scheduled_date  # None clears it
+    if publish_date is not UNSET:
+        values["publish_date"] = publish_date  # None clears it
+    if production_status is not None:
+        values["production_status"] = production_status
+    if not values:
+        return False
+    values["updated_at"] = _now()
+
+    return await _touched(
+        session,
+        update(YoutubePlaylistItem)
+        .where(
+            YoutubePlaylistItem.id == item_id, YoutubePlaylistItem.user_id == user_id
+        )
+        .values(**values),
+    )
+
+
+async def delete_youtube_playlist_item(
+    session: AsyncSession, item_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        delete(YoutubePlaylistItem).where(
+            YoutubePlaylistItem.id == item_id, YoutubePlaylistItem.user_id == user_id
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YouTube analyses (saved strategy / roadmap runs)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _analysis_row(row) -> dict | None:
+    """Row → dict, renaming the JSONB column to ``payload``.
+
+    No json.loads: ``payload_json`` is JSONB, so the driver already hands back a
+    Python object.
+    """
+    record = row_to_dict(row)
+    if record is None:
+        return None
+    record["payload"] = record.pop("payload_json", None)
+    return record
+
+
+async def create_youtube_analysis(
+    session: AsyncSession,
+    user_id: str,
+    kind: str,
+    time_range: str,
+    payload: dict,
+    weeks: int | None = None,
+    model: str | None = None,
+) -> dict:
+    row = (
+        await session.execute(
+            insert(YoutubeAnalysis)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                kind=kind,
+                time_range=time_range,
+                weeks=weeks,
+                model=model,
+                payload_json=payload,
+            )
+            .returning(YoutubeAnalysis)
+        )
+    ).one()
+    return _analysis_row(row)
+
+
+async def get_youtube_analyses(
+    session: AsyncSession, user_id: str, kind: str | None = None, limit: int = 20
+) -> list[dict]:
+    """History list: metadata only, no payload (keeps the dropdown response small)."""
+    stmt = select(
+        YoutubeAnalysis.id,
+        YoutubeAnalysis.kind,
+        YoutubeAnalysis.time_range,
+        YoutubeAnalysis.weeks,
+        YoutubeAnalysis.model,
+        YoutubeAnalysis.created_at,
+    ).where(YoutubeAnalysis.user_id == user_id)
+    if kind is not None:
+        stmt = stmt.where(YoutubeAnalysis.kind == kind)
+    return await _all(
+        session, stmt.order_by(YoutubeAnalysis.created_at.desc()).limit(limit)
+    )
+
+
+async def get_latest_youtube_analysis(
+    session: AsyncSession, user_id: str, kind: str, time_range: str | None = None
+) -> dict | None:
+    stmt = select(YoutubeAnalysis).where(
+        YoutubeAnalysis.user_id == user_id, YoutubeAnalysis.kind == kind
+    )
+    if time_range is not None:
+        stmt = stmt.where(YoutubeAnalysis.time_range == time_range)
+    row = (
+        await session.execute(stmt.order_by(YoutubeAnalysis.created_at.desc()).limit(1))
+    ).one_or_none()
+    return _analysis_row(row)
+
+
+async def get_youtube_analysis_by_id(
+    session: AsyncSession, analysis_id: str, user_id: str
+) -> dict | None:
+    row = (
+        await session.execute(
+            select(YoutubeAnalysis).where(
+                YoutubeAnalysis.id == analysis_id, YoutubeAnalysis.user_id == user_id
+            )
+        )
+    ).one_or_none()
+    return _analysis_row(row)
+
+
+async def delete_youtube_analysis(
+    session: AsyncSession, analysis_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        delete(YoutubeAnalysis).where(
+            YoutubeAnalysis.id == analysis_id, YoutubeAnalysis.user_id == user_id
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Google OAuth tokens
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def save_google_tokens(
+    session: AsyncSession,
+    user_id: str,
+    token_json_encrypted: str,
+    scopes: str | None = None,
+    connected_email: str | None = None,
+) -> None:
+    await session.run_sync(
+        lambda s: sync_queries.save_google_tokens(
+            s, user_id, token_json_encrypted, scopes, connected_email
+        )
+    )
+
+
+async def get_google_tokens(session: AsyncSession, user_id: str) -> dict | None:
+    return await session.run_sync(lambda s: sync_queries.get_google_tokens(s, user_id))
+
+
+async def delete_google_tokens(session: AsyncSession, user_id: str) -> bool:
+    return await session.run_sync(
+        lambda s: sync_queries.delete_google_tokens(s, user_id)
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Planner analytics
+# ─────────────────────────────────────────────────────────────────────────────
 
 # Production lifecycle order (mirrors app.models.planner.ProductionStatus).
 PRODUCTION_STATUS_ORDER = [
@@ -930,91 +1824,140 @@ CONTENT_TYPES = ["linkedin", "blog", "youtube_script"]
 REVIEW_STATUSES = ["generating", "ready", "approved", "rejected", "failed"]
 
 
-def _count_map(rows, key: str) -> Dict[str, int]:
+def _count_map(rows: list[dict], key: str) -> dict[str, int]:
     """Turn [{key: 'x', 'n': 3}, ...] rows into {'x': 3}."""
     return {row[key]: row["n"] for row in rows}
 
 
-def get_planner_analytics(user_id: str) -> dict:
-    """Aggregate planner metrics for the analytics dashboard (scoped to a user).
+async def _group_count(session: AsyncSession, column, *where) -> dict[str, int]:
+    rows = await _all(
+        session,
+        select(column, func.count().label("n")).where(*where).group_by(column),
+    )
+    return _count_map(rows, column.key)
 
-    Returns status breakdowns, content mix, generation reliability, schedule
-    adherence, per-platform word metrics and top-line KPIs in a single dict.
-    All sub-queries are index-backed GROUP BYs over the planner tables.
+
+async def get_planner_analytics(
+    session: AsyncSession,
+    user_id: str,
+    platform: str | None = None,
+    today: str | None = None,
+) -> dict:
+    """Aggregate planner metrics for the analytics dashboard, scoped to a user.
+
+    Status breakdowns, content mix, generation reliability, schedule adherence,
+    per-platform word metrics and top-line KPIs in a single dict. All
+    sub-queries are index-backed GROUP BYs over the planner tables.
+
+    ``platform`` scopes every figure to one channel. Without it the numbers are
+    cross-platform totals, which is correct for an "all platforms" view but
+    means the funnel rows will not sum to ``total_items`` — the funnel lists one
+    vocabulary's stages, and items may be in the other's.
+
+    ``today`` ('YYYY-MM-DD') anchors the overdue/upcoming split. Omitted, it
+    falls back to Postgres ``current_date`` — the *database session's* timezone,
+    which in a UTC container is a full day off between 00:00 and 05:30 IST, so
+    an item scheduled for today reads as overdue. Every pre-existing caller
+    omits it and is unaffected; callers that care (the assistant) pass
+    ``app.core.clock.user_today_iso()``.
     """
-    db = get_db()
-
-    def rows(sql: str, params=(user_id,)):
-        return [dict_from_row(r) for r in db.execute(sql, params).fetchall()]
-
-    def scalar(sql: str, params=(user_id,)):
-        row = db.execute(sql, params).fetchone()
-        return row[0] if row and row[0] is not None else 0
+    owned_plan = and_(ContentPlan.user_id == user_id)
+    owned_item = and_(PlanItem.user_id == user_id)
+    owned_content = and_(PlanItemContent.user_id == user_id)
+    if platform is not None:
+        owned_plan = and_(owned_plan, ContentPlan.platform == platform)
+        owned_item = and_(owned_item, PlanItem.platform == platform)
+        # plan_item_content has no platform column (only generating platforms
+        # produce rows there), so scope it through its parent item instead.
+        owned_content = and_(
+            owned_content,
+            PlanItemContent.item_id.in_(select(PlanItem.id).where(owned_item)),
+        )
 
     # -- Plans --
-    total_plans = scalar("SELECT COUNT(*) FROM content_plans WHERE user_id = ?")
-    plans_by_status = _count_map(
-        rows("SELECT status, COUNT(*) n FROM content_plans WHERE user_id = ? GROUP BY status"),
-        "status",
-    )
-    plans_by_type = _count_map(
-        rows("SELECT plan_type, COUNT(*) n FROM content_plans WHERE user_id = ? GROUP BY plan_type"),
-        "plan_type",
-    )
-    plans_by_niche = _count_map(
-        rows("SELECT niche, COUNT(*) n FROM content_plans WHERE user_id = ? GROUP BY niche"),
-        "niche",
-    )
+    total_plans = (
+        await session.execute(
+            select(func.count()).select_from(ContentPlan).where(owned_plan)
+        )
+    ).scalar_one()
+    plans_by_status = await _group_count(session, ContentPlan.status, owned_plan)
+    plans_by_type = await _group_count(session, ContentPlan.plan_type, owned_plan)
+    plans_by_niche = await _group_count(session, ContentPlan.niche, owned_plan)
 
     # -- Items funnel --
-    status_counts = _count_map(
-        rows(
-            "SELECT production_status, COUNT(*) n FROM plan_items "
-            "WHERE user_id = ? GROUP BY production_status"
-        ),
-        "production_status",
+    status_counts = await _group_count(
+        session, PlanItem.production_status, owned_item
+    )
+    funnel_stages = (
+        status_order(platform) if platform is not None else PRODUCTION_STATUS_ORDER
     )
     items_funnel = [
-        {"status": s, "count": status_counts.get(s, 0)} for s in PRODUCTION_STATUS_ORDER
+        {"status": s, "count": status_counts.get(s, 0)} for s in funnel_stages
     ]
     total_items = sum(status_counts.values())
-    published_items = status_counts.get("video_published", 0)
-    items_by_format = _count_map(
-        rows("SELECT video_format, COUNT(*) n FROM plan_items WHERE user_id = ? GROUP BY video_format"),
-        "video_format",
-    )
-    items_by_source = _count_map(
-        rows("SELECT topic_source, COUNT(*) n FROM plan_items WHERE user_id = ? GROUP BY topic_source"),
-        "topic_source",
-    )
+    # Both vocabularies' terminal stages, so an Instagram 'published' card is
+    # not invisible here.
+    published_items = sum(status_counts.get(s, 0) for s in PUBLISHED_STATUSES)
+    items_by_format = await _group_count(session, PlanItem.video_format, owned_item)
+    items_by_source = await _group_count(session, PlanItem.topic_source, owned_item)
 
     # -- Content mix (type x review status) --
-    mix_rows = rows(
-        "SELECT content_type, review_status, COUNT(*) n FROM plan_item_content "
-        "WHERE user_id = ? GROUP BY content_type, review_status"
+    mix_rows = await _all(
+        session,
+        select(
+            PlanItemContent.content_type,
+            PlanItemContent.review_status,
+            func.count().label("n"),
+        )
+        .where(owned_content)
+        .group_by(PlanItemContent.content_type, PlanItemContent.review_status),
     )
     content_by_type = {t: 0 for t in CONTENT_TYPES}
     content_by_review = {s: 0 for s in REVIEW_STATUSES}
     for r in mix_rows:
-        content_by_type[r["content_type"]] = content_by_type.get(r["content_type"], 0) + r["n"]
-        content_by_review[r["review_status"]] = content_by_review.get(r["review_status"], 0) + r["n"]
+        content_by_type[r["content_type"]] = (
+            content_by_type.get(r["content_type"], 0) + r["n"]
+        )
+        content_by_review[r["review_status"]] = (
+            content_by_review.get(r["review_status"], 0) + r["n"]
+        )
     total_content = sum(content_by_type.values())
 
     # -- Volume over time (content pieces generated per day) --
-    volume_over_time = rows(
-        "SELECT date(created_at) AS day, COUNT(*) n FROM plan_item_content "
-        "WHERE user_id = ? GROUP BY day ORDER BY day"
+    day = func.date(PlanItemContent.created_at).label("day")
+    volume_over_time = await _all(
+        session,
+        select(day, func.count().label("n"))
+        .where(owned_content)
+        .group_by(day)
+        .order_by(day),
     )
 
     # -- Schedule adherence --
-    overdue = scalar(
-        "SELECT COUNT(*) FROM plan_items WHERE user_id = ? "
-        "AND production_status != 'video_published' AND date(scheduled_date) < date('now')"
-    )
-    upcoming = scalar(
-        "SELECT COUNT(*) FROM plan_items WHERE user_id = ? "
-        "AND production_status != 'video_published' AND date(scheduled_date) >= date('now')"
-    )
+    # A real date object, not cast(str): asyncpg binds a DATE parameter from a
+    # date and rejects a string outright ("'str' object has no attribute
+    # 'toordinal'"), so the ISO string callers pass is parsed here.
+    if today is None:
+        today_expr = func.current_date()
+    else:
+        today_expr = date.fromisoformat(today) if isinstance(today, str) else today
+    unpublished = PlanItem.production_status.not_in(PUBLISHED_STATUSES)
+    # An undated backlog idea is neither overdue nor upcoming.
+    dated = PlanItem.scheduled_date.is_not(None)
+    overdue = (
+        await session.execute(
+            select(func.count())
+            .select_from(PlanItem)
+            .where(owned_item, unpublished, dated, PlanItem.scheduled_date < today_expr)
+        )
+    ).scalar_one()
+    upcoming = (
+        await session.execute(
+            select(func.count())
+            .select_from(PlanItem)
+            .where(owned_item, unpublished, dated, PlanItem.scheduled_date >= today_expr)
+        )
+    ).scalar_one()
     schedule = {
         "published": published_items,
         "overdue": overdue,
@@ -1022,43 +1965,56 @@ def get_planner_analytics(user_id: str) -> dict:
     }
 
     # -- Generation reliability (runs behind planner content) --
-    gen_rows = rows(
-        "SELECT r.status, COUNT(*) n, AVG(r.duration_seconds) avg_seconds "
-        "FROM agent_runs r JOIN plan_item_content c ON c.run_id = r.id "
-        "WHERE c.user_id = ? GROUP BY r.status"
+    gen_rows = await _all(
+        session,
+        select(
+            AgentRun.status,
+            func.count().label("n"),
+            func.avg(AgentRun.duration_seconds).label("avg_seconds"),
+        )
+        .join(PlanItemContent, PlanItemContent.run_id == AgentRun.id)
+        .where(owned_content)
+        .group_by(AgentRun.status),
     )
     generation = {
         r["status"]: {"count": r["n"], "avg_seconds": round(r["avg_seconds"] or 0, 2)}
         for r in gen_rows
     }
     avg_gen_seconds = round(
-        scalar(
-            "SELECT AVG(r.duration_seconds) FROM agent_runs r "
-            "JOIN plan_item_content c ON c.run_id = r.id "
-            "WHERE c.user_id = ? AND r.duration_seconds IS NOT NULL"
-        )
+        (
+            await session.execute(
+                select(func.avg(AgentRun.duration_seconds))
+                .join(PlanItemContent, PlanItemContent.run_id == AgentRun.id)
+                .where(owned_content, AgentRun.duration_seconds.is_not(None))
+            )
+        ).scalar()
         or 0,
         2,
     )
 
     # -- Per-platform word metrics (join to source tables via content_ref_id) --
     word_metrics = {}
-    for content_type, table in (
-        ("linkedin", "linkedin_posts"),
-        ("blog", "blog_posts"),
-        ("youtube_script", "youtube_scripts"),
+    for content_type, model in (
+        ("linkedin", LinkedinPost),
+        ("blog", BlogPost),
+        ("youtube_script", YoutubeScript),
     ):
-        row = db.execute(
-            f"SELECT COUNT(*) c, COALESCE(SUM(word_count), 0) total, "
-            f"COALESCE(AVG(word_count), 0) avg FROM {table} WHERE id IN "
-            f"(SELECT content_ref_id FROM plan_item_content "
-            f"WHERE user_id = ? AND content_type = ?)",
-            (user_id, content_type),
-        ).fetchone()
+        refs = select(PlanItemContent.content_ref_id).where(
+            owned_content, PlanItemContent.content_type == content_type
+        )
+        row = (
+            await session.execute(
+                select(
+                    func.count().label("c"),
+                    func.coalesce(func.sum(model.word_count), 0).label("total"),
+                    func.coalesce(func.avg(model.word_count), 0).label("avg"),
+                ).where(model.id.in_(refs))
+            )
+        ).one()
         word_metrics[content_type] = {
-            "count": row[0],
-            "total_words": row[1],
-            "avg_words": round(row[2], 1),
+            "count": row.c,
+            "total_words": int(row.total),
+            "avg_words": round(float(row.avg), 1),
         }
 
     # -- Top-line KPIs --
@@ -1094,33 +2050,788 @@ def get_planner_analytics(user_id: str) -> dict:
     }
 
 
-# -- Google OAuth Token Operations --
+# ─────────────────────────────────────────────────────────────────────────────
+# Personal Intelligence — user rules
+# ─────────────────────────────────────────────────────────────────────────────
 
-def save_google_tokens(user_id: str, token_json_encrypted: str, scopes: str = None,
-                       connected_email: str = None) -> None:
-    db = get_db()
-    db.execute(
-        """
-        INSERT INTO google_oauth_tokens (user_id, token_json_encrypted, scopes, connected_email, updated_at)
-        VALUES (?, ?, ?, ?, datetime('now'))
-        ON CONFLICT(user_id) DO UPDATE SET
-            token_json_encrypted = excluded.token_json_encrypted,
-            scopes = COALESCE(excluded.scopes, scopes),
-            connected_email = COALESCE(excluded.connected_email, connected_email),
-            updated_at = datetime('now')
-        """,
-        (user_id, token_json_encrypted, scopes, connected_email)
+
+async def list_user_rules(
+    session: AsyncSession,
+    user_id: str,
+    scope: str | None = None,
+    active_only: bool = False,
+) -> list[dict]:
+    stmt = select(UserRule).where(UserRule.user_id == user_id)
+    if scope:
+        stmt = stmt.where(or_(UserRule.scope == scope, UserRule.scope == "global"))
+    if active_only:
+        stmt = stmt.where(UserRule.is_active.is_(True))
+    return await _all(session, stmt.order_by(UserRule.priority.asc(), UserRule.created_at.asc()))
+
+
+async def get_user_rule(session: AsyncSession, rule_id: str, user_id: str) -> dict | None:
+    return await _one(
+        session, select(UserRule).where(UserRule.id == rule_id, UserRule.user_id == user_id)
     )
-    db.commit()
 
-def get_google_tokens(user_id: str) -> Optional[dict]:
-    db = get_db()
-    cursor = db.execute("SELECT * FROM google_oauth_tokens WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return dict_from_row(row) if row else None
 
-def delete_google_tokens(user_id: str) -> bool:
-    db = get_db()
-    cursor = db.execute("DELETE FROM google_oauth_tokens WHERE user_id = ?", (user_id,))
-    db.commit()
-    return cursor.rowcount > 0
+async def create_user_rule(
+    session: AsyncSession,
+    user_id: str,
+    scope: str,
+    category: str,
+    rule_text: str,
+    priority: int = 100,
+    is_active: bool = True,
+) -> dict:
+    row = (
+        await session.execute(
+            insert(UserRule)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                scope=scope,
+                category=category,
+                rule_text=rule_text,
+                priority=priority,
+                is_active=is_active,
+            )
+            .returning(UserRule)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def update_user_rule(
+    session: AsyncSession,
+    rule_id: str,
+    user_id: str,
+    scope: str | None = None,
+    category: str | None = None,
+    rule_text: str | None = None,
+    priority: int | None = None,
+    is_active: bool | None = None,
+) -> bool:
+    values: dict[str, Any] = {}
+    if scope is not None:
+        values["scope"] = scope
+    if category is not None:
+        values["category"] = category
+    if rule_text is not None:
+        values["rule_text"] = rule_text
+    if priority is not None:
+        values["priority"] = priority
+    if is_active is not None:
+        values["is_active"] = is_active
+    if not values:
+        return False
+    values["updated_at"] = _now()
+    return await _touched(
+        session,
+        update(UserRule).where(UserRule.id == rule_id, UserRule.user_id == user_id).values(**values),
+    )
+
+
+async def delete_user_rule(session: AsyncSession, rule_id: str, user_id: str) -> bool:
+    return await _touched(
+        session, delete(UserRule).where(UserRule.id == rule_id, UserRule.user_id == user_id)
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Personal Intelligence — user goals
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def list_user_goals(
+    session: AsyncSession, user_id: str, status: str | None = None
+) -> list[dict]:
+    stmt = select(UserGoal).where(UserGoal.user_id == user_id)
+    if status:
+        stmt = stmt.where(UserGoal.status == status)
+    return await _all(session, stmt.order_by(UserGoal.deadline.asc()))
+
+
+async def get_user_goal(session: AsyncSession, goal_id: str, user_id: str) -> dict | None:
+    return await _one(
+        session, select(UserGoal).where(UserGoal.id == goal_id, UserGoal.user_id == user_id)
+    )
+
+
+async def create_user_goal(
+    session: AsyncSession,
+    user_id: str,
+    title: str,
+    metric: str,
+    target_value: float,
+    deadline,
+    platform: str = "youtube",
+    description: str | None = None,
+    baseline_value: float = 0.0,
+) -> dict:
+    row = (
+        await session.execute(
+            insert(UserGoal)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                title=title,
+                description=description,
+                platform=platform,
+                metric=metric,
+                target_value=target_value,
+                baseline_value=baseline_value,
+                baseline_at=_now(),
+                deadline=deadline,
+                status="active",
+            )
+            .returning(UserGoal)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def update_user_goal(
+    session: AsyncSession,
+    goal_id: str,
+    user_id: str,
+    title: str | None = None,
+    description: Any = UNSET,
+    target_value: float | None = None,
+    deadline: Any = None,
+    status: str | None = None,
+    progress: Any = UNSET,
+) -> bool:
+    values: dict[str, Any] = {}
+    if title is not None:
+        values["title"] = title
+    if description is not UNSET:
+        values["description"] = description
+    if target_value is not None:
+        values["target_value"] = target_value
+    if deadline is not None:
+        values["deadline"] = deadline
+    if status is not None:
+        values["status"] = status
+    if progress is not UNSET:
+        values["progress"] = progress
+    if not values:
+        return False
+    values["updated_at"] = _now()
+    return await _touched(
+        session,
+        update(UserGoal).where(UserGoal.id == goal_id, UserGoal.user_id == user_id).values(**values),
+    )
+
+
+async def delete_user_goal(session: AsyncSession, goal_id: str, user_id: str) -> bool:
+    return await _touched(
+        session, delete(UserGoal).where(UserGoal.id == goal_id, UserGoal.user_id == user_id)
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Competitors
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def create_competitor_discovery_run(
+    session: AsyncSession, user_id: str, niche: str
+) -> dict:
+    row = (
+        await session.execute(
+            insert(YoutubeCompetitorDiscoveryRun)
+            .values(id=generate_uuid(), user_id=user_id, niche=niche, candidates=[])
+            .returning(YoutubeCompetitorDiscoveryRun)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_competitor_discovery_run(
+    session: AsyncSession, run_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(YoutubeCompetitorDiscoveryRun).where(
+            YoutubeCompetitorDiscoveryRun.id == run_id,
+            YoutubeCompetitorDiscoveryRun.user_id == user_id,
+        ),
+    )
+
+
+async def get_latest_pending_discovery_run(session: AsyncSession, user_id: str) -> dict | None:
+    return await _one(
+        session,
+        select(YoutubeCompetitorDiscoveryRun)
+        .where(
+            YoutubeCompetitorDiscoveryRun.user_id == user_id,
+            YoutubeCompetitorDiscoveryRun.status == "pending",
+        )
+        .order_by(YoutubeCompetitorDiscoveryRun.created_at.desc())
+        .limit(1),
+    )
+
+
+async def complete_discovery_run(
+    session: AsyncSession,
+    run_id: str,
+    user_id: str,
+    candidates: list[dict],
+    quota_units_spent: int,
+) -> bool:
+    return await _touched(
+        session,
+        update(YoutubeCompetitorDiscoveryRun)
+        .where(
+            YoutubeCompetitorDiscoveryRun.id == run_id,
+            YoutubeCompetitorDiscoveryRun.user_id == user_id,
+        )
+        .values(
+            candidates=candidates,
+            status="pending",
+            quota_units_spent=quota_units_spent,
+        ),
+    )
+
+
+async def decide_discovery_run(
+    session: AsyncSession,
+    run_id: str,
+    user_id: str,
+    approved_count: int,
+    rejected_count: int,
+) -> bool:
+    return await _touched(
+        session,
+        update(YoutubeCompetitorDiscoveryRun)
+        .where(
+            YoutubeCompetitorDiscoveryRun.id == run_id,
+            YoutubeCompetitorDiscoveryRun.user_id == user_id,
+        )
+        .values(
+            status="applied",
+            approved_count=approved_count,
+            rejected_count=rejected_count,
+            decided_at=_now(),
+        ),
+    )
+
+
+async def filter_known_competitor_ids(
+    session: AsyncSession, user_id: str, channel_ids: list[str]
+) -> set[str]:
+    """Channel ids already present for this user, in ANY status.
+
+    This is the exclusion guarantee: a channel the user approved OR rejected OR
+    removed must never be suggested again, so discovery drops every id this
+    query returns before it ever reaches the candidate list.
+    """
+    if not channel_ids:
+        return set()
+    rows = await _all(
+        session,
+        select(YoutubeCompetitor.channel_id).where(
+            YoutubeCompetitor.user_id == user_id,
+            YoutubeCompetitor.channel_id.in_(channel_ids),
+        ),
+    )
+    return {r["channel_id"] for r in rows}
+
+
+async def bulk_upsert_competitors(
+    session: AsyncSession, user_id: str, rows: list[dict]
+) -> int:
+    """Insert or refresh many competitor rows in one statement.
+
+    Each dict must carry ``channel_id`` plus whatever columns it wants to set;
+    ``user_id``/``created_at``/``updated_at`` are added here. Existing rows keep
+    their ``status``/``priority``/``notes`` unless the caller explicitly
+    supplies them — a stats refresh must never silently un-reject a channel.
+    """
+    if not rows:
+        return 0
+    valid_columns = {c.name for c in YoutubeCompetitor.__table__.columns}
+    # Callers pass through LLM/verification dicts that may carry extra
+    # display-only fields (e.g. a discovery candidate's "tier" hint, kept in
+    # the discovery run's JSONB but not a column here) — drop anything the
+    # table doesn't define rather than letting the INSERT fail on it.
+    values = [{"user_id": user_id, **{k: v for k, v in r.items() if k in valid_columns}} for r in rows]
+    stmt = pg_insert(YoutubeCompetitor).values(values)
+    settable = {
+        c.name
+        for c in YoutubeCompetitor.__table__.columns
+        if c.name not in ("user_id", "channel_id", "created_at")
+    }
+    # Only columns present on every row are safe to reference via .excluded;
+    # anything omitted keeps the existing row's value via COALESCE.
+    update_cols = set()
+    for v in values:
+        update_cols.update(v.keys())
+    update_cols &= settable
+    update_cols.discard("user_id")
+    set_ = {
+        col: func.coalesce(getattr(stmt.excluded, col), getattr(YoutubeCompetitor, col))
+        for col in update_cols
+    }
+    set_["updated_at"] = func.now()
+    result = await session.execute(
+        stmt.on_conflict_do_update(
+            index_elements=[YoutubeCompetitor.user_id, YoutubeCompetitor.channel_id],
+            set_=set_,
+        )
+    )
+    return result.rowcount or 0
+
+
+async def list_competitors(
+    session: AsyncSession,
+    user_id: str,
+    *,
+    limit: int = 50,
+    cursor: tuple[Any, str] | None = None,
+    status: str = "approved",
+    q: str = "",
+) -> list[dict]:
+    """Keyset-paginated competitor list, newest first.
+
+    Thousands of rows per user rules out OFFSET pagination (it degrades
+    linearly with depth); the cursor is the last row's ``(created_at,
+    channel_id)``, which the ``ix_youtube_competitors_user_status`` index
+    serves directly.
+    """
+    stmt = select(YoutubeCompetitor).where(
+        YoutubeCompetitor.user_id == user_id, YoutubeCompetitor.status == status
+    )
+    if q:
+        stmt = stmt.where(YoutubeCompetitor.title.ilike(f"%{q}%"))
+    if cursor is not None:
+        cursor_created_at, cursor_channel_id = cursor
+        stmt = stmt.where(
+            or_(
+                YoutubeCompetitor.created_at < cursor_created_at,
+                (YoutubeCompetitor.created_at == cursor_created_at)
+                & (YoutubeCompetitor.channel_id < cursor_channel_id),
+            )
+        )
+    stmt = stmt.order_by(YoutubeCompetitor.created_at.desc(), YoutubeCompetitor.channel_id.desc())
+    return await _all(session, stmt.limit(limit))
+
+
+async def count_competitors(session: AsyncSession, user_id: str, status: str = "approved") -> int:
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(YoutubeCompetitor)
+            .where(YoutubeCompetitor.user_id == user_id, YoutubeCompetitor.status == status)
+        )
+    ).scalar_one()
+
+
+async def get_competitor(session: AsyncSession, user_id: str, channel_id: str) -> dict | None:
+    return await _one(
+        session,
+        select(YoutubeCompetitor).where(
+            YoutubeCompetitor.user_id == user_id, YoutubeCompetitor.channel_id == channel_id
+        ),
+    )
+
+
+async def update_competitor(
+    session: AsyncSession,
+    user_id: str,
+    channel_id: str,
+    status: str | None = None,
+    priority: int | None = None,
+) -> bool:
+    values: dict[str, Any] = {}
+    if status is not None:
+        values["status"] = status
+    if priority is not None:
+        values["priority"] = priority
+    if not values:
+        return False
+    values["updated_at"] = _now()
+    return await _touched(
+        session,
+        update(YoutubeCompetitor)
+        .where(YoutubeCompetitor.user_id == user_id, YoutubeCompetitor.channel_id == channel_id)
+        .values(**values),
+    )
+
+
+async def get_competitor_videos(
+    session: AsyncSession, user_id: str, channel_id: str, limit: int = 20
+) -> list[dict]:
+    return await _all(
+        session,
+        select(YoutubeCompetitorVideo)
+        .where(
+            YoutubeCompetitorVideo.user_id == user_id,
+            YoutubeCompetitorVideo.channel_id == channel_id,
+        )
+        .order_by(YoutubeCompetitorVideo.published_at.desc())
+        .limit(limit),
+    )
+
+
+async def get_all_competitor_videos(
+    session: AsyncSession,
+    user_id: str,
+    *,
+    limit: int = 30,
+    offset: int = 0,
+    channel_id: str | None = None,
+) -> tuple[list[dict], int]:
+    """All competitor videos sorted by views desc with optional channel filter.
+
+    Returns (rows, total_count) for pagination.
+    """
+    base_where = [
+        YoutubeCompetitorVideo.user_id == user_id,
+        YoutubeCompetitor.status == "approved",
+    ]
+    if channel_id:
+        base_where.append(YoutubeCompetitorVideo.channel_id == channel_id)
+
+    join_cond = (YoutubeCompetitorVideo.user_id == YoutubeCompetitor.user_id) & (
+        YoutubeCompetitorVideo.channel_id == YoutubeCompetitor.channel_id
+    )
+
+    rows = await _all(
+        session,
+        select(
+            YoutubeCompetitorVideo,
+            YoutubeCompetitor.title.label("channel_title"),
+            YoutubeCompetitor.thumbnail_url.label("channel_thumbnail"),
+            YoutubeCompetitor.handle.label("channel_handle"),
+        )
+        .join(YoutubeCompetitor, join_cond)
+        .where(*base_where)
+        .order_by(YoutubeCompetitorVideo.views.desc())
+        .limit(limit)
+        .offset(offset),
+    )
+
+    count_result = await session.execute(
+        select(func.count())
+        .select_from(YoutubeCompetitorVideo)
+        .join(YoutubeCompetitor, join_cond)
+        .where(*base_where)
+    )
+    total = count_result.scalar() or 0
+    return rows, total
+
+
+async def get_competitor_recent_videos(
+    session: AsyncSession, user_id: str, *, days: int = 45, limit: int = 40
+) -> list[dict]:
+    """Recent videos across every tracked competitor — the context feed."""
+    since = _now() - timedelta(days=days)
+    return await _all(
+        session,
+        select(YoutubeCompetitorVideo, YoutubeCompetitor.title.label("channel_title"))
+        .join(
+            YoutubeCompetitor,
+            (YoutubeCompetitorVideo.user_id == YoutubeCompetitor.user_id)
+            & (YoutubeCompetitorVideo.channel_id == YoutubeCompetitor.channel_id),
+        )
+        .where(
+            YoutubeCompetitorVideo.user_id == user_id,
+            YoutubeCompetitor.status == "approved",
+            YoutubeCompetitorVideo.published_at >= since,
+        )
+        .order_by(YoutubeCompetitorVideo.published_at.desc())
+        .limit(limit),
+    )
+
+
+async def bulk_upsert_competitor_videos(
+    session: AsyncSession, user_id: str, videos: list[dict]
+) -> int:
+    """Insert or refresh many competitor-video rows in one statement.
+
+    Each dict needs ``video_id``, ``channel_id`` plus the metric columns; see
+    ``app.services.youtube_competitor.sync_competitor_videos`` for the shape.
+    """
+    if not videos:
+        return 0
+    values = [{"user_id": user_id, **v} for v in videos]
+    stmt = pg_insert(YoutubeCompetitorVideo).values(values)
+    result = await session.execute(
+        stmt.on_conflict_do_update(
+            index_elements=[YoutubeCompetitorVideo.user_id, YoutubeCompetitorVideo.video_id],
+            set_={
+                "title": stmt.excluded.title,
+                "description": stmt.excluded.description,
+                "published_at": func.coalesce(
+                    stmt.excluded.published_at, YoutubeCompetitorVideo.published_at
+                ),
+                "duration_seconds": stmt.excluded.duration_seconds,
+                "is_short": stmt.excluded.is_short,
+                "views": stmt.excluded.views,
+                "likes": stmt.excluded.likes,
+                "comments": stmt.excluded.comments,
+                "tags": stmt.excluded.tags,
+                "thumbnail_url": func.coalesce(
+                    stmt.excluded.thumbnail_url, YoutubeCompetitorVideo.thumbnail_url
+                ),
+                "fetched_at": func.now(),
+            },
+        )
+    )
+    return result.rowcount or 0
+
+
+async def list_competitor_names(session: AsyncSession, user_id: str, limit: int = 150) -> list[str]:
+    """Titles of every tracked competitor, any status — the discovery prompt's
+    exclusion hint. (The authoritative exclusion is filter_known_competitor_ids,
+    run on real channel_ids after verification; this is only to stop the LLM
+    wasting proposal slots on channels it will just be told no about.)"""
+    rows = await _all(
+        session,
+        select(YoutubeCompetitor.title)
+        .where(YoutubeCompetitor.user_id == user_id)
+        .order_by(YoutubeCompetitor.created_at.desc())
+        .limit(limit),
+    )
+    return [r["title"] for r in rows]
+
+
+async def stamp_competitor_synced(
+    session: AsyncSession, user_id: str, channel_id: str, error: str | None = None
+) -> bool:
+    return await _touched(
+        session,
+        update(YoutubeCompetitor)
+        .where(YoutubeCompetitor.user_id == user_id, YoutubeCompetitor.channel_id == channel_id)
+        .values(last_synced_at=_now(), sync_error=error, updated_at=_now()),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Assistant (chat history + confirmable actions)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def create_assistant_conversation(
+    session: AsyncSession, user_id: str, title: str
+) -> dict:
+    return await _one(
+        session,
+        insert(AssistantConversation)
+        .values(id=generate_uuid(), user_id=user_id, title=title)
+        .returning(AssistantConversation),
+    )
+
+
+async def get_assistant_conversation(
+    session: AsyncSession, conversation_id: str, user_id: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(AssistantConversation).where(
+            AssistantConversation.id == conversation_id,
+            AssistantConversation.user_id == user_id,
+        ),
+    )
+
+
+async def list_assistant_conversations(
+    session: AsyncSession, user_id: str, limit: int = 30
+) -> list[dict]:
+    """Sidebar list: threads newest-active first, with their message counts."""
+    rows = await _all(
+        session,
+        select(
+            AssistantConversation,
+            func.count(AssistantMessage.id).label("message_count"),
+        )
+        .outerjoin(
+            AssistantMessage,
+            AssistantMessage.conversation_id == AssistantConversation.id,
+        )
+        .where(AssistantConversation.user_id == user_id)
+        .group_by(AssistantConversation.id)
+        .order_by(AssistantConversation.updated_at.desc())
+        .limit(limit),
+    )
+    return rows
+
+
+async def touch_assistant_conversation(
+    session: AsyncSession, conversation_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        update(AssistantConversation)
+        .where(
+            AssistantConversation.id == conversation_id,
+            AssistantConversation.user_id == user_id,
+        )
+        .values(updated_at=_now()),
+    )
+
+
+async def delete_assistant_conversation(
+    session: AsyncSession, conversation_id: str, user_id: str
+) -> bool:
+    """Messages and their actions go with it, via ON DELETE CASCADE."""
+    return await _touched(
+        session,
+        delete(AssistantConversation).where(
+            AssistantConversation.id == conversation_id,
+            AssistantConversation.user_id == user_id,
+        ),
+    )
+
+
+async def create_assistant_message(
+    session: AsyncSession,
+    conversation_id: str,
+    user_id: str,
+    role: str,
+    content: str,
+    meta: dict | None = None,
+) -> dict:
+    return await _one(
+        session,
+        insert(AssistantMessage)
+        .values(
+            id=generate_uuid(),
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role=role,
+            content=content,
+            meta=meta or {},
+        )
+        .returning(AssistantMessage),
+    )
+
+
+async def get_assistant_messages(
+    session: AsyncSession, conversation_id: str, user_id: str, limit: int = 50
+) -> list[dict]:
+    """Transcript in order. Scoped by conversation *and* user, never one alone."""
+    return await _all(
+        session,
+        select(AssistantMessage)
+        .where(
+            AssistantMessage.conversation_id == conversation_id,
+            AssistantMessage.user_id == user_id,
+        )
+        .order_by(AssistantMessage.created_at.asc(), AssistantMessage.id.asc())
+        .limit(limit),
+    )
+
+
+async def get_recent_assistant_messages(
+    session: AsyncSession, conversation_id: str, user_id: str, limit: int = 6
+) -> list[dict]:
+    """The last N turns, oldest-first — the prompt's conversation window.
+
+    Ordered DESC in SQL so the LIMIT takes the *newest* rows, then reversed, so
+    a long thread does not have to be fully materialised to read its tail.
+    """
+    rows = await _all(
+        session,
+        select(AssistantMessage)
+        .where(
+            AssistantMessage.conversation_id == conversation_id,
+            AssistantMessage.user_id == user_id,
+        )
+        .order_by(AssistantMessage.created_at.desc(), AssistantMessage.id.desc())
+        .limit(limit),
+    )
+    return list(reversed(rows))
+
+
+async def create_assistant_action(
+    session: AsyncSession,
+    message_id: str,
+    user_id: str,
+    item_id: str,
+    verb: str,
+    label: str,
+    params: dict,
+    expires_at: datetime,
+    content_id: str | None = None,
+) -> dict:
+    return await _one(
+        session,
+        insert(AssistantAction)
+        .values(
+            id=generate_uuid(),
+            message_id=message_id,
+            user_id=user_id,
+            item_id=item_id,
+            content_id=content_id,
+            verb=verb,
+            label=label,
+            params=params or {},
+            expires_at=expires_at,
+        )
+        .returning(AssistantAction),
+    )
+
+
+async def get_assistant_action(
+    session: AsyncSession, action_id: str, user_id: str, for_update: bool = False
+) -> dict | None:
+    """Fetch one action, tenant-scoped in SQL.
+
+    ``for_update`` takes a row lock, which is what makes confirm single-use: two
+    concurrent confirms serialise, and the second sees the status the first
+    already advanced past.
+    """
+    stmt = select(AssistantAction).where(
+        AssistantAction.id == action_id, AssistantAction.user_id == user_id
+    )
+    if for_update:
+        stmt = stmt.with_for_update()
+    return await _one(session, stmt)
+
+
+async def update_assistant_action(
+    session: AsyncSession,
+    action_id: str,
+    user_id: str,
+    status: str | None = None,
+    result: dict | None = None,
+    executed_at: datetime | None = None,
+) -> bool:
+    values: dict[str, Any] = {}
+    if status is not None:
+        values["status"] = status
+    if result is not None:
+        values["result"] = result
+    if executed_at is not None:
+        values["executed_at"] = executed_at
+    if not values:
+        return False
+    return await _touched(
+        session,
+        update(AssistantAction)
+        .where(
+            AssistantAction.id == action_id, AssistantAction.user_id == user_id
+        )
+        .values(**values),
+    )
+
+
+async def get_assistant_actions_for_messages(
+    session: AsyncSession, message_ids: list[str], user_id: str
+) -> list[dict]:
+    """Every action attached to a batch of messages — one query for a replayed
+    transcript, rather than one per assistant bubble."""
+    if not message_ids:
+        return []
+    return await _all(
+        session,
+        select(AssistantAction)
+        .where(
+            AssistantAction.message_id.in_(message_ids),
+            AssistantAction.user_id == user_id,
+        )
+        .order_by(AssistantAction.created_at.asc()),
+    )

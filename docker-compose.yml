@@ -7,25 +7,102 @@
 # Stop:    docker compose down
 # =============================================================================
 
+# Shared by every Python service. Defined once so the API and the workers can
+# never drift onto different databases or brokers.
+x-backend-environment: &backend-environment
+  DATABASE_URL: postgresql+asyncpg://nexus:${POSTGRES_PASSWORD:-nexus}@postgres:5432/nexus
+  REDIS_CACHE_URL: redis://redis-cache:6379/0
+  REDIS_STATE_URL: redis://redis-broker:6379/2
+  CELERY_BROKER_URL: redis://redis-broker:6379/0
+  CELERY_RESULT_BACKEND: redis://redis-broker:6379/1
+  # ComfyUI retired — image generation runs on the Gemini image models.
+  # COMFY_HOST: host.docker.internal
+  # COMFY_PORT: "8188"
+  GEMINI_IMAGE_MODEL: ${GEMINI_IMAGE_MODEL:-gemini-3.1-flash-image}
+  OPENAI_API_KEY: sk-no-openai-intended
+
+x-backend-depends: &backend-depends
+  postgres:
+    condition: service_healthy
+  redis-broker:
+    condition: service_healthy
+  redis-cache:
+    condition: service_healthy
+  migrate:
+    condition: service_completed_successfully
+
 services:
-  # ── Redis (Message Broker + Result Backend) ─────────────────────────────
-  redis:
-    image: redis:7-alpine
-    # Bound to loopback rather than 0.0.0.0: an unauthenticated broker holding
-    # task payloads must not be reachable off-host. Still published (not just
-    # `expose`d) because the API and workers are commonly run directly on the
-    # host against a containerised Redis, and those reach it via localhost:6379.
+  # ── Postgres ────────────────────────────────────────────────────────────
+  # Published on 5433, not 5432, so it does not collide with a Postgres
+  # already installed on the host.
+  postgres:
+    image: postgres:16-alpine
     ports:
-      - "127.0.0.1:6379:6379"
+      - "127.0.0.1:5433:5432"
+    environment:
+      - POSTGRES_USER=nexus
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-nexus}
+      - POSTGRES_DB=nexus
     volumes:
-      - redis_data:/data
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexus"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Redis: broker + durable state ───────────────────────────────────────
+  # Deliberately separate from the cache below. This instance holds queued task
+  # payloads and the auth revocation denylist, neither of which may ever be
+  # evicted — an evicted denylist entry silently *un-revokes* a logged-out
+  # token — hence `noeviction` and AOF persistence.
+  #   db 0: Celery broker   db 1: Celery results   db 2: auth state + job pubsub
+  redis-broker:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - redis_broker_data:/data
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 3s
       retries: 3
     restart: unless-stopped
+
+  # ── Redis: analytics cache ──────────────────────────────────────────────
+  # Evictable by design. Losing a cached analytics payload costs one recompute;
+  # losing a queued job or a revocation entry costs correctness, which is why
+  # those live on redis-broker instead.
+  redis-cache:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    command: redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru --save ""
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  # ── Schema migrations ───────────────────────────────────────────────────
+  # Runs once to completion before anything that touches the database starts.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: alembic upgrade head
+    env_file:
+      - app/.env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://nexus:${POSTGRES_PASSWORD:-nexus}@postgres:5432/nexus
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   # ── FastAPI Backend ─────────────────────────────────────────────────────
   api:
@@ -37,17 +114,18 @@ services:
     env_file:
       - app/.env
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - COMFY_HOST=host.docker.internal
-      - COMFY_PORT=8188
-      - OPENAI_API_KEY=sk-no-openai-intended
+      <<: *backend-environment
+      # The default output dir is the Next.js public folder, which only exists
+      # in the dashboard image. Point renders at the volume below; the API
+      # serves them back itself via /api/plans/{plan}/items/{item}/image.
+      # (IMAGE_OUTPUT_DIR is the current name; COMFY_OUTPUT_DIR still works.)
+      IMAGE_OUTPUT_DIR: /data/generated_posts
+    volumes:
+      - generated_posts:/data/generated_posts
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - sqlite_data:/app/data
     depends_on:
-      redis:
-        condition: service_healthy
+      <<: *backend-depends
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
       interval: 30s
@@ -65,17 +143,11 @@ services:
     env_file:
       - app/.env
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - COMFY_HOST=host.docker.internal
-      - COMFY_PORT=8188
-      - OPENAI_API_KEY=sk-no-openai-intended
+      <<: *backend-environment
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - sqlite_data:/app/data
     depends_on:
-      redis:
-        condition: service_healthy
+      <<: *backend-depends
     restart: unless-stopped
 
   # ── LinkedIn Celery Worker ──────────────────────────────────────────────
@@ -90,17 +162,11 @@ services:
     env_file:
       - app/.env
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - COMFY_HOST=host.docker.internal
-      - COMFY_PORT=8188
-      - OPENAI_API_KEY=sk-no-openai-intended
+      <<: *backend-environment
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - sqlite_data:/app/data
     depends_on:
-      redis:
-        condition: service_healthy
+      <<: *backend-depends
     restart: unless-stopped
 
   # ── Blog Celery Worker ──────────────────────────────────────────────────
@@ -115,17 +181,11 @@ services:
     env_file:
       - app/.env
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - COMFY_HOST=host.docker.internal
-      - COMFY_PORT=8188
-      - OPENAI_API_KEY=sk-no-openai-intended
+      <<: *backend-environment
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - sqlite_data:/app/data
     depends_on:
-      redis:
-        condition: service_healthy
+      <<: *backend-depends
     restart: unless-stopped
 
   # ── Celery GPU Worker (gpu_queue) ───────────────────────────────────────
@@ -137,17 +197,11 @@ services:
     env_file:
       - app/.env
     environment:
-      - REDIS_URL=redis://redis:6379/0
-      - COMFY_HOST=host.docker.internal
-      - COMFY_PORT=8188
-      - OPENAI_API_KEY=sk-no-openai-intended
+      <<: *backend-environment
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    volumes:
-      - sqlite_data:/app/data
     depends_on:
-      redis:
-        condition: service_healthy
+      <<: *backend-depends
     deploy:
       resources:
         reservations:
@@ -158,7 +212,8 @@ services:
     restart: unless-stopped
 
   # ── ComfyUI ─────────────────────────────────────────────────────────────
-  # Disabled — using local ComfyUI at host.docker.internal:8188
+  # Retired — image generation runs on the Gemini image models (no GPU node).
+  # Was: disabled here, using a local ComfyUI at host.docker.internal:8188.
   # comfyui:
   #   image: ghcr.io/ai-dock/comfyui:latest
   #   ports:
@@ -187,15 +242,15 @@ services:
     # Bound to loopback so it is not reachable off-host. Flower natively reads
     # FLOWER_BASIC_AUTH from its environment — set it in app/.env as
     # `FLOWER_BASIC_AUTH=user:somelongpassword` to require credentials too.
-    command: celery -A app.celery_app flower --port=5555 --broker_api=redis://redis:6379/0
+    command: celery -A app.celery_app flower --port=5555 --broker_api=redis://redis-broker:6379/0
     ports:
       - "127.0.0.1:5555:5555"
     env_file:
       - app/.env
     environment:
-      - REDIS_URL=redis://redis:6379/0
+      <<: *backend-environment
     depends_on:
-      redis:
+      redis-broker:
         condition: service_healthy
     restart: unless-stopped
 
@@ -207,11 +262,12 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - NEXT_PUBLIC_BACKEND_API=http://localhost:8000
+      - NEXT_PUBLIC_BACKEND_API=""
     depends_on:
       - api
     restart: unless-stopped
 
 volumes:
-  redis_data:
-  sqlite_data:
+  generated_posts:
+  postgres_data:
+  redis_broker_data:

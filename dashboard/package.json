@@ -3,7 +3,8 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "NODE_OPTIONS='--max-old-space-size=8192' next dev --webpack",
+    "dev:turbo": "NODE_OPTIONS='--max-old-space-size=8192' next dev",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
@@ -29,5 +30,8 @@
     "eslint-config-next": "16.2.0",
     "tailwindcss": "^4",
     "typescript": "^5"
+  },
+  "optionalDependencies": {
+    "@next/swc-linux-x64-gnu": "^16.2.0"
   }
 }

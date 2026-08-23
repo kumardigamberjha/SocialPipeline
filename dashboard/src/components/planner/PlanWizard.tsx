@@ -2,7 +2,16 @@
 
 import { Loader2, Plus, Sparkles, Trash2, X } from "lucide-react";
 import { useState } from "react";
-import { plannerApi, PlanDetail, PlanType, VideoFormat } from "@/lib/plannerApi";
+import {
+  INSTAGRAM_POST_TYPES,
+  PLATFORMS,
+  isVideoPlatform,
+  Platform,
+  plannerApi,
+  PlanDetail,
+  PlanType,
+  VideoFormat,
+} from "@/lib/plannerApi";
 
 interface DraftItem {
   topic: string;
@@ -10,17 +19,24 @@ interface DraftItem {
   topic_source: "ai" | "manual";
   notes: string;
   video_format: VideoFormat;
+  /** Platform-specific extras — seeded from the AI suggestion, then editable. */
+  meta: Record<string, unknown>;
 }
 
 interface Props {
+  /** The plan's channel. Without it every plan was created as YouTube. */
+  platform: Platform;
   onClose: () => void;
   onCreated: (plan: PlanDetail) => void;
 }
 
 const PROVIDERS = ["nvidia", "groq", "ollama", "openai", "anthropic", "google"];
 
-export default function PlanWizard({ onClose, onCreated }: Props) {
+export default function PlanWizard({ platform, onClose, onCreated }: Props) {
   const today = new Date().toISOString().slice(0, 10);
+  // Only YouTube runs the video pipeline; for everything else a short/full
+  // toggle is noise, and Instagram wants a post type instead.
+  const isVideo = isVideoPlatform(platform);
   const [name, setName] = useState("");
   const [planType, setPlanType] = useState<PlanType>("weekly");
   const [niche, setNiche] = useState("ai");
@@ -39,6 +55,7 @@ export default function PlanWizard({ onClose, onCreated }: Props) {
         plan_type: planType,
         niche,
         start_date: startDate,
+        platform,
         provider,
       });
       setItems(
@@ -49,6 +66,9 @@ export default function PlanWizard({ onClose, onCreated }: Props) {
           // Seed the editable description with the AI's rationale so it is kept, not lost.
           notes: t.rationale ?? "",
           video_format: "full" as const,
+          // Instagram's suggester returns type/caption/image_prompt here; these
+          // were previously dropped on the floor.
+          meta: t.meta ?? {},
         })),
       );
     } catch (err) {
@@ -63,7 +83,17 @@ export default function PlanWizard({ onClose, onCreated }: Props) {
   };
 
   const addRow = () => {
-    setItems((prev) => [...prev, { topic: "", scheduled_date: startDate, topic_source: "manual", notes: "", video_format: "full" }]);
+    setItems((prev) => [
+      ...prev,
+      {
+        topic: "",
+        scheduled_date: startDate,
+        topic_source: "manual",
+        notes: "",
+        video_format: "full",
+        meta: isVideo ? {} : { type: "reel" },
+      },
+    ]);
   };
 
   const removeRow = (index: number) => {
@@ -88,12 +118,15 @@ export default function PlanWizard({ onClose, onCreated }: Props) {
         plan_type: planType,
         niche,
         start_date: startDate,
+        platform,
         items: valid.map((i) => ({
           topic: i.topic.trim(),
           scheduled_date: i.scheduled_date,
           topic_source: i.topic_source,
           notes: i.notes.trim() || null,
-          video_format: i.video_format,
+          // video_format only means something on the video pipeline.
+          ...(isVideo ? { video_format: i.video_format } : {}),
+          ...(Object.keys(i.meta).length ? { meta: i.meta } : {}),
         })),
       });
       onCreated(plan);
@@ -107,7 +140,9 @@ export default function PlanWizard({ onClose, onCreated }: Props) {
     <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 backdrop-blur-sm overflow-y-auto py-10 px-4">
       <div className="w-full max-w-2xl rounded-2xl border border-white/10 bg-slate-900 p-6 shadow-2xl">
         <div className="flex items-center justify-between mb-5">
-          <h2 className="text-sm font-bold uppercase tracking-[0.2em] text-white">New Content Plan</h2>
+          <h2 className="text-sm font-bold uppercase tracking-[0.2em] text-white">
+            New {PLATFORMS.find((p) => p.value === platform)?.label ?? platform} Plan
+          </h2>
           <button onClick={onClose} className="text-slate-500 hover:text-white transition-colors">
             <X className="w-5 h-5" />
           </button>
@@ -201,7 +236,7 @@ export default function PlanWizard({ onClose, onCreated }: Props) {
                 <input
                   value={item.topic}
                   onChange={(e) => updateItem(i, { topic: e.target.value, topic_source: item.topic_source })}
-                  placeholder="Video topic / working title"
+                  placeholder={isVideo ? "Video topic / working title" : "Post topic / working title"}
                   className="w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-white placeholder:text-slate-600 focus:outline-none focus:border-blue-500/50"
                 />
                 <textarea
@@ -218,15 +253,28 @@ export default function PlanWizard({ onClose, onCreated }: Props) {
                 onChange={(e) => updateItem(i, { scheduled_date: e.target.value })}
                 className="rounded-lg bg-white/5 border border-white/10 px-2 py-2 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50 [color-scheme:dark]"
               />
-              <select
-                value={item.video_format}
-                onChange={(e) => updateItem(i, { video_format: e.target.value as VideoFormat })}
-                title="Video format — short (<60s) or full length (7-9 min)"
-                className="rounded-lg bg-white/5 border border-white/10 px-2 py-2 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50"
-              >
-                <option value="full" className="bg-slate-900">Full</option>
-                <option value="short" className="bg-slate-900">Short</option>
-              </select>
+              {isVideo ? (
+                <select
+                  value={item.video_format}
+                  onChange={(e) => updateItem(i, { video_format: e.target.value as VideoFormat })}
+                  title="Video format — short (<60s) or full length (7-9 min)"
+                  className="rounded-lg bg-white/5 border border-white/10 px-2 py-2 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50"
+                >
+                  <option value="full" className="bg-slate-900">Full</option>
+                  <option value="short" className="bg-slate-900">Short</option>
+                </select>
+              ) : (
+                <select
+                  value={(item.meta.type as string) ?? "reel"}
+                  onChange={(e) => updateItem(i, { meta: { ...item.meta, type: e.target.value } })}
+                  title="Post type"
+                  className="rounded-lg bg-white/5 border border-white/10 px-2 py-2 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50 capitalize"
+                >
+                  {INSTAGRAM_POST_TYPES.map((t) => (
+                    <option key={t} value={t} className="bg-slate-900 capitalize">{t}</option>
+                  ))}
+                </select>
+              )}
               <button onClick={() => removeRow(i)} className="p-2 text-slate-600 hover:text-red-400 transition-colors">
                 <Trash2 className="w-4 h-4" />
               </button>

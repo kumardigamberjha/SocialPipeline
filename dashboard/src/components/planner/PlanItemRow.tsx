@@ -1,16 +1,22 @@
 "use client";
 
-import { Calendar, CalendarCheck, Check, Eye, Loader2, Pencil, Trash2, X, Zap } from "lucide-react";
+import { Calendar, CalendarCheck, Check, CheckCircle2, Circle, Clock, Eye, FileText, Image as ImageIcon, Loader2, Pencil, PlayCircle, Sparkles, Trash2, Video, X, Zap } from "lucide-react";
 import { useState } from "react";
 import {
   ContentType,
   GenerateType,
+  canGenerate,
+  canGenerateImage,
+  instagramMeta,
+  isVideoPlatform,
+  Platform,
   PlanItem,
-  PRODUCTION_STATUSES,
   plannerApi,
   ProductionStatus,
+  statusesFor,
   VideoFormat,
 } from "@/lib/plannerApi";
+import PlatformMetaFields, { PlatformMetaStats } from "./PlatformMetaFields";
 
 const TYPE_LABELS: { type: ContentType; label: string }[] = [
   { type: "linkedin", label: "LinkedIn" },
@@ -24,6 +30,89 @@ const CHIP_STYLES: Record<string, string> = {
   approved: "bg-green-500/10 text-green-400 border-green-400/30",
   rejected: "bg-red-500/10 text-red-400 border-red-400/30",
   failed: "bg-red-500/10 text-red-400 border-red-400/30",
+};
+
+const STATUS_STYLES: Record<
+  ProductionStatus,
+  {
+    card: string;
+    badge: string;
+    select: string;
+    label: string;
+    icon: React.ComponentType<{ className?: string }>;
+  }
+> = {
+  // The plain board vocabulary every non-video platform uses.
+  idea: {
+    card: "bg-slate-900/30 border-white/5 border-l-4 border-l-slate-600/50",
+    badge: "bg-slate-500/10 text-slate-400 border-slate-400/30",
+    select: "text-slate-400",
+    label: "Idea",
+    icon: Circle,
+  },
+  in_production: {
+    card: "bg-amber-900/10 border-white/5 border-l-4 border-l-amber-500/50",
+    badge: "bg-amber-500/10 text-amber-400 border-amber-400/30",
+    select: "text-amber-400",
+    label: "In Production",
+    icon: Circle,
+  },
+  scheduled: {
+    card: "bg-blue-900/10 border-white/5 border-l-4 border-l-blue-500/50",
+    badge: "bg-blue-500/10 text-blue-400 border-blue-400/30",
+    select: "text-blue-400",
+    label: "Scheduled",
+    icon: Circle,
+  },
+  published: {
+    card: "bg-green-900/10 border-white/5 border-l-4 border-l-green-500/50",
+    badge: "bg-green-500/10 text-green-400 border-green-400/30",
+    select: "text-green-400",
+    label: "Published",
+    icon: Circle,
+  },
+  pending: {
+    card: "bg-slate-900/30 border-white/5 border-l-4 border-l-slate-600/50",
+    badge: "bg-slate-500/10 text-slate-400 border-slate-400/20",
+    select: "bg-white/5 text-slate-300 border-white/10",
+    label: "Pending",
+    icon: Clock,
+  },
+  script_generated: {
+    card: "bg-blue-950/20 border-blue-500/25 border-l-4 border-l-blue-500",
+    badge: "bg-blue-500/15 text-blue-300 border-blue-400/30",
+    select: "bg-blue-500/15 text-blue-300 border-blue-400/30 font-medium",
+    label: "Script Generated",
+    icon: FileText,
+  },
+  presentation_created: {
+    card: "bg-indigo-950/20 border-indigo-500/25 border-l-4 border-l-indigo-500",
+    badge: "bg-indigo-500/15 text-indigo-300 border-indigo-400/30",
+    select: "bg-indigo-500/15 text-indigo-300 border-indigo-400/30 font-medium",
+    label: "Presentation Created",
+    icon: Sparkles,
+  },
+  video_created: {
+    card: "bg-amber-950/20 border-amber-500/25 border-l-4 border-l-amber-500",
+    badge: "bg-amber-500/15 text-amber-300 border-amber-400/30",
+    select: "bg-amber-500/15 text-amber-300 border-amber-400/30 font-medium",
+    label: "Video Created",
+    icon: Video,
+  },
+  video_edited: {
+    card: "bg-purple-950/20 border-purple-500/25 border-l-4 border-l-purple-500",
+    badge: "bg-purple-500/15 text-purple-300 border-purple-400/30",
+    select: "bg-purple-500/15 text-purple-300 border-purple-400/30 font-medium",
+    label: "Video Edited",
+    icon: PlayCircle,
+  },
+  video_published: {
+    card: "bg-gradient-to-r from-emerald-950/40 via-emerald-900/20 to-slate-900/30 border-emerald-500/40 border-l-4 border-l-emerald-400 shadow-[0_0_15px_rgba(16,185,129,0.08)]",
+    badge: "bg-emerald-500/20 text-emerald-300 border-emerald-500/40 font-bold",
+    select: "bg-emerald-500/20 text-emerald-300 border-emerald-500/40 font-bold",
+    label: "Video Published",
+    icon: CheckCircle2,
+  },
 };
 
 const DURATION_PRESETS = [15, 30, 45, 60, 90, 120, 180, 240];
@@ -102,20 +191,39 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
   const [savingEdit, setSavingEdit] = useState(false);
   const [editTopic, setEditTopic] = useState(item.topic);
   const [editNotes, setEditNotes] = useState(item.notes ?? "");
-  const [editScheduled, setEditScheduled] = useState(item.scheduled_date);
+  // "" when the item is an undated backlog idea; the <input type="date"> needs
+  // a string, and an empty one renders as a blank date field.
+  const [editScheduled, setEditScheduled] = useState(item.scheduled_date ?? "");
   const [editPublish, setEditPublish] = useState(item.publish_date ?? "");
   const [editTime, setEditTime] = useState(item.event_time ?? "");
   const [editDuration, setEditDuration] = useState(item.event_duration_minutes ?? 60);
   const [editFormat, setEditFormat] = useState<VideoFormat>(item.video_format ?? "full");
+  // Only the meta keys the user actually touched, so the server-side shallow
+  // merge leaves every other key (metrics, image_file, …) alone.
+  const [editMeta, setEditMeta] = useState<Record<string, unknown>>({});
+
+  const [imageBusy, setImageBusy] = useState(false);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+
+  const platform: Platform = item.platform ?? "youtube";
+  const isVideo = isVideoPlatform(platform);
+  const ig = instagramMeta(item.meta ?? {});
+
+  const statusStyle = STATUS_STYLES[item.production_status] ?? STATUS_STYLES.pending;
+  const StatusIcon = statusStyle.icon;
+  const isPublished =
+    item.production_status === "video_published" ||
+    item.production_status === "published";
 
   const startEdit = () => {
     setEditTopic(item.topic);
     setEditNotes(item.notes ?? "");
-    setEditScheduled(item.scheduled_date);
+    setEditScheduled(item.scheduled_date ?? "");
     setEditPublish(item.publish_date ?? "");
     setEditTime(item.event_time ?? "");
     setEditDuration(item.event_duration_minutes ?? 60);
     setEditFormat(item.video_format ?? "full");
+    setEditMeta({});
     setEditing(true);
   };
 
@@ -130,9 +238,11 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
         event_time: editTime || null,
         event_duration_minutes: editDuration,
         notes: editNotes.trim(),
-        video_format: editFormat,
+        ...(isVideo ? { video_format: editFormat } : {}),
+        ...(Object.keys(editMeta).length ? { meta: editMeta } : {}),
       });
       setEditing(false);
+      setEditMeta({});
       onChanged();
     } catch (err) {
       onError(err instanceof Error ? err.message : "Update failed");
@@ -147,6 +257,22 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
       onChanged();
     } catch (err) {
       onError(err instanceof Error ? err.message : "Format update failed");
+    }
+  };
+
+  const generateImage = async () => {
+    setImageBusy(true);
+    try {
+      const res = await plannerApi.generateImage(planId, item.id, {
+        prompt: ig.image_prompt || undefined,
+      });
+      // Show the returned bytes straight away; later loads fetch by URL.
+      setImagePreview(`data:image/png;base64,${res.image_b64}`);
+      onChanged();
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Image generation failed");
+    } finally {
+      setImageBusy(false);
     }
   };
 
@@ -199,11 +325,17 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
     }
   };
 
-  const fmtDate = (d: string) =>
-    new Date(d + "T00:00:00").toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+  const fmtDate = (d: string | null) =>
+    d
+      ? new Date(d + "T00:00:00").toLocaleDateString(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+        })
+      : "No date";
 
   return (
-    <div className="rounded-xl border border-white/5 bg-white/[0.02] px-4 py-3 hover:border-white/10 transition-colors">
+    <div className={`rounded-xl px-4 py-3.5 transition-all duration-200 ${statusStyle.card}`}>
       {editing ? (
         /* ── Edit form ── */
         <div className="space-y-2">
@@ -219,6 +351,11 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
             placeholder="Description (optional) — angle, key points, notes…"
             rows={2}
             className="w-full rounded-lg bg-white/5 border border-white/10 px-3 py-1.5 text-xs text-slate-300 placeholder:text-slate-600 focus:outline-none focus:border-blue-500/50 resize-y"
+          />
+          <PlatformMetaFields
+            platform={platform}
+            meta={{ ...(item.meta ?? {}), ...editMeta }}
+            onChange={(patch) => setEditMeta((prev) => ({ ...prev, ...patch }))}
           />
           <div className="flex gap-3 flex-wrap items-end">
             <label className="text-[10px] uppercase tracking-wider text-slate-500">
@@ -254,17 +391,19 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
                 <DurationPicker value={editDuration} onChange={setEditDuration} />
               </span>
             </label>
-            <label className="text-[10px] uppercase tracking-wider text-slate-500">
-              Video format
-              <select
-                value={editFormat}
-                onChange={(e) => setEditFormat(e.target.value as VideoFormat)}
-                className="mt-1 block rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50"
-              >
-                <option value="full" className="bg-slate-900">Full length</option>
-                <option value="short" className="bg-slate-900">Short</option>
-              </select>
-            </label>
+            {isVideo && (
+              <label className="text-[10px] uppercase tracking-wider text-slate-500">
+                Video format
+                <select
+                  value={editFormat}
+                  onChange={(e) => setEditFormat(e.target.value as VideoFormat)}
+                  className="mt-1 block rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50"
+                >
+                  <option value="full" className="bg-slate-900">Full length</option>
+                  <option value="short" className="bg-slate-900">Short</option>
+                </select>
+              </label>
+            )}
             <div className="flex-1" />
             <button
               onClick={() => setEditing(false)}
@@ -285,59 +424,100 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
         /* ── Read-only view ── */
         <div className="flex items-start gap-3 flex-wrap">
           <div className="flex-1 min-w-[220px]">
-            <p className="text-[10px] uppercase tracking-wider text-slate-500">
-              {fmtDate(item.scheduled_date)}
-              {item.publish_date && (
-                <span className="text-blue-400/80"> · publishes {fmtDate(item.publish_date)}</span>
-              )}
-            </p>
+            <div className="flex items-center gap-2 flex-wrap mb-1">
+              <p className="text-[10px] uppercase tracking-wider text-slate-400 font-medium">
+                {fmtDate(item.scheduled_date)}
+                {item.publish_date && (
+                  <span className="text-blue-400/80"> · publishes {fmtDate(item.publish_date)}</span>
+                )}
+              </p>
+
+              {/* Status Badge in Header */}
+              <span className={`px-2 py-0.5 rounded-full text-[10px] uppercase tracking-wider border inline-flex items-center gap-1 ${statusStyle.badge}`}>
+                <StatusIcon className="w-3 h-3 shrink-0" />
+                {statusStyle.label}
+              </span>
+            </div>
+
             <button
               onClick={startEdit}
-              className="text-sm text-white mt-0.5 text-left hover:text-blue-300 transition-colors"
+              className={`text-sm mt-0.5 text-left transition-colors flex items-center gap-1.5 ${
+                isPublished ? "text-emerald-200 font-semibold hover:text-emerald-100" : "text-white hover:text-blue-300 font-medium"
+              }`}
               title="Click to edit"
             >
-              {item.topic}
+              {isPublished && <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />}
+              <span>{item.topic}</span>
             </button>
-            {item.notes && <p className="text-xs text-slate-500 mt-0.5">{item.notes}</p>}
+            {item.notes && <p className="text-xs text-slate-400 mt-1 leading-relaxed">{item.notes}</p>}
+            {!isVideo && (
+              <div className="mt-1.5 space-y-1">
+                <span className="text-[10px] uppercase tracking-wider text-pink-400/70 capitalize">
+                  {ig.type}
+                  {ig.type === "carousel" && ` · ${ig.slides_count} slides`}
+                </span>
+                <PlatformMetaStats platform={platform} meta={item.meta ?? {}} />
+              </div>
+            )}
           </div>
 
-          {/* Video format */}
-          <select
-            value={item.video_format ?? "full"}
-            onChange={(e) => setFormat(e.target.value as VideoFormat)}
-            className="rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50"
-            title="Video format — drives YouTube script length (short = <60s, full = 7-9 min)"
-          >
-            <option value="full" className="bg-slate-900">Full length</option>
-            <option value="short" className="bg-slate-900">Short</option>
-          </select>
+          {/* Video format — only the YouTube pipeline reads it. */}
+          {isVideo && (
+            <select
+              value={item.video_format ?? "full"}
+              onChange={(e) => setFormat(e.target.value as VideoFormat)}
+              className="rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50"
+              title="Video format — drives YouTube script length (short = <60s, full = 7-9 min)"
+            >
+              <option value="full" className="bg-slate-900">Full length</option>
+              <option value="short" className="bg-slate-900">Short</option>
+            </select>
+          )}
 
-          {/* Production status */}
+          {/* Production status dropdown */}
           <select
             value={item.production_status}
             onChange={(e) => setStatus(e.target.value as ProductionStatus)}
-            className="rounded-lg bg-white/5 border border-white/10 px-2 py-1.5 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50"
-            title="Production stage — script_generated is set automatically when a YouTube script completes"
+            className={`rounded-lg border px-2.5 py-1.5 text-xs focus:outline-none transition-colors ${statusStyle.select}`}
+            title={
+              isVideo
+                ? "Production stage — script_generated is set automatically when a YouTube script completes"
+                : "Production stage"
+            }
           >
-            {PRODUCTION_STATUSES.map((s) => (
-              <option key={s.value} value={s.value} className="bg-slate-900">
+            {statusesFor(platform).map((s) => (
+              <option key={s.value} value={s.value} className="bg-slate-900 text-slate-200 font-normal">
                 {s.label}
               </option>
             ))}
           </select>
 
-          <button onClick={startEdit} className="p-1.5 text-slate-600 hover:text-blue-400 transition-colors" title="Edit item">
+          <button onClick={startEdit} className="p-1.5 text-slate-500 hover:text-blue-400 transition-colors" title="Edit item">
             <Pencil className="w-4 h-4" />
           </button>
-          <button onClick={remove} className="p-1.5 text-slate-600 hover:text-red-400 transition-colors" title="Delete item">
+          <button onClick={remove} className="p-1.5 text-slate-500 hover:text-red-400 transition-colors" title="Delete item">
             <Trash2 className="w-4 h-4" />
           </button>
         </div>
       )}
 
-      {/* Generation buttons + chips */}
+      {canGenerateImage(platform) && (imagePreview || ig.image_file) && (
+        /* eslint-disable-next-line @next/next/no-img-element -- generated at
+           runtime behind an authenticated API route; next/image cannot fetch it. */
+        <img
+          src={imagePreview ?? plannerApi.itemImageUrl(planId, item.id)}
+          alt={`Generated graphic for ${item.topic}`}
+          className="mt-3 rounded-lg border border-white/10 max-h-48 w-auto"
+        />
+      )}
+
+      {/* Generation buttons + chips.
+          Hidden on platforms the pipelines cannot produce for — the backend
+          rejects those with a 400, and offering the button would only lead the
+          user into an error (or, before the guard existed, into a wasted run). */}
       <div className="flex items-center gap-2 mt-3 flex-wrap">
-        {TYPE_LABELS.map(({ type, label }) => {
+        {canGenerate(platform) &&
+          TYPE_LABELS.map(({ type, label }) => {
           const latest = latestByType.get(type);
           return (
             <button
@@ -360,14 +540,38 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
           );
         })}
 
-        <button
-          onClick={() => generate("all")}
-          disabled={generating !== null}
-          className="text-xs px-2.5 py-1.5 rounded-lg bg-purple-600/70 hover:bg-purple-500 text-white transition-colors flex items-center gap-1.5 disabled:opacity-50"
-        >
-          {generating === "all" ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
-          Generate All
-        </button>
+        {canGenerate(platform) && (
+          <button
+            onClick={() => generate("all")}
+            disabled={generating !== null}
+            className="text-xs px-2.5 py-1.5 rounded-lg bg-purple-600/70 hover:bg-purple-500 text-white transition-colors flex items-center gap-1.5 disabled:opacity-50"
+          >
+            {generating === "all" ? <Loader2 className="w-3 h-3 animate-spin" /> : <Zap className="w-3 h-3" />}
+            Generate All
+          </button>
+        )}
+
+        {/* Instagram's "generation" is a Gemini image render, not a text
+            pipeline — it has its own endpoint and no review flow. */}
+        {canGenerateImage(platform) && (
+          <button
+            onClick={generateImage}
+            disabled={imageBusy}
+            className="text-xs px-2.5 py-1.5 rounded-lg border border-pink-400/30 text-pink-300 hover:bg-pink-500/10 transition-colors flex items-center gap-1.5 disabled:opacity-50"
+            title={
+              ig.image_prompt
+                ? `Render an image from: ${ig.image_prompt}`
+                : "Render an image from this topic (add an image prompt for finer control)"
+            }
+          >
+            {imageBusy ? (
+              <Loader2 className="w-3 h-3 animate-spin" />
+            ) : (
+              <ImageIcon className="w-3 h-3" />
+            )}
+            {ig.image_file || imagePreview ? "Regenerate image" : "Generate image"}
+          </button>
+        )}
 
         <div className="flex-1" />
 
@@ -416,3 +620,4 @@ export default function PlanItemRow({ planId, item, provider, onChanged, onRevie
     </div>
   );
 }
+

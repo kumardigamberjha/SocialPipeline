@@ -39,3 +39,6 @@ dashboard/
 scratch/
 *.md
 !README.md
+
+# Standalone marketing site — never ship into a backend image
+website/

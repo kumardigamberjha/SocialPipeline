@@ -3,7 +3,7 @@ Blog pipeline HTTP + WebSocket router.
 
 The 5-agent blog pipeline runs in a dedicated Celery worker (queue
 ``blog_queue``), so the WebSocket cannot stream from an in-process task. Instead
-it polls the SQLite ``task_steps`` the worker writes (a 2-second cadence) and
+it polls the ``task_steps`` rows the worker writes (a 2-second cadence) and
 emits structured events to the client.
 
 Two routers are exported:
@@ -18,21 +18,31 @@ import json
 import logging
 import re
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth_deps import get_current_user
+from app.core.auth_deps import (
+    WS_FORBIDDEN,
+    WebSocketAuthError,
+    get_current_user,
+    get_current_user_ws,
+)
 from app.db import queries
-
-from app.services.dispatch import run_blog_fallback, should_use_celery
-from app.tasks.blog_task import run_blog_pipeline
+from app.db.session import get_session
+from app.services.dispatch import dispatch_pipeline
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/blog", tags=["blog"])
 ws_router = APIRouter(prefix="/api/ws", tags=["blog"])
-
-BLOG_QUEUE = "blog_queue"
 
 # Fields returned for the list view (the full ``content`` is intentionally omitted).
 _LIST_FIELDS = (
@@ -51,75 +61,87 @@ class GenerateRequest(BaseModel):
 
 
 @router.post("/generate")
-def generate_blog(request: GenerateRequest, background_tasks: BackgroundTasks,
-                  current_user: dict = Depends(get_current_user)):
-    """Enforce the monthly usage cap, create a run, and dispatch the pipeline.
-    Falls back to in-process execution when no Celery worker is draining the queue."""
+async def generate_blog(
+    request: GenerateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    """Enforce the monthly usage cap, create a run, and dispatch the pipeline."""
     user_id = current_user["id"]
 
-    queries.reset_usage_if_expired(user_id)
-    usage = queries.get_usage(user_id)
+    await queries.reset_usage_if_expired(session, user_id)
+    usage = await queries.get_usage(session, user_id)
     if not usage:
-        queries.init_usage(user_id)
-        usage = queries.get_usage(user_id)
+        await queries.init_usage(session, user_id)
+        usage = await queries.get_usage(session, user_id)
     if usage and usage["runs_this_month"] >= usage["max_runs_per_month"]:
         raise HTTPException(status_code=429, detail="Usage limit exceeded for this month.")
 
-    run = queries.create_run(user_id, request.topic, request.provider)
+    run = await queries.create_run(session, user_id, request.topic, request.provider)
     run_id = run["id"]
 
-    dispatched_to_celery = False
-    if should_use_celery(BLOG_QUEUE):
-        try:
-            run_blog_pipeline.apply_async(
-                args=[run_id, request.topic, request.target_keyword, user_id, request.provider],
-                queue=BLOG_QUEUE,
-                ignore_result=True,
-            )
-            dispatched_to_celery = True
-        except Exception as exc:
-            logger.warning("Celery dispatch failed, falling back to BackgroundTasks: %s", exc)
-
-    if not dispatched_to_celery:
-        logger.info("Running blog pipeline in-process (no Celery worker) ▸ run_id=%s", run_id)
-        background_tasks.add_task(run_blog_fallback, run_id, request.topic, request.target_keyword, user_id, request.provider)
-
+    # The Celery-vs-in-process decision, queue name and task signature all live
+    # in dispatch_pipeline, so this router cannot drift from the others.
+    dispatch_pipeline(
+        content_type="blog",
+        run_id=run_id,
+        topic=request.topic,
+        niche=request.target_keyword,
+        user_id=user_id,
+        provider=request.provider,
+        video_format="full",
+        background_tasks=background_tasks,
+    )
     return {"run_id": run_id, "status": "queued", "message": "Blog pipeline started"}
 
 
 @router.get("/posts")
-def list_blog_posts(current_user: dict = Depends(get_current_user)):
+async def list_blog_posts(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     """Metadata-only list of the user's posts (no ``content`` field)."""
-    posts = queries.get_blog_posts(current_user["id"], limit=50)
+    posts = await queries.get_blog_posts(session, current_user["id"], limit=50)
     return [{k: p.get(k) for k in _LIST_FIELDS} for p in posts]
 
 
 @router.get("/posts/{blog_id}")
-def get_blog_post(blog_id: str, current_user: dict = Depends(get_current_user)):
-    post = queries.get_blog_by_id(blog_id, current_user["id"])
+async def get_blog_post(
+    blog_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    post = await queries.get_blog_by_id(session, blog_id, current_user["id"])
     if not post:
         raise HTTPException(status_code=404, detail="Blog post not found")
     return post
 
 
 @router.get("/view/{slug}")
-def view_blog_post(slug: str):
-    """Public endpoint — render a post by slug, no authentication required."""
-    post = queries.get_blog_by_slug(slug)
+async def view_blog_post(slug: str, session: AsyncSession = Depends(get_session)):
+    """Public endpoint — render a post by slug, no authentication required.
+
+    One of the few genuinely public routes; see PUBLIC_ROUTES in app.main.
+    """
+    post = await queries.get_public_blog_by_slug(session, slug)
     if not post:
         raise HTTPException(status_code=404, detail="Blog post not found")
     return post
 
 
 @router.delete("/posts/{blog_id}")
-def delete_blog_post(blog_id: str, current_user: dict = Depends(get_current_user)):
-    success = queries.soft_delete_blog(blog_id, current_user["id"])
-    if not success:
+async def delete_blog_post(
+    blog_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    if not await queries.soft_delete_blog(session, blog_id, current_user["id"]):
         raise HTTPException(status_code=404, detail="Blog post not found or already deleted")
     return {"message": "Blog post deleted"}
 
 
-# ── WebSocket: /api/ws/blog/{client_id}?token={jwt} ───────────────────────────
+# ── WebSocket: /api/ws/blog/{client_id} ───────────────────────────────────────
 
 
 def _parse_step_output(output_str: str) -> dict | None:
@@ -153,15 +175,35 @@ def _cycle_from_task(task_name: str) -> int | None:
 
 
 @ws_router.websocket("/blog/{client_id}")
-async def blog_websocket(websocket: WebSocket, client_id: str, token: str | None = None):
-    """Stream blog pipeline progress. ``client_id`` is the run_id."""
-    await websocket.accept()
+async def blog_websocket(
+    websocket: WebSocket,
+    client_id: str,
+    user: dict = Depends(get_current_user_ws),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stream blog pipeline progress. ``client_id`` is the run_id.
+
+    Previously this accepted any connection and streamed the full generated
+    article to whoever named a run_id — it declared a ``token`` parameter and
+    never read it. The socket is now authenticated before ``accept()`` and the
+    run must belong to the caller.
+    """
     run_id = client_id
+    user_id = user["id"]
+
+    run = await queries.get_run_by_id(session, run_id, user_id)
+    if run is None:
+        await websocket.close(code=WS_FORBIDDEN, reason="Unknown run")
+        return
+
+    await websocket.accept()
     last_step_id = 0
 
     try:
         while True:
-            for step in queries.get_new_steps_since(run_id, last_step_id):
+            for step in await queries.get_new_steps_since(
+                session, run_id, user_id, last_step_id
+            ):
                 last_step_id = max(last_step_id, step["id"])
                 agent_name = step["agent_name"]
                 task_name = step["task_name"]
@@ -199,10 +241,12 @@ async def blog_websocket(websocket: WebSocket, client_id: str, token: str | None
                         "cycle": _cycle_from_task(task_name),
                     })
 
-            run = queries.get_run_by_id(run_id)
+            run = await queries.get_run_by_id(session, run_id, user_id)
             if run and run["status"] in ("completed", "failed"):
                 if run["status"] == "completed":
-                    saved = queries.get_blog_posts_by_run_id(run_id)
+                    saved = await queries.get_blog_posts_by_run_id(
+                        session, run_id, user_id
+                    )
                     post = saved[-1] if saved else None
                     await websocket.send_json({
                         "type": "complete",
@@ -215,9 +259,11 @@ async def blog_websocket(websocket: WebSocket, client_id: str, token: str | None
                     await websocket.send_json({"type": "error", "message": "Pipeline failed"})
                 break
 
+            # The worker writes progress from another process, so this polls
+            # rather than subscribing. Phase 4 replaces it with job pub/sub.
             await asyncio.sleep(2)
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, WebSocketAuthError):
         logger.info("Blog WS client disconnected: run_id=%s", run_id)
     except Exception as exc:  # noqa: BLE001
         logger.error("Blog WS error for run_id=%s: %s", run_id, exc)

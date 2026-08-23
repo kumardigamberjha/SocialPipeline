@@ -171,7 +171,7 @@ def create_idea_agent(llm: LLM) -> Agent:
 def create_instagram_image_agent(llm: LLM) -> Agent:
     return Agent(
         role="Instagram Image Designer",
-        goal="Design and generate the visual image for an Instagram post using ComfyUI.",
+        goal="Design and generate the visual image for an Instagram post using Gemini image generation.",
         backstory=_niche_lock(
             "You are an expert Instagram visual designer. "
             "You know how to choose the right palette, layout, and style hints to generate an image that matches the given topic."

@@ -1,41 +1,68 @@
 "use client";
 
-import { Activity, Radio, Users } from "lucide-react";
+import { Activity, LogOut, Radio, Users } from "lucide-react";
 import { motion } from "framer-motion";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api, HealthResponse } from "@/lib/api";
+import { useAuth } from "@/lib/auth/AuthContext";
 
 const NAV_LINKS = [
   { href: "/", label: "Nexus" },
+  { href: "/assistant", label: "Assistant" },
   { href: "/topics", label: "Topics" },
   { href: "/planner", label: "Planner" },
   { href: "/youtube-analysis", label: "YouTube" },
   { href: "/instagram-analysis", label: "Instagram" },
+  { href: "/personal-intelligence", label: "Intelligence" },
 ];
 
 export default function Header() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [isOnline, setIsOnline] = useState(false);
   const pathname = usePathname();
+  const { user, logout } = useAuth();
+  const router = useRouter();
+
+  async function handleLogout() {
+    await logout();
+    router.replace("/login");
+  }
 
   useEffect(() => {
-    const checkHealth = async () => {
+    let isMounted = true;
+    let timerId: NodeJS.Timeout | null = null;
+
+    const checkHealth = async (retries = 2, delay = 1500) => {
       try {
-        console.log("Checking backend health...");
         const data = await api.getHealth();
-        console.log("Health check success:", data);
-        setHealth(data);
-        setIsOnline(true);
+        if (isMounted) {
+          setHealth(data);
+          setIsOnline(true);
+        }
       } catch (err) {
-        console.error("Health check failed:", err);
-        setIsOnline(false);
+        if (isMounted && retries > 0) {
+          timerId = setTimeout(() => {
+            if (isMounted) checkHealth(retries - 1, delay * 1.5);
+          }, delay);
+          return;
+        }
+        if (isMounted) {
+          console.warn("Backend health check failed:", err);
+          setIsOnline(false);
+        }
       }
     };
+
     checkHealth();
-    const interval = setInterval(checkHealth, 30000);
-    return () => clearInterval(interval);
+    const interval = setInterval(() => checkHealth(1, 1000), 30000);
+
+    return () => {
+      isMounted = false;
+      if (timerId) clearTimeout(timerId);
+      clearInterval(interval);
+    };
   }, []);
 
   return (
@@ -139,6 +166,24 @@ export default function Header() {
             </svg>
             <span className="hidden sm:inline font-semibold">@codingindiaai</span>
           </a>
+
+          {user && (
+            <>
+              <div className="w-px h-5 bg-white/10 hidden sm:block" />
+              <div className="flex items-center gap-2">
+                <span className="hidden lg:inline text-xs font-mono text-slate-500 max-w-[10rem] truncate" title={user.email}>
+                  {user.email}
+                </span>
+                <button
+                  onClick={handleLogout}
+                  title="Sign out"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-full glass-card hover:bg-red-500/10 border border-white/10 hover:border-red-500/30 text-xs font-mono text-slate-400 hover:text-red-300 transition-all"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </header>

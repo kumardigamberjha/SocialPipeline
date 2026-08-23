@@ -16,7 +16,8 @@ import time
 from celery.exceptions import SoftTimeLimitExceeded
 
 from app.celery_app import celery_app
-from app.db import queries
+from app.db import sync_queries
+from app.db.sync_session import sync_session_scope
 from app.services.youtube_pipeline import YouTubeScriptOrchestrator
 
 logger = logging.getLogger(__name__)
@@ -32,12 +33,22 @@ logger = logging.getLogger(__name__)
 )
 def run_youtube_pipeline(self, run_id: str, topic: str, niche: str, user_id: str, provider: str,
                          video_format: str = "full"):
+    # Each database touch opens its own short transaction. Holding one session
+    # open across the multi-minute pipeline would pin a Postgres connection and
+    # block autovacuum for the duration.
+    def _set_status(status: str, **kwargs):
+        with sync_session_scope() as session:
+            sync_queries.update_run_status(session, run_id, user_id, status, **kwargs)
+
     try:
-        queries.update_run_status(run_id, "running")
+        _set_status("running")
         start = time.time()
 
         def step_callback(agent_name: str, task_name: str, output: str):
-            queries.insert_task_step(run_id, agent_name, task_name, str(output))
+            with sync_session_scope() as session:
+                sync_queries.insert_task_step(
+                    session, run_id, user_id, agent_name, task_name, str(output)
+                )
 
         orchestrator = YouTubeScriptOrchestrator(
             llm_provider=provider,
@@ -47,30 +58,38 @@ def run_youtube_pipeline(self, run_id: str, topic: str, niche: str, user_id: str
         result = asyncio.run(orchestrator.run(topic, niche, user_id, video_format=video_format))
 
         duration = round(time.time() - start, 2)
-        queries.save_youtube_script(
-            run_id=run_id,
-            user_id=user_id,
-            topic=topic,
-            title=result["title"],
-            script=result["script"],
-            word_count=result["word_count"],
-            seo_title=result["seo_title"],
-            seo_description=result["seo_description"],
-            seo_tags=result["seo_tags"],
-            approved=result["approved"],
-            niche=niche,
-        )
-        queries.update_run_status(run_id, "completed", final_result=result["script"], duration=duration)
-        queries.increment_usage(user_id)
+        # Saving the content, closing out the run and charging usage belong to
+        # one transaction: a crash between them previously left a completed run
+        # with no content, or content the user was never billed for.
+        with sync_session_scope() as session:
+            sync_queries.save_youtube_script(
+                session,
+                run_id=run_id,
+                user_id=user_id,
+                topic=topic,
+                title=result["title"],
+                script=result["script"],
+                word_count=result["word_count"],
+                seo_title=result["seo_title"],
+                seo_description=result["seo_description"],
+                seo_tags=result["seo_tags"],
+                approved=result["approved"],
+                niche=niche,
+            )
+            sync_queries.update_run_status(
+                session, run_id, user_id, "completed",
+                final_result=result["script"], duration=duration,
+            )
+            sync_queries.increment_usage(session, user_id)
         logger.info("YouTube pipeline DONE ▸ run_id=%s duration=%.2fs approved=%s", run_id, duration, result["approved"])
         return {"title": result["title"], "word_count": result["word_count"], "approved": result["approved"]}
 
     except SoftTimeLimitExceeded:
         logger.error("YouTube pipeline TIMEOUT ▸ run_id=%s", run_id)
-        queries.update_run_status(run_id, "failed")
+        _set_status("failed")
         raise
 
     except Exception as exc:
         logger.exception("YouTube pipeline FAILED ▸ run_id=%s", run_id)
-        queries.update_run_status(run_id, "failed")
+        _set_status("failed")
         raise self.retry(exc=exc, countdown=10)

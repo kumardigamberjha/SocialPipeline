@@ -35,7 +35,7 @@ CANDIDATE_COUNT = 5
 # ── Candidate research ───────────────────────────────────────────────────────
 
 
-async def research_candidates(user_id: str, provider: str, niche: str) -> list[dict]:
+async def research_candidates(session, user_id: str, provider: str, niche: str) -> list[dict]:
     """Ask the suggester for CANDIDATE_COUNT ideas.
 
     Returns [{topic, rationale, ...}]. Raises on failure — the caller decides
@@ -47,21 +47,22 @@ async def research_candidates(user_id: str, provider: str, niche: str) -> list[d
     # count overrides the weekly default and the returned scheduled_date is
     # discarded — saved topics have no calendar slot.
     candidates = await suggest_topics(
+        session=session,
         user_id=user_id,
         plan_type="weekly",
         niche=niche,
         start_date=date.today(),
         count=CANDIDATE_COUNT,
         provider=provider,
-        extra_recent=queries.get_uncovered_topic_titles(user_id),
+        extra_recent=await queries.get_uncovered_topic_titles(session, user_id),
     )
     if not candidates:
         raise RuntimeError("Suggester returned no candidate topics")
     return candidates
 
 
-def save_candidates(user_id: str, candidates: list[dict], niche: str,
-                    source_run_id: str = None) -> int:
+async def save_candidates(session, user_id: str, candidates: list[dict], niche: str,
+                          source_run_id: str = None) -> int:
     """Persist candidates as 'uncovered'. Returns how many were actually new
     (create_saved_topic returns None for ones already in the backlog)."""
     saved = 0
@@ -69,7 +70,8 @@ def save_candidates(user_id: str, candidates: list[dict], niche: str,
         topic = (candidate.get("topic") or "").strip()
         if not topic:
             continue
-        row = queries.create_saved_topic(
+        row = await queries.create_saved_topic(
+            session,
             user_id=user_id,
             topic=topic,
             rationale=candidate.get("rationale"),
@@ -86,30 +88,32 @@ def save_candidates(user_id: str, candidates: list[dict], niche: str,
 # ── Reconciliation ───────────────────────────────────────────────────────────
 
 
-def reconcile_saved_topic_run(row: dict) -> dict:
+async def reconcile_saved_topic_run(session, row: dict) -> dict:
     """Advance a 'generating' saved_topic_runs row from its run's terminal
     state. The saved-topic twin of reconcile_plan_item_content()."""
     if row["review_status"] != "generating" or not row.get("run_id"):
         return row
 
-    run = queries.get_run_by_id(row["run_id"])
+    user_id = row["user_id"]
+    run = await queries.get_run_by_id(session, row["run_id"], user_id)
     if not run or run["status"] in ("pending", "running"):
         return row
 
     if run["status"] == "failed":
-        queries.update_saved_topic_run(row["id"], review_status="failed")
+        await queries.update_saved_topic_run(session, row["id"], user_id, review_status="failed")
         row["review_status"] = "failed"
         return row
 
-    rows = CONTENT_LOOKUP[row["content_type"]](row["run_id"])
+    rows = await CONTENT_LOOKUP[row["content_type"]](session, row["run_id"], user_id)
     if not rows:
         # Completed run but no saved row (should not happen) — surface as failed.
-        queries.update_saved_topic_run(row["id"], review_status="failed")
+        await queries.update_saved_topic_run(session, row["id"], user_id, review_status="failed")
         row["review_status"] = "failed"
         return row
 
     ref_id = rows[-1]["id"]
-    queries.update_saved_topic_run(row["id"], content_ref_id=ref_id, review_status="ready")
+    await queries.update_saved_topic_run(session, row["id"], user_id,
+                                        content_ref_id=ref_id, review_status="ready")
     row["content_ref_id"] = ref_id
     row["review_status"] = "ready"
     return row
@@ -127,35 +131,35 @@ def _derive_status(runs: list[dict]) -> str:
     return "uncovered"  # every attempt failed — let the user retry
 
 
-def reconcile_saved_topic(topic: dict, user_id: str) -> dict:
+async def reconcile_saved_topic(session, topic: dict, user_id: str) -> dict:
     """Reconcile a topic's runs and sync its own status. Returns the topic with
     a `runs` key attached."""
-    runs = [reconcile_saved_topic_run(r) for r in queries.get_saved_topic_runs(topic["id"], user_id)]
+    run_rows = await queries.get_saved_topic_runs(session, topic["id"], user_id)
+    runs = [await reconcile_saved_topic_run(session, r) for r in run_rows]
     topic["runs"] = runs
 
     derived = _derive_status(runs)
     if derived != topic["status"]:
-        queries.update_saved_topic(topic["id"], user_id, status=derived)
+        await queries.update_saved_topic(session, topic["id"], user_id, status=derived)
         topic["status"] = derived
         if derived == "generated" and not topic.get("generated_at"):
-            refreshed = queries.get_saved_topic_by_id(topic["id"], user_id)
+            refreshed = await queries.get_saved_topic_by_id(session, topic["id"], user_id)
             if refreshed:
                 topic["generated_at"] = refreshed["generated_at"]
     return topic
 
 
-def list_topics_reconciled(user_id: str, status: str = None,
-                           include_dismissed: bool = False) -> list[dict]:
+async def list_topics_reconciled(session, user_id: str, status: str = None,
+                                 include_dismissed: bool = False) -> list[dict]:
     """List topics with their runs reconciled.
 
     Reconciles against the unfiltered set first, then applies the status filter,
     so a topic that just finished generating is filtered on its *new* status
     rather than the stale one.
     """
-    topics = [
-        reconcile_saved_topic(t, user_id)
-        for t in queries.get_saved_topics(user_id, status=None, include_dismissed=include_dismissed)
-    ]
+    rows = await queries.get_saved_topics(session, user_id, status=None,
+                                          include_dismissed=include_dismissed)
+    topics = [await reconcile_saved_topic(session, t, user_id) for t in rows]
     if status:
         topics = [t for t in topics if t["status"] == status]
     return topics
@@ -164,8 +168,8 @@ def list_topics_reconciled(user_id: str, status: str = None,
 # ── Generation dispatch ──────────────────────────────────────────────────────
 
 
-def dispatch_saved_topic_generation(topic: dict, content_type: str, provider: str,
-                                    background_tasks: BackgroundTasks) -> list[dict]:
+async def dispatch_saved_topic_generation(session, topic: dict, content_type: str, provider: str,
+                                          background_tasks: BackgroundTasks) -> list[dict]:
     """Dispatch one content type or all three for a saved topic.
 
     Gates on remaining quota upfront using the planner's accounting, so a saved
@@ -174,7 +178,7 @@ def dispatch_saved_topic_generation(topic: dict, content_type: str, provider: st
     types = list(CONTENT_TYPES) if content_type == "all" else [content_type]
     user_id = topic["user_id"]
 
-    remaining = _remaining_quota(user_id)
+    remaining = await _remaining_quota(session, user_id)
     if remaining < len(types):
         raise HTTPException(
             status_code=429,
@@ -183,9 +187,9 @@ def dispatch_saved_topic_generation(topic: dict, content_type: str, provider: st
 
     dispatched = []
     for ct in types:
-        run = queries.create_run(user_id, topic["topic"], provider)
+        run = await queries.create_run(session, user_id, topic["topic"], provider)
         run_id = run["id"]
-        link = queries.create_saved_topic_run(topic["id"], user_id, ct, run_id)
+        link = await queries.create_saved_topic_run(session, topic["id"], user_id, ct, run_id)
         dispatch_pipeline(
             content_type=ct,
             run_id=run_id,
@@ -200,5 +204,5 @@ def dispatch_saved_topic_generation(topic: dict, content_type: str, provider: st
 
     # Eager, so the topic leaves the backlog banner the moment Generate is
     # clicked rather than on the next reconcile.
-    queries.update_saved_topic(topic["id"], user_id, status="generating")
+    await queries.update_saved_topic(session, topic["id"], user_id, status="generating")
     return dispatched

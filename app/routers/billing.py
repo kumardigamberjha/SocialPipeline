@@ -4,15 +4,21 @@ Stripe billing endpoints: checkout, webhook, customer portal.
 Handles subscription lifecycle for pro and enterprise tiers.
 """
 
+import asyncio
 import logging
 
 import stripe
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.core.auth_deps import get_current_user
 from app.db import queries
+from app.db.session import get_session, session_scope
+from app.db.tables import UsageLimit
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +58,11 @@ def _frontend(path: str) -> str:
 
 
 @router.post("/checkout", summary="Create a Stripe Checkout Session")
-async def create_checkout(req: CheckoutRequest, user: dict = Depends(get_current_user)):
+async def create_checkout(
+    req: CheckoutRequest,
+    user: dict = Depends(get_current_user),
+    session_db: AsyncSession = Depends(get_session),
+):
     """
     Create a Stripe Checkout Session for upgrading to pro or enterprise.
     Returns the checkout URL for the client to redirect to.
@@ -74,11 +84,11 @@ async def create_checkout(req: CheckoutRequest, user: dict = Depends(get_current
     # Check if user already has a Stripe customer ID
     customer_id = None
     try:
-        usage = queries.get_usage(user_id)
+        usage = await queries.get_usage(session_db, user_id)
         if usage and usage.get("stripe_customer_id"):
             customer_id = usage["stripe_customer_id"]
     except Exception as e:
-        logger.warning("Could not fetch existing Stripe customer from SQLite: %s", e)
+        logger.warning("Could not fetch existing Stripe customer: %s", e)
 
     try:
         session_params = {
@@ -97,7 +107,9 @@ async def create_checkout(req: CheckoutRequest, user: dict = Depends(get_current
         else:
             session_params["customer_creation"] = "always"
 
-        session = s.checkout.Session.create(**session_params)
+        # The Stripe SDK is synchronous — this is an outbound HTTPS round trip
+        # that would otherwise block the event loop for every other request.
+        session = await asyncio.to_thread(s.checkout.Session.create, **session_params)
         return {"checkout_url": session.url, "session_id": session.id}
 
     except s.error.StripeError as e:
@@ -126,8 +138,9 @@ async def stripe_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Missing Stripe signature")
 
     try:
-        event = s.Webhook.construct_event(
-            payload, sig_header, settings.stripe_webhook_secret
+        event = await asyncio.to_thread(
+            s.Webhook.construct_event,
+            payload, sig_header, settings.stripe_webhook_secret,
         )
     except s.error.SignatureVerificationError:
         raise HTTPException(status_code=400, detail="Invalid Stripe signature")
@@ -158,7 +171,10 @@ async def stripe_webhook(request: Request):
 
 
 @router.get("/portal", summary="Create Stripe Customer Portal session")
-async def create_portal(user: dict = Depends(get_current_user)):
+async def create_portal(
+    user: dict = Depends(get_current_user),
+    session_db: AsyncSession = Depends(get_session),
+):
     """
     Create a Stripe billing portal session for the user to manage their subscription.
     """
@@ -167,7 +183,7 @@ async def create_portal(user: dict = Depends(get_current_user)):
 
     # Look up the user's Stripe customer ID
     try:
-        usage = queries.get_usage(user_id)
+        usage = await queries.get_usage(session_db, user_id)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
@@ -177,7 +193,8 @@ async def create_portal(user: dict = Depends(get_current_user)):
     customer_id = usage["stripe_customer_id"]
 
     try:
-        session = s.billing_portal.Session.create(
+        session = await asyncio.to_thread(
+            s.billing_portal.Session.create,
             customer=customer_id,
             return_url=_frontend("/dashboard"),
         )
@@ -191,7 +208,12 @@ async def create_portal(user: dict = Depends(get_current_user)):
 
 
 async def _handle_checkout_completed(session_data: dict):
-    """Upgrade user tier after successful checkout in SQLite."""
+    """Upgrade a user's tier after successful checkout.
+
+    Called from the webhook handler, which is outside the normal request
+    cycle, so this opens its own session rather than borrowing one from a
+    ``Depends``.
+    """
     metadata = session_data.get("metadata", {})
     user_id = metadata.get("user_id")
     tier = metadata.get("tier", "pro")
@@ -204,58 +226,69 @@ async def _handle_checkout_completed(session_data: dict):
 
     plan_config = PLAN_LIMITS.get(tier, PLAN_LIMITS["pro"])
 
-    from app.db.database import get_db
     try:
-        db = get_db()
-        db.execute(
-            """
-            INSERT INTO usage_limits (user_id, plan, max_runs_per_month, stripe_customer_id, stripe_subscription_id)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                plan = excluded.plan,
-                max_runs_per_month = excluded.max_runs_per_month,
-                stripe_customer_id = excluded.stripe_customer_id,
-                stripe_subscription_id = excluded.stripe_subscription_id
-            """,
-            (user_id, tier, plan_config["max_runs_per_month"], customer_id, subscription_id)
-        )
-        db.commit()
-        logger.info("User %s upgraded to %s in SQLite", user_id, tier)
+        async with session_scope() as db:
+            stmt = pg_insert(UsageLimit).values(
+                user_id=user_id,
+                plan=tier,
+                max_runs_per_month=plan_config["max_runs_per_month"],
+                stripe_customer_id=customer_id,
+                stripe_subscription_id=subscription_id,
+            )
+            await db.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[UsageLimit.user_id],
+                    set_={
+                        "plan": stmt.excluded.plan,
+                        "max_runs_per_month": stmt.excluded.max_runs_per_month,
+                        "stripe_customer_id": stmt.excluded.stripe_customer_id,
+                        "stripe_subscription_id": stmt.excluded.stripe_subscription_id,
+                    },
+                )
+            )
+        logger.info("User %s upgraded to %s", user_id, tier)
     except Exception as e:
-        logger.error("Failed to upgrade user %s in SQLite: %s", user_id, e)
+        logger.error("Failed to upgrade user %s: %s", user_id, e)
 
 
 async def _handle_subscription_deleted(subscription_data: dict):
-    """Downgrade user to free tier when subscription is cancelled."""
+    """Downgrade a user to the free tier when their subscription is cancelled."""
     metadata = subscription_data.get("metadata", {})
     user_id = metadata.get("user_id")
     customer_id = subscription_data.get("customer")
 
-    # Try to find user by metadata first, then by customer_id
-    if user_id:
-        _downgrade_user(user_id)
-    elif customer_id:
-        from app.db.database import get_db
+    # Prefer the metadata user_id; fall back to looking up by Stripe customer.
+    if not user_id and customer_id:
         try:
-            db = get_db()
-            cursor = db.execute("SELECT user_id FROM usage_limits WHERE stripe_customer_id = ? LIMIT 1", (customer_id,))
-            row = cursor.fetchone()
-            if row:
-                _downgrade_user(row["user_id"])
+            async with session_scope() as db:
+                user_id = (
+                    await db.execute(
+                        select(UsageLimit.user_id)
+                        .where(UsageLimit.stripe_customer_id == customer_id)
+                        .limit(1)
+                    )
+                ).scalar_one_or_none()
         except Exception as e:
             logger.error("Failed to find user for customer %s: %s", customer_id, e)
+            return
+
+    if user_id:
+        await _downgrade_user(user_id)
 
 
-def _downgrade_user(user_id: str):
-    """Reset a user to the free tier in SQLite."""
-    from app.db.database import get_db
+async def _downgrade_user(user_id: str):
+    """Reset a user to the free tier."""
     try:
-        db = get_db()
-        db.execute(
-            "UPDATE usage_limits SET plan = 'free', max_runs_per_month = 10, stripe_subscription_id = NULL WHERE user_id = ?",
-            (user_id,)
-        )
-        db.commit()
-        logger.info("User %s downgraded to free in SQLite", user_id)
+        async with session_scope() as db:
+            await db.execute(
+                update(UsageLimit)
+                .where(UsageLimit.user_id == user_id)
+                .values(
+                    plan="free",
+                    max_runs_per_month=PLAN_LIMITS["free"]["max_runs_per_month"],
+                    stripe_subscription_id=None,
+                )
+            )
+        logger.info("User %s downgraded to free", user_id)
     except Exception as e:
-        logger.error("Failed to downgrade user %s in SQLite: %s", user_id, e)
+        logger.error("Failed to downgrade user %s: %s", user_id, e)

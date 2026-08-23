@@ -13,7 +13,10 @@ import logging
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from app.db.database import get_db, dict_from_row
+from sqlalchemy import select
+
+from app.db.sync_session import sync_session_scope
+from app.db.tables import YoutubePublishedVideo
 from app.services.google_calendar import (
     YOUTUBE_SCOPE,
     NotConnectedError,
@@ -60,26 +63,36 @@ def _wrap_http_error(exc: HttpError) -> YoutubeDataError:
     return YoutubeDataError(f"YouTube Data API error: {detail}")
 
 
-def _enrich_with_metrics(videos: list[dict]) -> list[dict]:
-    """Attach imported views/watch-time/CTR to videos, matched by video_id."""
+def _enrich_with_metrics(user_id: str, videos: list[dict]) -> list[dict]:
+    """Attach imported views/watch-time/CTR to videos, matched by video_id.
+
+    Scoped to ``user_id``: ``youtube_published_videos`` is keyed on
+    ``(user_id, video_id)``, so an unscoped lookup would surface another
+    tenant's imported analytics for any video id they happen to share.
+    """
     ids = [v["video_id"] for v in videos if v.get("video_id")]
     if not ids:
         return videos
-    db = get_db()
-    placeholders = ",".join("?" * len(ids))
-    rows = {
-        r["video_id"]: dict_from_row(r)
-        for r in db.execute(
-            f"SELECT video_id, views, watch_time_hours, impressions_ctr "
-            f"FROM youtube_published_videos WHERE video_id IN ({placeholders})",
-            ids,
-        ).fetchall()
-    }
+    with sync_session_scope() as session:
+        rows = {
+            r.video_id: r
+            for r in session.execute(
+                select(
+                    YoutubePublishedVideo.video_id,
+                    YoutubePublishedVideo.views,
+                    YoutubePublishedVideo.watch_time_hours,
+                    YoutubePublishedVideo.impressions_ctr,
+                ).where(
+                    YoutubePublishedVideo.user_id == user_id,
+                    YoutubePublishedVideo.video_id.in_(ids),
+                )
+            )
+        }
     for v in videos:
         m = rows.get(v["video_id"])
-        v["views"] = m["views"] if m else None
-        v["watch_time_hours"] = m["watch_time_hours"] if m else None
-        v["impressions_ctr"] = m["impressions_ctr"] if m else None
+        v["views"] = m.views if m else None
+        v["watch_time_hours"] = m.watch_time_hours if m else None
+        v["impressions_ctr"] = m.impressions_ctr if m else None
     return videos
 
 
@@ -154,4 +167,4 @@ def list_playlist_videos(user_id: str, playlist_id: str, max_results: int = 10) 
         )
     # Newest first regardless of playlist ordering.
     videos.sort(key=lambda v: v.get("published_at") or "", reverse=True)
-    return _enrich_with_metrics(videos[:max_results])
+    return _enrich_with_metrics(user_id, videos[:max_results])

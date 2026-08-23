@@ -133,17 +133,17 @@ def web_search_tool(query: str, max_results: int = 5) -> str:
 
 # ── 2. Instagram Image Generation Tool ──────────────────────
 @tool("generate_instagram_image")
-def generate_instagram_image_tool(topic: str, palette: str = "void_purple", layout: str = "bottom_hero", model: str = "flux_schnell", style_hints: str = "") -> str:
-    """Generate an Instagram image using ComfyUI. Provide a topic, palette (e.g. void_purple, cyber_teal), layout (e.g. bottom_hero, top_title), model (sdxl_turbo or flux_schnell), and style_hints."""
+def generate_instagram_image_tool(topic: str, palette: str = "void_purple", layout: str = "bottom_hero", model: str = "gemini_flash", style_hints: str = "") -> str:
+    """Generate an Instagram image using Gemini image generation. Provide a topic, palette (e.g. void_purple, cyber_teal), layout (e.g. bottom_hero, top_title), model (gemini_flash, gemini_flash_lite or gemini_pro), and style_hints."""
     import asyncio
-    from app.services.comfy_client import ComfyClient
+    from app.services.gemini_image_client import GeminiImageClient
 
     async def _generate():
-        comfy = ComfyClient()
-        if not await comfy.health_check():
-            return "Error: ComfyUI is not running."
+        client = GeminiImageClient()
+        if not await client.health_check():
+            return "Error: Gemini image generation is unavailable (check GEMINI_API_KEY)."
         try:
-            result = await comfy.generate_instagram_post(
+            result = await client.generate_instagram_post(
                 topic=topic,
                 palette=palette,
                 layout=layout,

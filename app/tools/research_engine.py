@@ -423,8 +423,11 @@ class ResearchEngine:
             try:
                 from ddgs import DDGS
             except ImportError:
-                logger.warning("ddgs not installed, skipping DuckDuckGo")
-                return []
+                try:
+                    from duckduckgo_search import DDGS
+                except ImportError:
+                    logger.warning("ddgs/duckduckgo_search not installed, skipping DuckDuckGo")
+                    return []
 
             items = []
             with DDGS() as ddgs:
@@ -439,13 +442,20 @@ class ResearchEngine:
                             published_at=r.get("date", "")[:10] if r.get("date") else "",
                         ))
                 except Exception:
-                    for r in ddgs.text(query, max_results=max_results):
-                        items.append(ResearchResult(
-                            title=r.get("title", ""),
-                            url=r.get("href", ""),
-                            source="DuckDuckGo",
-                            summary=r.get("body", "")[:200],
-                        ))
+                    pass
+
+                if not items:
+                    try:
+                        for r in ddgs.text(query, max_results=max_results):
+                            items.append(ResearchResult(
+                                title=r.get("title", ""),
+                                url=r.get("href", ""),
+                                source="DuckDuckGo",
+                                summary=r.get("body", "")[:200],
+                            ))
+                    except Exception as e:
+                        logger.debug("DuckDuckGo text search failed: %s", e)
+
             return items
 
         return await asyncio.to_thread(_fetch)
@@ -457,8 +467,15 @@ class ResearchEngine:
             items = []
             per_sub = max(1, max_results // len(REDDIT_SUBREDDITS))
             session = requests.Session()
-            session.headers.update({"User-Agent": REDDIT_USER_AGENT})
+            session.headers.update({
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "Accept": "application/json, text/plain, */*",
+            })
 
+            direct_failed = False
             for subreddit in REDDIT_SUBREDDITS:
                 try:
                     encoded = urllib.parse.quote(query)
@@ -467,9 +484,9 @@ class ResearchEngine:
                         f"?q={encoded}&sort=relevance&t=week&restrict_sr=1&limit={per_sub}"
                     )
                     resp = session.get(url, timeout=self.timeout)
-                    if resp.status_code == 429:
-                        logger.warning("Reddit rate limited on r/%s, skipping", subreddit)
-                        continue
+                    if resp.status_code in (403, 429):
+                        direct_failed = True
+                        break
                     resp.raise_for_status()
 
                     data = resp.json().get("data", {}).get("children", [])
@@ -497,7 +514,36 @@ class ResearchEngine:
                             published_at=published,
                         ))
                 except Exception as e:
-                    logger.debug("Reddit r/%s search failed: %s", subreddit, e)
+                    direct_failed = True
+                    logger.debug("Reddit r/%s direct search failed: %s", subreddit, e)
+                    break
+
+            # Fallback: search Reddit threads via DDGS if direct Reddit API is blocked/rate-limited
+            if (not items or direct_failed):
+                try:
+                    try:
+                        from ddgs import DDGS
+                    except ImportError:
+                        from duckduckgo_search import DDGS
+
+                    sub_filters = " OR ".join(f"inurl:r/{sub}" for sub in REDDIT_SUBREDDITS[:3])
+                    ddg_query = f"site:reddit.com ({sub_filters}) {query}"
+                    with DDGS() as ddgs:
+                        ddg_results = list(ddgs.text(ddg_query, max_results=max_results))
+                        for r in ddg_results:
+                            title = r.get("title", "")
+                            url = r.get("href", "")
+                            if not title or not url:
+                                continue
+                            items.append(ResearchResult(
+                                title=title,
+                                url=url,
+                                source="Reddit",
+                                summary=r.get("body", "")[:200],
+                                tags=["reddit"],
+                            ))
+                except Exception as e:
+                    logger.debug("Reddit search via DDGS fallback failed: %s", e)
 
             items.sort(key=lambda x: x.raw_engagement, reverse=True)
             return items[:max_results]
@@ -666,50 +712,71 @@ class ResearchEngine:
 
     async def _search_producthunt(self, query: str, max_results: int) -> list[ResearchResult]:
         def _fetch():
-            encoded = urllib.parse.quote(query)
-            url = f"https://www.producthunt.com/search?q={encoded}"
-
+            url = "https://www.producthunt.com/feed"
             resp = requests.get(url, timeout=self.timeout, headers={
-                "Accept": "text/html",
                 "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
                 ),
+                "Accept": "application/atom+xml,application/xml,text/xml;q=0.9,*/*;q=0.8",
             })
             resp.raise_for_status()
 
             try:
                 from bs4 import BeautifulSoup
             except ImportError:
-                logger.warning("beautifulsoup4 not installed, skipping Product Hunt")
-                return []
+                BeautifulSoup = None
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            items = []
+            root = ET.fromstring(resp.content)
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            entries = root.findall("atom:entry", ns)
 
-            for link in soup.select("a[href*='/posts/']"):
-                title = link.get_text(strip=True)
-                href = link.get("href", "")
+            query_words = set(w.lower() for w in query.split() if len(w) > 2)
+            matched_items: list[ResearchResult] = []
+            fallback_items: list[ResearchResult] = []
 
-                if not title or len(title) < 3:
+            for entry in entries:
+                title_el = entry.find("atom:title", ns)
+                link_el = entry.find("atom:link", ns)
+                content_el = entry.find("atom:content", ns)
+                pub_el = entry.find("atom:published", ns)
+
+                title = title_el.text.strip() if title_el is not None and title_el.text else ""
+                href = link_el.get("href", "") if link_el is not None else ""
+                pub = pub_el.text.strip()[:10] if pub_el is not None and pub_el.text else ""
+
+                if not title or not href:
                     continue
 
-                full_url = href if href.startswith("http") else f"https://www.producthunt.com{href}"
+                summary = ""
+                if content_el is not None and content_el.text:
+                    if BeautifulSoup:
+                        soup = BeautifulSoup(content_el.text, "html.parser")
+                        summary = soup.get_text(separator=" ", strip=True).replace("Discussion | Link", "").strip()[:200]
+                    else:
+                        summary = re.sub(r"<[^>]+>", " ", content_el.text).replace("Discussion | Link", "").strip()[:200]
 
-                if any(item.url == full_url for item in items):
-                    continue
-
-                items.append(ResearchResult(
+                item = ResearchResult(
                     title=title[:100],
-                    url=full_url,
+                    url=href,
                     source="Product Hunt",
-                    summary="",
-                ))
+                    summary=summary,
+                    published_at=pub,
+                )
 
-                if len(items) >= max_results:
+                text_to_match = f"{title} {summary}".lower()
+                if query_words and any(w in text_to_match for w in query_words):
+                    matched_items.append(item)
+                else:
+                    fallback_items.append(item)
+
+                if len(matched_items) >= max_results:
                     break
 
-            return items
+            if len(matched_items) < max_results:
+                matched_items.extend(fallback_items[:max_results - len(matched_items)])
+
+            return matched_items[:max_results]
 
         return await asyncio.to_thread(_fetch)
 

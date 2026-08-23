@@ -19,6 +19,8 @@ import { useState, useEffect, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
+import { request } from "@/lib/apiClient";
+
 const PAGE_SIZE = 20;
 
 const PROSE_CLASS =
@@ -163,8 +165,6 @@ const statusBadge: Record<string, any> = {
 };
 
 
-const baseUrl = process.env.NEXT_PUBLIC_BACKEND_API || "http://127.0.0.1:8000";
-
 export default function TelemetryLedger() {
   const [metrics, setMetrics] = useState<PostMetric[]>([]);
   const [loading, setLoading] = useState(true);
@@ -179,8 +179,7 @@ export default function TelemetryLedger() {
   useEffect(() => {
     setLoading(true);
     setExpandedId(null);
-    fetch(`${baseUrl}/api/runs?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`)
-      .then(res => res.json())
+    request<any[]>(`/runs?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`)
       .then((data: any[]) => {
         const mapped = data.map((run) => ({
           id: run.id,
@@ -210,8 +209,7 @@ export default function TelemetryLedger() {
       // Fetch pipeline steps on first expand of this run.
       if (next === id && !stepsById[id]) {
         setDetailLoadingId(id);
-        fetch(`${baseUrl}/api/runs/${id}`)
-          .then((res) => res.json())
+        request<any>(`/runs/${id}`)
           .then((run: any) => {
             setStepsById((prev) => ({ ...prev, [id]: run.task_steps || [] }));
           })

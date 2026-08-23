@@ -1,140 +1,209 @@
-import os
+"""
+Bulk import of YouTube Studio CSV exports.
+
+Reads the ``data/Youtube`` folder (Content* and Traffic source* exports) and
+upserts them into the analytics tables for **one** user. The import is scoped
+to a ``user_id``: both destination tables are now keyed per tenant, so an
+unscoped import would have written one user's Studio export over everyone's.
+
+Synchronous by design — it is filesystem- and CPU-bound, and the only callers
+are a Celery task and a threadpooled endpoint.
+"""
+
 import csv
 import glob
+import os
 from datetime import datetime
-from app.db.database import get_db
 
-def parse_date(date_str: str) -> str:
-    """Parse Youtube date format (e.g. 'Jan 3, 2023') to ISO 8601 (YYYY-MM-DD)"""
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+from app.db.sync_session import sync_session_scope
+from app.db.tables import YoutubePublishedVideo, YoutubeTrafficSource
+
+BASE_DIR = "./data/Youtube"
+
+
+def parse_date(date_str: str) -> str | None:
+    """Parse a YouTube date ('Jan 3, 2023') into ISO 8601 (YYYY-MM-DD).
+
+    Returns None on an unparseable value. The previous version returned an
+    ``"ERR:..."`` marker string, which then got stored verbatim in the
+    publish_time column; Postgres rejects that outright rather than silently
+    keeping garbage.
+    """
     if not date_str:
-        return ""
+        return None
     try:
-        dt = datetime.strptime(date_str.strip(), "%b %d, %Y")
-        return dt.strftime("%Y-%m-%d")
-    except ValueError as e:
-        return f"ERR:{str(e)}:{date_str}"
+        return datetime.strptime(date_str.strip(), "%b %d, %Y").strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
 
 def parse_duration(duration_str: str) -> int:
-    """Parse duration from various formats into seconds"""
+    """Parse a duration in HH:MM:SS, MM:SS or plain seconds."""
     if not duration_str:
         return 0
     try:
-        if ':' in duration_str:
-            parts = duration_str.split(':')
-            if len(parts) == 3: # HH:MM:SS
+        if ":" in duration_str:
+            parts = duration_str.split(":")
+            if len(parts) == 3:  # HH:MM:SS
                 return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
-            elif len(parts) == 2: # MM:SS
+            if len(parts) == 2:  # MM:SS
                 return int(parts[0]) * 60 + int(parts[1])
         return int(float(duration_str))
     except ValueError:
         return 0
 
-def import_youtube_data():
-    """
-    Scans the data/Youtube folder for CSV files, parses them, 
-    and inserts/updates the SQLite database.
-    """
-    base_dir = "./data/Youtube"
-    if not os.path.exists(base_dir):
+
+def _int(row: dict, key: str) -> int:
+    raw = row.get(key)
+    try:
+        return int(raw) if raw else 0
+    except ValueError:
+        return 0
+
+
+def _float(row: dict, key: str) -> float:
+    raw = row.get(key)
+    try:
+        return float(raw) if raw else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _table_rows(pattern: str):
+    """Yield CSV rows from every ``<pattern>*/Table data.csv`` under BASE_DIR."""
+    for directory in glob.glob(os.path.join(BASE_DIR, f"{pattern}*")):
+        csv_file = os.path.join(directory, "Table data.csv")
+        if not os.path.exists(csv_file):
+            continue
+        with open(csv_file, "r", encoding="utf-8-sig") as f:
+            yield from csv.DictReader(f)
+
+
+def import_youtube_data(user_id: str) -> dict:
+    """Import the CSV exports into ``user_id``'s analytics tables."""
+    if not os.path.exists(BASE_DIR):
         return {"status": "error", "message": "Youtube data directory not found"}
 
-    conn = get_db()
-    cursor = conn.cursor()
+    videos_upserted = 0
+    sources_upserted = 0
 
-    content_videos_upserted = 0
-    traffic_sources_upserted = 0
+    with sync_session_scope() as session:
+        # -- Content export -> youtube_published_videos --
+        for row in _table_rows("Content"):
+            video_id = row.get("Content")
+            if not video_id or video_id == "Total":
+                continue
 
-    # 1. Import Content data (youtube_published_videos)
-    content_dirs = glob.glob(os.path.join(base_dir, "Content*"))
-    for cdir in content_dirs:
-        csv_file = os.path.join(cdir, "Table data.csv")
-        if not os.path.exists(csv_file):
-            continue
+            stmt = pg_insert(YoutubePublishedVideo).values(
+                user_id=user_id,
+                video_id=video_id,
+                title=row.get("Video title", ""),
+                publish_time=parse_date(row.get("Video publish time", "")),
+                duration_seconds=parse_duration(row.get("Duration", "0")),
+                views=_int(row, "Views"),
+                watch_time_hours=_float(row, "Watch time (hours)"),
+                subscribers=_int(row, "Subscribers"),
+                impressions=_int(row, "Impressions"),
+                impressions_ctr=_float(row, "Impressions click-through rate (%)"),
+            )
+            # GREATEST, not the CSV value: exports are cumulative and a partial
+            # or older export must never walk a metric backwards.
+            session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[
+                        YoutubePublishedVideo.user_id,
+                        YoutubePublishedVideo.video_id,
+                    ],
+                    set_={
+                        "title": stmt.excluded.title,
+                        "publish_time": func.coalesce(
+                            stmt.excluded.publish_time,
+                            YoutubePublishedVideo.publish_time,
+                        ),
+                        "duration_seconds": func.coalesce(
+                            stmt.excluded.duration_seconds,
+                            YoutubePublishedVideo.duration_seconds,
+                        ),
+                        "views": func.greatest(
+                            YoutubePublishedVideo.views, stmt.excluded.views
+                        ),
+                        "watch_time_hours": func.greatest(
+                            YoutubePublishedVideo.watch_time_hours,
+                            stmt.excluded.watch_time_hours,
+                        ),
+                        "subscribers": func.greatest(
+                            YoutubePublishedVideo.subscribers,
+                            stmt.excluded.subscribers,
+                        ),
+                        "impressions": func.greatest(
+                            YoutubePublishedVideo.impressions,
+                            stmt.excluded.impressions,
+                        ),
+                        "impressions_ctr": func.greatest(
+                            YoutubePublishedVideo.impressions_ctr,
+                            stmt.excluded.impressions_ctr,
+                        ),
+                        "imported_at": func.now(),
+                    },
+                )
+            )
+            videos_upserted += 1
 
-        with open(csv_file, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                video_id = row.get("Content")
-                if not video_id or video_id == "Total":
-                    continue
+        # -- Traffic source export -> youtube_traffic_sources --
+        for row in _table_rows("Traffic source"):
+            source = row.get("Traffic source")
+            if not source or source == "Total":
+                continue
 
-                title = row.get("Video title", "")
-                publish_time = parse_date(row.get("Video publish time", ""))
-                
-                duration_raw = row.get("Duration", "0")
-                duration_seconds = parse_duration(duration_raw)
-                
-                views = int(row.get("Views", 0)) if row.get("Views") else 0
-                watch_time = float(row.get("Watch time (hours)", 0.0)) if row.get("Watch time (hours)") else 0.0
-                subscribers = int(row.get("Subscribers", 0)) if row.get("Subscribers") else 0
-                impressions = int(row.get("Impressions", 0)) if row.get("Impressions") else 0
-                
-                ctr_raw = row.get("Impressions click-through rate (%)")
-                impressions_ctr = float(ctr_raw) if ctr_raw else 0.0
+            stmt = pg_insert(YoutubeTrafficSource).values(
+                user_id=user_id,
+                traffic_source=source,
+                views=_int(row, "Views"),
+                watch_time_hours=_float(row, "Watch time (hours)"),
+                avg_view_duration=row.get("Average view duration", ""),
+                impressions=_int(row, "Impressions"),
+                impressions_ctr=_float(row, "Impressions click-through rate (%)"),
+            )
+            session.execute(
+                stmt.on_conflict_do_update(
+                    # The upsert target is the per-user unique constraint; the
+                    # old schema made traffic_source globally unique, so two
+                    # users' imports collided on it.
+                    index_elements=[
+                        YoutubeTrafficSource.user_id,
+                        YoutubeTrafficSource.traffic_source,
+                    ],
+                    set_={
+                        "views": func.greatest(
+                            YoutubeTrafficSource.views, stmt.excluded.views
+                        ),
+                        "watch_time_hours": func.greatest(
+                            YoutubeTrafficSource.watch_time_hours,
+                            stmt.excluded.watch_time_hours,
+                        ),
+                        "avg_view_duration": func.coalesce(
+                            stmt.excluded.avg_view_duration,
+                            YoutubeTrafficSource.avg_view_duration,
+                        ),
+                        "impressions": func.greatest(
+                            YoutubeTrafficSource.impressions,
+                            stmt.excluded.impressions,
+                        ),
+                        "impressions_ctr": func.greatest(
+                            YoutubeTrafficSource.impressions_ctr,
+                            stmt.excluded.impressions_ctr,
+                        ),
+                        "imported_at": func.now(),
+                    },
+                )
+            )
+            sources_upserted += 1
 
-                # Upsert into youtube_published_videos
-                # We use REPLACE or INSERT ... ON CONFLICT (SQLite 3.24+)
-                # Assuming video_id is PRIMARY KEY
-                cursor.execute("""
-                    INSERT INTO youtube_published_videos (
-                        video_id, title, publish_time, duration_seconds, views,
-                        watch_time_hours, subscribers, impressions, impressions_ctr
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(video_id) DO UPDATE SET
-                        title=excluded.title,
-                        publish_time=COALESCE(excluded.publish_time, youtube_published_videos.publish_time),
-                        duration_seconds=COALESCE(excluded.duration_seconds, youtube_published_videos.duration_seconds),
-                        views=MAX(youtube_published_videos.views, excluded.views),
-                        watch_time_hours=MAX(youtube_published_videos.watch_time_hours, excluded.watch_time_hours),
-                        subscribers=MAX(youtube_published_videos.subscribers, excluded.subscribers),
-                        impressions=MAX(youtube_published_videos.impressions, excluded.impressions),
-                        impressions_ctr=MAX(youtube_published_videos.impressions_ctr, excluded.impressions_ctr),
-                        imported_at=datetime('now')
-                """, (video_id, title, publish_time, duration_seconds, views, 
-                      watch_time, subscribers, impressions, impressions_ctr))
-                content_videos_upserted += 1
-
-    # 2. Import Traffic Source data (youtube_traffic_sources)
-    traffic_dirs = glob.glob(os.path.join(base_dir, "Traffic source*"))
-    for tdir in traffic_dirs:
-        csv_file = os.path.join(tdir, "Table data.csv")
-        if not os.path.exists(csv_file):
-            continue
-
-        with open(csv_file, 'r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                source = row.get("Traffic source")
-                if not source or source == "Total":
-                    continue
-
-                views = int(row.get("Views", 0)) if row.get("Views") else 0
-                watch_time = float(row.get("Watch time (hours)", 0.0)) if row.get("Watch time (hours)") else 0.0
-                avg_view_duration = row.get("Average view duration", "")
-                impressions = int(row.get("Impressions", 0)) if row.get("Impressions") else 0
-                
-                ctr_raw = row.get("Impressions click-through rate (%)")
-                impressions_ctr = float(ctr_raw) if ctr_raw else 0.0
-
-                cursor.execute("""
-                    INSERT INTO youtube_traffic_sources (
-                        traffic_source, views, watch_time_hours, avg_view_duration, 
-                        impressions, impressions_ctr
-                    ) VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(traffic_source) DO UPDATE SET
-                        views=MAX(youtube_traffic_sources.views, excluded.views),
-                        watch_time_hours=MAX(youtube_traffic_sources.watch_time_hours, excluded.watch_time_hours),
-                        avg_view_duration=COALESCE(excluded.avg_view_duration, youtube_traffic_sources.avg_view_duration),
-                        impressions=MAX(youtube_traffic_sources.impressions, excluded.impressions),
-                        impressions_ctr=MAX(youtube_traffic_sources.impressions_ctr, excluded.impressions_ctr),
-                        imported_at=datetime('now')
-                """, (source, views, watch_time, avg_view_duration, impressions, impressions_ctr))
-                traffic_sources_upserted += 1
-
-    conn.commit()
-    
     return {
         "status": "success",
-        "videos_imported": content_videos_upserted,
-        "traffic_sources_imported": traffic_sources_upserted
+        "videos_imported": videos_upserted,
+        "traffic_sources_imported": sources_upserted,
     }

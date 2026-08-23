@@ -2,26 +2,29 @@
 
 import { CalendarRange, Loader2, Plus } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { Plan, PlanDetail, plannerApi } from "@/lib/plannerApi";
+import { Plan, PlanDetail, Platform, plannerApi } from "@/lib/plannerApi";
 import PlanWizard from "./PlanWizard";
+import PendingIdeasQueue from "./PendingIdeasQueue";
 
 interface Props {
   onOpenPlan: (planId: string) => void;
+  platform: Platform;
 }
 
-export default function PlanList({ onOpenPlan }: Props) {
+export default function PlanList({ onOpenPlan, platform }: Props) {
   const [plans, setPlans] = useState<Plan[] | null>(null);
   const [showWizard, setShowWizard] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
+    setPlans(null);
     try {
-      setPlans(await plannerApi.listPlans());
+      setPlans(await plannerApi.listPlans(platform));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load plans — is the backend running?");
       setPlans([]);
     }
-  }, []);
+  }, [platform]);
 
   useEffect(() => {
     load();
@@ -34,16 +37,22 @@ export default function PlanList({ onOpenPlan }: Props) {
 
   return (
     <div>
+      {/* Pending Ideas Queue from YouTube Trends — a YouTube-only surface
+          (youtube_playlist_items), so it stays hidden on other platforms. */}
+      {platform === "youtube" && <PendingIdeasQueue />}
+
       <div className="flex items-center justify-between mb-5">
         <h2 className="text-sm font-bold uppercase tracking-[0.2em] text-white flex items-center gap-2">
           <CalendarRange className="w-4 h-4 text-blue-400" /> Content Plans
         </h2>
-        <button
-          onClick={() => setShowWizard(true)}
-          className="text-xs px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition-colors flex items-center gap-1.5"
-        >
-          <Plus className="w-3 h-3" /> New Plan
-        </button>
+        <div className="flex gap-2">
+          <button
+            onClick={() => setShowWizard(true)}
+            className="text-xs px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition-colors flex items-center gap-1.5"
+          >
+            <Plus className="w-3 h-3" /> New Custom Plan
+          </button>
+        </div>
       </div>
 
       {error && <p className="text-xs text-red-400 mb-4">{error}</p>}
@@ -56,7 +65,7 @@ export default function PlanList({ onOpenPlan }: Props) {
 
       {plans !== null && plans.length === 0 && !error && (
         <div className="text-center py-16 border border-dashed border-white/10 rounded-2xl">
-          <p className="text-sm text-slate-500">No content plans yet.</p>
+          <p className="text-sm text-slate-500">No content plans for this platform yet.</p>
           <p className="text-xs text-slate-600 mt-1">Create a weekly or monthly plan and let AI suggest the topics.</p>
         </div>
       )}
@@ -90,7 +99,9 @@ export default function PlanList({ onOpenPlan }: Props) {
         ))}
       </div>
 
-      {showWizard && <PlanWizard onClose={() => setShowWizard(false)} onCreated={onCreated} />}
+      {showWizard && (
+        <PlanWizard platform={platform} onClose={() => setShowWizard(false)} onCreated={onCreated} />
+      )}
     </div>
   );
 }

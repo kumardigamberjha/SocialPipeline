@@ -2,8 +2,8 @@
 YouTube script pipeline HTTP + WebSocket router.
 
 Mirrors app/routers/linkedin.py: the pipeline runs in a Celery worker (queue
-``youtube_queue``) with a BackgroundTasks fallback when Redis is down; the
-WebSocket polls SQLite ``task_steps`` on a 2-second cadence.
+``youtube_queue``); the WebSocket polls the ``task_steps`` rows the worker
+writes on a 2-second cadence.
 
 Two routers are exported:
   - ``router``    : REST endpoints under /api/youtube
@@ -12,16 +12,28 @@ Both are registered in app.main.
 """
 
 import asyncio
-import json
 import logging
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth_deps import get_current_user
+from app.core.auth_deps import (
+    WS_FORBIDDEN,
+    WebSocketAuthError,
+    get_current_user,
+    get_current_user_ws,
+)
 from app.db import queries
-from app.services.dispatch import YOUTUBE_QUEUE, run_youtube_fallback, should_use_celery
-from app.tasks.youtube_task import run_youtube_pipeline
+from app.db.session import get_session
+from app.services.dispatch import dispatch_pipeline
 
 logger = logging.getLogger(__name__)
 
@@ -36,63 +48,81 @@ class GenerateRequest(BaseModel):
     video_format: str = "full"  # 'short' | 'full'
 
 
-def _dispatch(user_id: str, topic: str, niche: str, provider: str, video_format: str,
-              background_tasks: BackgroundTasks) -> dict:
-    """Enforce usage, create a run, and dispatch the Celery task onto the
-    YouTube queue. Falls back to BackgroundTasks if Redis fails."""
-    queries.reset_usage_if_expired(user_id)
-    usage = queries.get_usage(user_id)
+async def _dispatch(
+    session: AsyncSession,
+    user_id: str,
+    topic: str,
+    niche: str,
+    provider: str,
+    video_format: str,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Enforce the monthly cap, create a run, and dispatch the pipeline."""
+    await queries.reset_usage_if_expired(session, user_id)
+    usage = await queries.get_usage(session, user_id)
     if not usage:
-        queries.init_usage(user_id)
-        usage = queries.get_usage(user_id)
+        await queries.init_usage(session, user_id)
+        usage = await queries.get_usage(session, user_id)
     if usage and usage["runs_this_month"] >= usage["max_runs_per_month"]:
         raise HTTPException(status_code=429, detail="Usage limit exceeded for this month.")
 
-    run = queries.create_run(user_id, topic, provider)
+    run = await queries.create_run(session, user_id, topic, provider)
     run_id = run["id"]
 
-    dispatched_to_celery = False
-    if should_use_celery(YOUTUBE_QUEUE):
-        try:
-            run_youtube_pipeline.apply_async(
-                args=[run_id, topic, niche, user_id, provider, video_format],
-                queue=YOUTUBE_QUEUE,
-                ignore_result=True,
-            )
-            dispatched_to_celery = True
-        except Exception as exc:
-            logger.warning("Celery dispatch failed, falling back to BackgroundTasks: %s", exc)
-
-    if not dispatched_to_celery:
-        logger.info("Running YouTube pipeline in-process (no Celery worker) ▸ run_id=%s", run_id)
-        background_tasks.add_task(run_youtube_fallback, run_id, topic, niche, user_id, provider, video_format)
-
+    dispatch_pipeline(
+        content_type="youtube_script",
+        run_id=run_id,
+        topic=topic,
+        niche=niche,
+        user_id=user_id,
+        provider=provider,
+        video_format=video_format,
+        background_tasks=background_tasks,
+    )
     return {"run_id": run_id, "status": "queued", "message": "YouTube script pipeline started"}
 
 
 @router.post("/generate")
-def generate_youtube_script(request: GenerateRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
-    return _dispatch(current_user["id"], request.topic, request.niche, request.provider, request.video_format, background_tasks)
+async def generate_youtube_script(
+    request: GenerateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    return await _dispatch(
+        session, current_user["id"], request.topic, request.niche,
+        request.provider, request.video_format, background_tasks,
+    )
 
 
 @router.get("/scripts")
-def list_youtube_scripts(current_user: dict = Depends(get_current_user)):
+async def list_youtube_scripts(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     # get_youtube_scripts already omits the script body for the list view.
-    return queries.get_youtube_scripts(current_user["id"], limit=50)
+    return await queries.get_youtube_scripts(session, current_user["id"], limit=50)
 
 
 @router.get("/scripts/{script_id}")
-def get_youtube_script(script_id: str, current_user: dict = Depends(get_current_user)):
-    script = queries.get_youtube_script_by_id(script_id, current_user["id"])
+async def get_youtube_script(
+    script_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    script = await queries.get_youtube_script_by_id(session, script_id, current_user["id"])
     if not script:
         raise HTTPException(status_code=404, detail="Script not found")
     return script
 
 
 @router.delete("/scripts/{script_id}")
-def delete_youtube_script(script_id: str, current_user: dict = Depends(get_current_user)):
-    success = queries.soft_delete_youtube_script(script_id, current_user["id"])
-    if not success:
+async def delete_youtube_script(
+    script_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    if not await queries.soft_delete_youtube_script(session, script_id, current_user["id"]):
         raise HTTPException(status_code=404, detail="Script not found or already deleted")
     return {"message": "Script deleted"}
 
@@ -101,15 +131,32 @@ def delete_youtube_script(script_id: str, current_user: dict = Depends(get_curre
 
 
 @ws_router.websocket("/youtube/{client_id}")
-async def youtube_websocket(websocket: WebSocket, client_id: str, token: str | None = None):
-    """Stream YouTube pipeline progress. ``client_id`` is the run_id."""
-    await websocket.accept()
+async def youtube_websocket(
+    websocket: WebSocket,
+    client_id: str,
+    user: dict = Depends(get_current_user_ws),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stream YouTube pipeline progress. ``client_id`` is the run_id.
+
+    Authenticated before ``accept()`` and scoped to the run's owner.
+    """
     run_id = client_id
+    user_id = user["id"]
+
+    run = await queries.get_run_by_id(session, run_id, user_id)
+    if run is None:
+        await websocket.close(code=WS_FORBIDDEN, reason="Unknown run")
+        return
+
+    await websocket.accept()
     last_step_id = 0
 
     try:
         while True:
-            for step in queries.get_new_steps_since(run_id, last_step_id):
+            for step in await queries.get_new_steps_since(
+                session, run_id, user_id, last_step_id
+            ):
                 last_step_id = max(last_step_id, step["id"])
                 await websocket.send_json({
                     "type": "agent_update",
@@ -117,10 +164,12 @@ async def youtube_websocket(websocket: WebSocket, client_id: str, token: str | N
                     "task": step["task_name"],
                 })
 
-            run = queries.get_run_by_id(run_id)
+            run = await queries.get_run_by_id(session, run_id, user_id)
             if run and run["status"] in ("completed", "failed"):
                 if run["status"] == "completed":
-                    saved = queries.get_youtube_scripts_by_run_id(run_id)
+                    saved = await queries.get_youtube_scripts_by_run_id(
+                        session, run_id, user_id
+                    )
                     script = saved[-1] if saved else None
                     await websocket.send_json({
                         "type": "complete",
@@ -129,7 +178,8 @@ async def youtube_websocket(websocket: WebSocket, client_id: str, token: str | N
                         "word_count": script["word_count"] if script else 0,
                         "seo_title": script["seo_title"] if script else "",
                         "seo_description": script["seo_description"] if script else "",
-                        "seo_tags": json.loads(script["seo_tags"]) if script and script["seo_tags"] else [],
+                        # seo_tags is JSONB now — already a list, no json.loads.
+                        "seo_tags": (script["seo_tags"] if script else None) or [],
                         "approved": bool(script["approved"]) if script else False,
                     })
                 else:
@@ -138,7 +188,7 @@ async def youtube_websocket(websocket: WebSocket, client_id: str, token: str | N
 
             await asyncio.sleep(2)
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, WebSocketAuthError):
         logger.info("YouTube WS client disconnected: run_id=%s", run_id)
     except Exception as exc:  # noqa: BLE001
         logger.error("YouTube WS error for run_id=%s: %s", run_id, exc)

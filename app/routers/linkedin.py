@@ -2,9 +2,9 @@
 LinkedIn pipeline HTTP + WebSocket router.
 
 The pipeline runs in a dedicated Celery worker (queue ``linkedin_queue``), so the
-WebSocket cannot stream from an in-process task the way the blog/main pipelines do.
-Instead it polls the SQLite ``task_steps`` the worker writes (the same 2-second
-polling cadence) and emits structured events to the client.
+WebSocket cannot stream from an in-process task the way the main pipeline does.
+Instead it polls the ``task_steps`` rows the worker writes (a 2-second cadence)
+and emits structured events to the client.
 
 Two routers are exported:
   - ``router``    : REST endpoints under /api/linkedin
@@ -17,22 +17,32 @@ import asyncio
 import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from pydantic import BaseModel
-import time
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.core.auth_deps import get_current_user
+from app.core.auth_deps import (
+    WS_FORBIDDEN,
+    WebSocketAuthError,
+    get_current_user,
+    get_current_user_ws,
+)
 from app.db import queries
-from app.tasks.linkedin_task import run_linkedin_pipeline
-from app.services.linkedin_pipeline import LinkedInPipelineOrchestrator
+from app.db.session import get_session
+from app.services.dispatch import dispatch_pipeline
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/linkedin", tags=["linkedin"])
 ws_router = APIRouter(prefix="/api/ws", tags=["linkedin"])
-
-LINKEDIN_QUEUE = "linkedin_queue"
 
 
 class GenerateRequest(BaseModel):
@@ -41,124 +51,117 @@ class GenerateRequest(BaseModel):
     provider: str = "nvidia"
 
 
-def _run_linkedin_fallback(run_id: str, topic: str, niche: str, user_id: str, provider: str):
-    try:
-        queries.update_run_status(run_id, "running")
-        start = time.time()
+async def _dispatch(
+    session: AsyncSession,
+    user_id: str,
+    topic: str,
+    niche: str,
+    provider: str,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    """Shared launch logic for /generate and /regenerate.
 
-        def step_callback(agent_name: str, task_name: str, output: str):
-            queries.insert_task_step(run_id, agent_name, task_name, str(output))
-
-        orchestrator = LinkedInPipelineOrchestrator(
-            llm_provider=provider,
-            run_id=run_id,
-            step_callback=step_callback,
-        )
-        result = asyncio.run(orchestrator.run(topic, niche, user_id))
-
-        duration = round(time.time() - start, 2)
-        queries.save_linkedin_post(
-            run_id=run_id,
-            user_id=user_id,
-            topic=topic,
-            post_text=result["post_text"],
-            hook=result["hook"],
-            angle_type=result["angle_type"],
-            word_count=result["word_count"],
-            approved=result["approved"],
-            niche=niche,
-        )
-        queries.update_run_status(run_id, "completed", final_result=result["post_text"], duration=duration)
-        queries.increment_usage(user_id)
-        logger.info("LinkedIn pipeline DONE (fallback) ▸ run_id=%s duration=%.2fs approved=%s", run_id, duration, result["approved"])
-
-    except Exception as exc:
-        logger.exception("LinkedIn pipeline FAILED (fallback) ▸ run_id=%s", run_id)
-        queries.update_run_status(run_id, "failed")
-
-
-from app.services.dispatch import should_use_celery
-
-def _dispatch(user_id: str, topic: str, niche: str, provider: str, background_tasks: BackgroundTasks) -> dict:
-    """Shared launch logic for /generate and /regenerate: enforce usage, create a
-    run, and dispatch the Celery task onto the LinkedIn queue. Falls back to
-    running the pipeline in-process (BackgroundTasks) whenever Celery can't be
-    used — Redis down OR no worker draining the queue."""
-    queries.reset_usage_if_expired(user_id)
-    usage = queries.get_usage(user_id)
+    Enforces the monthly cap, creates the run, and hands off to the shared
+    dispatcher. The in-process fallback used to be re-implemented here as a
+    third copy of the pipeline body; it now lives in one place.
+    """
+    await queries.reset_usage_if_expired(session, user_id)
+    usage = await queries.get_usage(session, user_id)
     if not usage:
-        queries.init_usage(user_id)
-        usage = queries.get_usage(user_id)
+        await queries.init_usage(session, user_id)
+        usage = await queries.get_usage(session, user_id)
     if usage and usage["runs_this_month"] >= usage["max_runs_per_month"]:
         raise HTTPException(status_code=429, detail="Usage limit exceeded for this month.")
 
-    run = queries.create_run(user_id, topic, provider)
+    run = await queries.create_run(session, user_id, topic, provider)
     run_id = run["id"]
 
-    dispatched_to_celery = False
-    if should_use_celery(LINKEDIN_QUEUE):
-        try:
-            run_linkedin_pipeline.apply_async(
-                args=[run_id, topic, niche, user_id, provider],
-                queue=LINKEDIN_QUEUE,
-                ignore_result=True,
-            )
-            dispatched_to_celery = True
-        except Exception as exc:
-            logger.warning("Celery dispatch failed, falling back to BackgroundTasks. Error: %s", exc)
-
-    if not dispatched_to_celery:
-        logger.info("Running LinkedIn pipeline in-process (no Celery worker) ▸ run_id=%s", run_id)
-        background_tasks.add_task(_run_linkedin_fallback, run_id, topic, niche, user_id, provider)
-
+    dispatch_pipeline(
+        content_type="linkedin",
+        run_id=run_id,
+        topic=topic,
+        niche=niche,
+        user_id=user_id,
+        provider=provider,
+        video_format="full",
+        background_tasks=background_tasks,
+    )
     return {"run_id": run_id, "status": "queued", "message": "LinkedIn pipeline started"}
 
 
 @router.post("/generate")
-def generate_linkedin_post(request: GenerateRequest, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
-    return _dispatch(current_user["id"], request.topic, request.niche, request.provider, background_tasks)
+async def generate_linkedin_post(
+    request: GenerateRequest,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    return await _dispatch(
+        session, current_user["id"], request.topic, request.niche,
+        request.provider, background_tasks,
+    )
 
 
 @router.get("/posts")
-def list_linkedin_posts(current_user: dict = Depends(get_current_user)):
+async def list_linkedin_posts(
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     # get_linkedin_posts already omits post_text for the list view.
-    return queries.get_linkedin_posts(current_user["id"], limit=50)
+    return await queries.get_linkedin_posts(session, current_user["id"], limit=50)
 
 
 @router.get("/posts/{post_id}")
-def get_linkedin_post(post_id: str, current_user: dict = Depends(get_current_user)):
-    post = queries.get_linkedin_post_by_id(post_id, current_user["id"])
+async def get_linkedin_post(
+    post_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    post = await queries.get_linkedin_post_by_id(session, post_id, current_user["id"])
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
     return post
 
 
 @router.delete("/posts/{post_id}")
-def delete_linkedin_post(post_id: str, current_user: dict = Depends(get_current_user)):
-    success = queries.soft_delete_linkedin_post(post_id, current_user["id"])
-    if not success:
+async def delete_linkedin_post(
+    post_id: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
+    if not await queries.soft_delete_linkedin_post(session, post_id, current_user["id"]):
         raise HTTPException(status_code=404, detail="Post not found or already deleted")
     return {"message": "Post deleted"}
 
 
 @router.post("/regenerate/{post_id}")
-def regenerate_linkedin_post(post_id: str, background_tasks: BackgroundTasks, current_user: dict = Depends(get_current_user)):
+async def regenerate_linkedin_post(
+    post_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+):
     """Re-run the pipeline on the same topic with a fresh angle. Creates a NEW
     post row (the original is left untouched)."""
-    post = queries.get_linkedin_post_by_id(post_id, current_user["id"])
+    user_id = current_user["id"]
+    post = await queries.get_linkedin_post_by_id(session, post_id, user_id)
     if not post:
         raise HTTPException(status_code=404, detail="Post not found")
 
     # Reuse the provider from the original run when we can, else fall back.
     provider = get_settings().default_provider or "nvidia"
-    original_run = queries.get_run_by_id(post.get("run_id")) if post.get("run_id") else None
-    if original_run and original_run.get("provider_used"):
-        provider = original_run["provider_used"]
+    if post.get("run_id"):
+        original_run = await queries.get_run_by_id(session, post["run_id"], user_id)
+        if original_run and original_run.get("provider_used"):
+            provider = original_run["provider_used"]
 
-    return _dispatch(current_user["id"], post["topic"], post.get("niche") or "ai", provider, background_tasks)
+    return await _dispatch(
+        session, user_id, post["topic"], post.get("niche") or "ai",
+        provider, background_tasks,
+    )
 
 
-# ── WebSocket: /api/ws/linkedin/{client_id}?token={jwt} ───────────────────────
+# ── WebSocket: /api/ws/linkedin/{client_id} ───────────────────────────────────
 
 
 def _parse_step_output(output_str: str) -> dict | None:
@@ -178,15 +181,34 @@ def _parse_step_output(output_str: str) -> dict | None:
 
 
 @ws_router.websocket("/linkedin/{client_id}")
-async def linkedin_websocket(websocket: WebSocket, client_id: str, token: str | None = None):
-    """Stream LinkedIn pipeline progress. ``client_id`` is the run_id."""
-    await websocket.accept()
+async def linkedin_websocket(
+    websocket: WebSocket,
+    client_id: str,
+    user: dict = Depends(get_current_user_ws),
+    session: AsyncSession = Depends(get_session),
+):
+    """Stream LinkedIn pipeline progress. ``client_id`` is the run_id.
+
+    Authenticated before ``accept()`` and scoped to the run's owner. The
+    previous version took an unused ``token`` parameter and streamed the full
+    generated post to anyone who supplied a run_id.
+    """
     run_id = client_id
+    user_id = user["id"]
+
+    run = await queries.get_run_by_id(session, run_id, user_id)
+    if run is None:
+        await websocket.close(code=WS_FORBIDDEN, reason="Unknown run")
+        return
+
+    await websocket.accept()
     last_step_id = 0
 
     try:
         while True:
-            for step in queries.get_new_steps_since(run_id, last_step_id):
+            for step in await queries.get_new_steps_since(
+                session, run_id, user_id, last_step_id
+            ):
                 last_step_id = max(last_step_id, step["id"])
                 agent_name = step["agent_name"]
                 task_name = step["task_name"]
@@ -208,10 +230,12 @@ async def linkedin_websocket(websocket: WebSocket, client_id: str, token: str | 
                         "task": task_name,
                     })
 
-            run = queries.get_run_by_id(run_id)
+            run = await queries.get_run_by_id(session, run_id, user_id)
             if run and run["status"] in ("completed", "failed"):
                 if run["status"] == "completed":
-                    saved = queries.get_linkedin_posts_by_run_id(run_id)
+                    saved = await queries.get_linkedin_posts_by_run_id(
+                        session, run_id, user_id
+                    )
                     post = saved[-1] if saved else None
                     await websocket.send_json({
                         "type": "complete",
@@ -226,7 +250,7 @@ async def linkedin_websocket(websocket: WebSocket, client_id: str, token: str | 
 
             await asyncio.sleep(2)
 
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, WebSocketAuthError):
         logger.info("LinkedIn WS client disconnected: run_id=%s", run_id)
     except Exception as exc:  # noqa: BLE001
         logger.error("LinkedIn WS error for run_id=%s: %s", run_id, exc)

@@ -14,18 +14,10 @@ import {
   Check,
   Loader2,
 } from "lucide-react";
-import { playlistItemsApi } from "@/lib/youtubePlaylistItemsApi";
+import { ApiError, request } from "@/lib/apiClient";
+import { playlistItemsApi, YoutubePlaylistItem } from "@/lib/youtubePlaylistItemsApi";
 
-const BASE = "http://localhost:8000/api/youtube-analytics";
-
-function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = {};
-  if (typeof window !== "undefined") {
-    const t = window.localStorage.getItem("token");
-    if (t) h["Authorization"] = `Bearer ${t}`;
-  }
-  return h;
-}
+const BASE = "/youtube-analytics";
 
 interface Playlist {
   id: string;
@@ -57,6 +49,22 @@ function fmtViews(n: number | null): string {
   return String(n);
 }
 
+function normalizeTitle(t: string): string {
+  return t.toLowerCase().replace(/[^a-z0-9]/g, "").trim();
+}
+
+function isTitleMatching(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const normA = normalizeTitle(a);
+  const normB = normalizeTitle(b);
+  if (!normA || !normB) return false;
+  if (normA === normB) return true;
+  if (normA.length > 8 && normB.length > 8) {
+    if (normA.includes(normB) || normB.includes(normA)) return true;
+  }
+  return false;
+}
+
 export default function YoutubePlaylistTrends() {
   const [status, setStatus] = useState<Status>("loading");
   const [errorMsg, setErrorMsg] = useState("");
@@ -68,29 +76,27 @@ export default function YoutubePlaylistTrends() {
     setStatus("loading");
     setErrorMsg("");
     try {
-      const res = await fetch(`${BASE}/playlists`, { headers: authHeaders() });
-      if (res.status === 403) {
-        setStatus("need_reconnect");
-        return;
-      }
-      if (res.status === 401 || res.status === 400) {
-        const b = await res.json().catch(() => ({}));
-        setErrorMsg(b.detail || "");
-        setStatus("need_connect");
-        return;
-      }
-      if (!res.ok) {
-        const b = await res.json().catch(() => ({}));
-        setErrorMsg(b.detail || `Failed (${res.status})`);
-        setStatus("error");
-        return;
-      }
-      const data = await res.json();
+      const data = await request<{
+        channel_title?: string;
+        uploads_playlist_id?: string;
+        playlists?: Playlist[];
+      }>(`${BASE}/playlists`);
       setChannelTitle(data.channel_title || "");
       setUploadsId(data.uploads_playlist_id || "");
       setPlaylists(data.playlists || []);
       setStatus("ready");
     } catch (e) {
+      if (e instanceof ApiError) {
+        if (e.status === 403) {
+          setStatus("need_reconnect");
+          return;
+        }
+        if (e.status === 401 || e.status === 400) {
+          setErrorMsg(e.message);
+          setStatus("need_connect");
+          return;
+        }
+      }
       setErrorMsg(e instanceof Error ? e.message : "Request failed");
       setStatus("error");
     }
@@ -102,13 +108,11 @@ export default function YoutubePlaylistTrends() {
 
   const connectGoogle = async () => {
     try {
-      const res = await fetch(`http://localhost:8000/api/google/authorize`, { headers: authHeaders() });
-      if (res.ok) {
-        const { authorization_url } = await res.json();
-        if (authorization_url) window.location.href = authorization_url;
-      } else {
-        setErrorMsg("Could not start Google authorization.");
-      }
+      const { authorization_url } = await request<{ authorization_url?: string }>(
+        "/google/authorize"
+      );
+      if (authorization_url) window.location.href = authorization_url;
+      else setErrorMsg("Could not start Google authorization.");
     } catch {
       setErrorMsg("Could not start Google authorization.");
     }
@@ -122,7 +126,7 @@ export default function YoutubePlaylistTrends() {
             <Sparkles size={20} />
           </div>
           <div>
-            <h2 className="text-lg font-semibold text-white">Playlists & Trending Topics</h2>
+            <h2 className="text-lg font-semibold text-white">Playlists &amp; Trending Topics</h2>
             <p className="text-slate-500 text-xs mt-0.5">
               Your latest videos per playlist + AI trend ideas
               {channelTitle ? ` · ${channelTitle}` : ""}
@@ -214,15 +218,25 @@ function PlaylistCard({ playlist, isUploads = false }: { playlist: Playlist; isU
   const [trends, setTrends] = useState<Trend[] | null>(null);
   const [trendsLoading, setTrendsLoading] = useState(false);
   const [trendsError, setTrendsError] = useState("");
+  const [pendingItems, setPendingItems] = useState<YoutubePlaylistItem[]>([]);
   // Per-trend "add to pending" state, keyed by trend index: "idle" | "busy" | "done".
   const [addState, setAddState] = useState<Record<number, "busy" | "done">>({});
   const [addError, setAddError] = useState("");
+
+  const loadPendingItems = async () => {
+    try {
+      const items = await playlistItemsApi.list(playlist.id);
+      setPendingItems(items || []);
+    } catch {
+      // Best effort load
+    }
+  };
 
   const addTrendToPending = async (t: Trend, idx: number) => {
     setAddError("");
     setAddState((s) => ({ ...s, [idx]: "busy" }));
     try {
-      await playlistItemsApi.add({
+      const newItem = await playlistItemsApi.add({
         playlist_id: playlist.id,
         playlist_title: playlist.title,
         title: t.title,
@@ -231,6 +245,7 @@ function PlaylistCard({ playlist, isUploads = false }: { playlist: Playlist; isU
         source: "trend_idea",
       });
       setAddState((s) => ({ ...s, [idx]: "done" }));
+      setPendingItems((prev) => [...prev, newItem]);
     } catch (e) {
       setAddState((s) => {
         const next = { ...s };
@@ -241,45 +256,68 @@ function PlaylistCard({ playlist, isUploads = false }: { playlist: Playlist; isU
     }
   };
 
-  const toggle = async () => {
-    const next = !open;
-    setOpen(next);
-    if (next && videos === null) {
-      setVideosLoading(true);
-      try {
-        const res = await fetch(
-          `${BASE}/playlist-videos?playlist_id=${encodeURIComponent(playlist.id)}&limit=8`,
-          { headers: authHeaders() }
-        );
-        setVideos(res.ok ? await res.json() : []);
-      } catch {
-        setVideos([]);
-      } finally {
-        setVideosLoading(false);
+  const checkCachedTrends = async () => {
+    try {
+      const data = await request<{ trending_topics?: Trend[]; cached?: boolean }>(
+        `${BASE}/playlist-trends?playlist_id=${encodeURIComponent(playlist.id)}` +
+          `&playlist_title=${encodeURIComponent(playlist.title)}&refresh=false&only_cached=true`,
+        { method: "POST" }
+      );
+      if (data.trending_topics && data.trending_topics.length > 0) {
+        setTrends(data.trending_topics);
       }
+    } catch {
+      // Ignore cache lookup failure
     }
   };
 
   const getTrends = async (refresh = false) => {
     setTrendsLoading(true);
     setTrendsError("");
+    loadPendingItems();
     try {
-      const res = await fetch(
+      const data = await request<{ trending_topics?: Trend[] }>(
         `${BASE}/playlist-trends?playlist_id=${encodeURIComponent(playlist.id)}` +
           `&playlist_title=${encodeURIComponent(playlist.title)}&refresh=${refresh}`,
-        { method: "POST", headers: authHeaders() }
+        { method: "POST" }
       );
-      if (!res.ok) {
-        const b = await res.json().catch(() => ({}));
-        throw new Error(b.detail || `Failed (${res.status})`);
-      }
-      const data = await res.json();
       setTrends(data.trending_topics || []);
     } catch (e) {
       setTrendsError(e instanceof Error ? e.message : "Trend analysis failed");
     } finally {
       setTrendsLoading(false);
     }
+  };
+
+  const toggle = async () => {
+    const next = !open;
+    setOpen(next);
+    if (next) {
+      if (videos === null) {
+        setVideosLoading(true);
+        try {
+          const data = await request<Video[]>(
+            `${BASE}/playlist-videos?playlist_id=${encodeURIComponent(playlist.id)}&limit=8`
+          );
+          setVideos(data);
+        } catch {
+          setVideos([]);
+        } finally {
+          setVideosLoading(false);
+        }
+      }
+      // Load current DB pending items & check if cached trends exist without triggering research
+      loadPendingItems();
+      if (trends === null) {
+        checkCachedTrends();
+      }
+    }
+  };
+
+  const isTrendAlreadyAdded = (t: Trend, idx: number): boolean => {
+    if (addState[idx] === "done") return true;
+    if (!pendingItems || pendingItems.length === 0) return false;
+    return pendingItems.some((item) => isTitleMatching(item.title, t.title));
   };
 
   return (
@@ -342,7 +380,7 @@ function PlaylistCard({ playlist, isUploads = false }: { playlist: Playlist; isU
 
             {trendsLoading && (
               <p className="text-slate-500 text-xs py-3 animate-pulse">
-                Searching the web for current trends and asking qwen… this can take 30–60s.
+                Searching the web for current trends and asking Gemini 3.6 Flash… this can take 30–60s.
               </p>
             )}
             {trendsError && <p className="text-red-400 text-xs py-2">{trendsError}</p>}
@@ -352,7 +390,8 @@ function PlaylistCard({ playlist, isUploads = false }: { playlist: Playlist; isU
             {trends && trends.length > 0 && (
               <div className="space-y-2 mt-1">
                 {trends.map((t, i) => {
-                  const st = addState[i];
+                  const isBusy = addState[i] === "busy";
+                  const isDone = isTrendAlreadyAdded(t, i);
                   return (
                     <div key={i} className="rounded-lg bg-white/[0.03] border border-white/5 p-3">
                       <div className="flex items-start justify-between gap-2">
@@ -367,22 +406,22 @@ function PlaylistCard({ playlist, isUploads = false }: { playlist: Playlist; isU
                       <div className="mt-2 flex justify-end">
                         <button
                           onClick={() => addTrendToPending(t, i)}
-                          disabled={st === "busy" || st === "done"}
-                          title="Save this idea as a pending video under this playlist"
+                          disabled={isBusy || isDone}
+                          title={isDone ? "Already added to pending video plan" : "Save this idea as a pending video under this playlist"}
                           className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium border transition-colors disabled:cursor-default ${
-                            st === "done"
+                            isDone
                               ? "border-green-400/30 text-green-400 bg-green-500/10"
                               : "border-white/10 text-slate-300 hover:border-blue-400/40 hover:text-blue-300 disabled:opacity-60"
                           }`}
                         >
-                          {st === "busy" ? (
+                          {isBusy ? (
                             <Loader2 size={13} className="animate-spin" />
-                          ) : st === "done" ? (
+                          ) : isDone ? (
                             <Check size={13} />
                           ) : (
                             <Plus size={13} />
                           )}
-                          {st === "done" ? "Added" : st === "busy" ? "Adding…" : "Add to Pending"}
+                          {isDone ? "Added to Plan" : isBusy ? "Adding…" : "Add to Pending"}
                         </button>
                       </div>
                     </div>

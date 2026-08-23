@@ -43,13 +43,42 @@ class Settings(BaseSettings):
     gemma_api_key: str | None = None
     ollama_cloud_api_key: str | None = None
     meta_access_token: str | None = None
+    instagram_app_id: str | None = None
+    instagram_app_secret: str | None = None
+    instagram_redirect_uri: str = "http://localhost:8000/api/instagram/oauth/callback"
+    instagram_token_expires_at: str | None = None
 
     # ── Database ──────────────────────────────────────────────
-    sqlite_db_path: str = "./data/nexus.db"
+    # Postgres. The API uses the async (asyncpg) engine; Celery workers use the
+    # sync (psycopg) one derived from the same URL by _sync_database_url().
+    database_url: str = "postgresql+asyncpg://nexus:nexus@localhost:5432/nexus"
+    db_pool_size: int = 10
+    db_max_overflow: int = 20
+    db_echo: bool = False
+
+    # ── Auth / sessions ───────────────────────────────────────
     secret_key: str = _PLACEHOLDER_SECRET_KEY
     jwt_algorithm: str = "HS256"
-    jwt_expire_days: int = 30
-    
+    # Access tokens are deliberately short-lived: revocation is enforced by a
+    # Redis denylist that only has to outlive a single access token.
+    access_token_ttl_seconds: int = 900          # 15 minutes
+    refresh_token_ttl_seconds: int = 2592000     # 30 days, absolute (not sliding)
+    # Minimum signup password length. Below 12 the bcrypt work factor is doing
+    # all the work; above it the entropy is.
+    password_min_length: int = 12
+
+    # ── Email / SMTP ──────────────────────────────────────────
+    # Gmail: use an App Password (16-char) from
+    # https://myaccount.google.com/apppasswords — not your account password.
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""           # e.g. you@gmail.com
+    smtp_password: str = ""       # Gmail App Password
+    smtp_from: str = ""           # defaults to smtp_user when empty
+
+    # How long a verification OTP is valid (seconds). 600 = 10 minutes.
+    email_verify_otp_ttl_seconds: int = 600
+
     qdrant_url: str = ""
     qdrant_api_key: str = ""
     qdrant_cluster_endpoint: str = ""
@@ -59,14 +88,59 @@ class Settings(BaseSettings):
     default_provider: Literal["nvidia", "groq", "ollama", "openai", "anthropic", "google", "gemma"] = "ollama"
     llm_temperature: float = 0.6
     llm_max_tokens: int = 4096
-    llm_timeout: int = 300
-    ollama_model: str = "ollama/mistral:latest"
-    # Model used for the YouTube AI analysis feature (local Ollama qwen).
-    ollama_analysis_model: str = "ollama/qwen2.5:latest"
-    ollama_api_base: str = "http://host.docker.internal:11434"
+    # Wall-clock ceiling for a whole LLM fallback cascade, not one call.
+    # Must stay under Cloudflare's ~100s proxy timeout: the analysis endpoints
+    # run the cascade synchronously inside the request handler.
+    llm_timeout: int = 85
+    ollama_model: str = "ollama/gemma4:31b-cloud"
+    # Local Ollama model (used as the last priority local fallback)
+    local_ollama_model: str = "ollama/qwen2.5:latest"
+    # Ollama cloud model (3rd priority fallback)
+    ollama_cloud_model: str = "ollama/gemma4:31b-cloud"
+    # Primary model (1st priority): Google Gemini
+    analysis_model: str = "gemini/gemini-3.6-flash"
+    ollama_analysis_model: str = "gemini/gemini-3.6-flash"
+    # 2nd priority fallback: NVIDIA DeepSeek AI (NVIDIA NIM)
+    nvidia_deepseek_model: str = "nvidia_nim/deepseek-ai/deepseek-v4-flash-0731"
+    analysis_fallback_model: str = "nvidia_nim/deepseek-ai/deepseek-v4-flash-0731"
+    # Kept as a config knob; no longer wired into the analysis cascade — this
+    # model does not hold the JSON schema these prompts require.
+    nvidia_fallback_model: str = "nvidia_nim/meta/llama-3.1-8b-instruct"
+    # Model behind default_provider="nvidia". Must exist in NVIDIA's catalog:
+    # https://integrate.api.nvidia.com/v1/models
+    nvidia_model: str = "nvidia_nim/deepseek-ai/deepseek-v4-flash-0731"
+    ollama_api_base: str = "http://localhost:11434"
     openai_api_base: str = ""
 
+    # ── YouTube competitor tracking ───────────────────────────────────────
+    # The weekly Sunday sync refreshes at most this many approved competitors
+    # per user (stalest-first — see sync_queries.select_competitors_for_weekly_sync),
+    # each up to this many latest videos. Bounds the per-user quota spend to
+    # roughly cap * 3 units/week regardless of how many competitors are tracked.
+    competitor_weekly_sync_cap: int = 50
+    competitor_weekly_video_limit: int = 10
+
     # ── Redis / Celery ───────────────────────────────────────
+    # Two physical instances, deliberately. The cache runs allkeys-lru; the
+    # state/broker instance runs noeviction. Auth denylist entries and queued
+    # task payloads must never be evictable — an evicted denylist entry
+    # silently *un-revokes* a token.
+    #
+    # These are explicit rather than derived. The previous code built the
+    # result backend by string-munging redis_url, which produced an invalid
+    # URL for anything not ending in "/0" (redis://h:6379/2 -> .../2/1).
+    redis_cache_url: str = "redis://localhost:6379/0"       # analytics/AI caches
+    redis_state_url: str = "redis://localhost:6380/2"       # denylist, WS tickets, job pubsub
+    celery_broker_url: str = "redis://localhost:6380/0"
+    celery_result_backend: str = "redis://localhost:6380/1"
+
+    # Run pipelines in-process via BackgroundTasks when no Celery worker is
+    # consuming the queue. A developer convenience; refused in production,
+    # where an unqueued multi-minute job would block an API worker.
+    allow_inprocess_fallback: bool = True
+
+    # DEPRECATED: single-instance Redis URL. Still read by the call sites that
+    # have not yet moved to app.core.redis_client; removed once they have.
     redis_url: str = "redis://localhost:6379/0"
 
     # ── Stripe Billing ───────────────────────────────────────
@@ -75,17 +149,53 @@ class Settings(BaseSettings):
     stripe_pro_price_id: str = ""
     stripe_enterprise_price_id: str = ""
 
-    # ── ComfyUI ──────────────────────────────────────────────
-    comfy_host: str = "127.0.0.1"
-    comfy_port: int = 8188
+    # ── ComfyUI (retired — image generation now runs on Gemini) ──
+    # Kept commented rather than deleted so the local-GPU path is one revert
+    # away; see app/services/comfy_client.py.
+    # comfy_host: str = "127.0.0.1"
+    # comfy_port: int = 8188
+
+    # ── Image generation (Gemini) ────────────────────────────
+    # Model id for image renders. NOTE: image generation needs an *image*
+    # model — the "-image" suffix is not optional, and the text models in
+    # `analysis_model` above cannot return image parts.
+    #   gemini-3.1-flash-image       versatile default
+    #   gemini-3.1-flash-lite-image  fastest / cheapest (1K only)
+    #   gemini-3-pro-image           highest fidelity, legible text
+    gemini_image_model: str = "gemini-3.1-flash-image"
+    # 4:5 is the Instagram portrait ratio the prompt engine is tuned for.
+    gemini_image_aspect_ratio: str = "4:5"
+    gemini_image_size: str = "2K"      # "512" | "1K" | "2K" | "4K"
+    gemini_image_timeout: int = 120
+
+    # Where rendered images are written. The default is the Next.js public dir,
+    # which makes them reachable at /generated_posts/<file> in local dev where
+    # the API and the dashboard share a checkout. Under docker-compose they are
+    # separate containers with no shared mount, so the API serves the files back
+    # itself (GET /api/plans/{plan}/items/{item}/image) and this should point at
+    # a mounted volume instead.
+    image_output_dir: str = str(
+        Path(__file__).resolve().parent.parent / "dashboard" / "public" / "generated_posts"
+    )
+    # DEPRECATED: the ComfyUI-era name for image_output_dir. Deployments (and
+    # docker-compose) still set COMFY_OUTPUT_DIR; the validator below mirrors it
+    # so an existing volume mount does not silently start writing elsewhere.
+    comfy_output_dir: str = ""
 
     # ── Google Calendar (planner) ────────────────────────────
     google_client_id: str = ""
     google_client_secret: str = ""
     google_redirect_uri: str = "http://localhost:8000/api/google/callback"
-    # Fernet key for encrypting stored OAuth tokens. No default on purpose —
-    # generate one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Fernet key for encrypting stored OAuth tokens (Google *and* Instagram).
+    # No default on purpose — generate one with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # GOOGLE_TOKEN_ENCRYPTION_KEY is the historical name and still works; see
+    # the validator below, which mirrors whichever one is set.
+    token_encryption_key: str = ""
     google_token_encryption_key: str = ""
+    # Previous keys, newest first. Set after rotating so MultiFernet can still
+    # decrypt ciphertext written under the old key. Comma-separated.
+    token_encryption_previous_keys: str = ""
     frontend_url: str = "http://localhost:3000"
     default_timezone: str = "Asia/Kolkata"
 
@@ -94,6 +204,81 @@ class Settings(BaseSettings):
     app_version: str = "1.0.0"
     log_level: str = "INFO"
     cors_origins: str = "*"  # comma-separated in prod
+
+    # ── Derived helpers ───────────────────────────────────────
+
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
+    @property
+    def sync_database_url(self) -> str:
+        """The same database over psycopg, for Celery workers.
+
+        Workers are synchronous; handing them the asyncpg engine would mean an
+        ``asyncio.run()`` per task and a fresh event loop per connection.
+        """
+        return self.database_url.replace("+asyncpg", "+psycopg")
+
+    @property
+    def cookie_secure(self) -> bool:
+        """Secure cookies everywhere except plain-http local development."""
+        return self.is_production
+
+    @property
+    def cookie_prefix(self) -> str:
+        """``__Host-`` in production, bare names in development.
+
+        The ``__Host-`` prefix is the strongest binding a cookie can have (exact
+        host, no Domain, Path=/, Secure) but the browser rejects it over plain
+        http, which is what localhost serves.
+        """
+        return "__Host-" if self.is_production else ""
+
+    @property
+    def resolved_token_encryption_key(self) -> str:
+        """TOKEN_ENCRYPTION_KEY, falling back to the historical Google name."""
+        return self.token_encryption_key or self.google_token_encryption_key
+
+    @property
+    def previous_encryption_keys(self) -> list[str]:
+        return [
+            k.strip()
+            for k in self.token_encryption_previous_keys.split(",")
+            if k.strip()
+        ]
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @model_validator(mode="after")
+    def _mirror_encryption_key_aliases(self) -> "Settings":
+        """Keep the old and new encryption-key names in sync.
+
+        Existing deployments set GOOGLE_TOKEN_ENCRYPTION_KEY. The key now
+        protects Instagram tokens too, so the setting was renamed — but silently
+        dropping the old name would make every stored Google credential
+        undecryptable, forcing a reconnect.
+        """
+        resolved = self.token_encryption_key or self.google_token_encryption_key
+        if resolved:
+            object.__setattr__(self, "token_encryption_key", resolved)
+            object.__setattr__(self, "google_token_encryption_key", resolved)
+        return self
+
+    @model_validator(mode="after")
+    def _mirror_image_output_dir_alias(self) -> "Settings":
+        """Honour the pre-Gemini COMFY_OUTPUT_DIR name.
+
+        The setting outlived ComfyUI itself — it is just "where renders land" —
+        so an environment that still sets the old name keeps pointing at the
+        same mounted volume instead of falling back to the in-repo default.
+        """
+        resolved = self.comfy_output_dir or self.image_output_dir
+        object.__setattr__(self, "image_output_dir", resolved)
+        object.__setattr__(self, "comfy_output_dir", resolved)
+        return self
 
     @model_validator(mode="after")
     def _reject_insecure_production_config(self) -> "Settings":
@@ -113,9 +298,26 @@ class Settings(BaseSettings):
             problems.append("SECRET_KEY is shorter than 32 characters")
         if "*" in self.cors_origins:
             problems.append("CORS_ORIGINS must list explicit origins, not '*'")
-        if self.google_client_id and not self.google_token_encryption_key:
+        if self.google_client_id and not self.resolved_token_encryption_key:
             problems.append(
-                "GOOGLE_TOKEN_ENCRYPTION_KEY must be set when Google OAuth is configured"
+                "TOKEN_ENCRYPTION_KEY must be set when Google OAuth is configured"
+            )
+
+        # Sessions are cookie-based. Without a real signing key, a forged access
+        # token is accepted; without Secure cookies over the tunnel, the session
+        # travels in cleartext to anything on the path.
+        if self.database_url.startswith("sqlite"):
+            problems.append("DATABASE_URL still points at SQLite")
+        if "postgresql+asyncpg" not in self.database_url:
+            problems.append("DATABASE_URL must use the postgresql+asyncpg driver")
+
+        # An in-process fallback runs a multi-minute pipeline inside an API
+        # worker. Behind Cloudflare's ~100s proxy timeout that is a guaranteed
+        # 524 *and* a blocked worker.
+        if self.allow_inprocess_fallback:
+            problems.append(
+                "ALLOW_INPROCESS_FALLBACK must be false in production; "
+                "run a Celery worker for every queue instead"
             )
 
         if problems:

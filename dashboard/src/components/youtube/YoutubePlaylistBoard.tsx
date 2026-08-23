@@ -15,6 +15,7 @@ import {
   Plus,
   Loader2,
 } from "lucide-react";
+import { ApiError, request } from "@/lib/apiClient";
 import {
   playlistItemsApi,
   PRODUCTION_STATUSES,
@@ -23,16 +24,7 @@ import {
   YoutubePlaylistItem,
 } from "@/lib/youtubePlaylistItemsApi";
 
-const BASE = "http://localhost:8000/api/youtube-analytics";
-
-function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = {};
-  if (typeof window !== "undefined") {
-    const t = window.localStorage.getItem("token");
-    if (t) h["Authorization"] = `Bearer ${t}`;
-  }
-  return h;
-}
+const BASE = "/youtube-analytics";
 
 interface Playlist {
   id: string;
@@ -83,29 +75,27 @@ export default function YoutubePlaylistBoard() {
     setStatus("loading");
     setErrorMsg("");
     try {
-      const res = await fetch(`${BASE}/playlists`, { headers: authHeaders() });
-      if (res.status === 403) {
-        setStatus("need_reconnect");
-        return;
-      }
-      if (res.status === 401 || res.status === 400) {
-        const b = await res.json().catch(() => ({}));
-        setErrorMsg(b.detail || "");
-        setStatus("need_connect");
-        return;
-      }
-      if (!res.ok) {
-        const b = await res.json().catch(() => ({}));
-        setErrorMsg(b.detail || `Failed (${res.status})`);
-        setStatus("error");
-        return;
-      }
-      const data = await res.json();
+      const data = await request<{
+        channel_title?: string;
+        uploads_playlist_id?: string;
+        playlists?: Playlist[];
+      }>(`${BASE}/playlists`);
       setChannelTitle(data.channel_title || "");
       setUploadsId(data.uploads_playlist_id || "");
       setPlaylists(data.playlists || []);
       setStatus("ready");
     } catch (e) {
+      if (e instanceof ApiError) {
+        if (e.status === 403) {
+          setStatus("need_reconnect");
+          return;
+        }
+        if (e.status === 401 || e.status === 400) {
+          setErrorMsg(e.message);
+          setStatus("need_connect");
+          return;
+        }
+      }
       setErrorMsg(e instanceof Error ? e.message : "Request failed");
       setStatus("error");
     }
@@ -117,13 +107,11 @@ export default function YoutubePlaylistBoard() {
 
   const connectGoogle = async () => {
     try {
-      const res = await fetch(`http://localhost:8000/api/google/authorize`, { headers: authHeaders() });
-      if (res.ok) {
-        const { authorization_url } = await res.json();
-        if (authorization_url) window.location.href = authorization_url;
-      } else {
-        setErrorMsg("Could not start Google authorization.");
-      }
+      const { authorization_url } = await request<{ authorization_url?: string }>(
+        "/google/authorize"
+      );
+      if (authorization_url) window.location.href = authorization_url;
+      else setErrorMsg("Could not start Google authorization.");
     } catch {
       setErrorMsg("Could not start Google authorization.");
     }
@@ -243,11 +231,10 @@ function BoardCard({ playlist, isUploads = false }: { playlist: Playlist; isUplo
     if (next && videos === null) {
       setVideosLoading(true);
       try {
-        const res = await fetch(
+        const data = await request<Video[]>(
           `${BASE}/playlist-videos?playlist_id=${encodeURIComponent(playlist.id)}&limit=10`,
-          { headers: authHeaders() },
         );
-        setVideos(res.ok ? await res.json() : []);
+        setVideos(data);
       } catch {
         setVideos([]);
       } finally {

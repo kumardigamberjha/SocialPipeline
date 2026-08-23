@@ -396,7 +396,7 @@
   }
   .copy-btn:hover { background: rgba(0,229,200,0.2); }
 
-  .comfy-payload {
+  .api-payload {
     background: var(--surface2);
     border: 1px solid var(--border);
     border-radius: 10px;
@@ -427,7 +427,7 @@
   <div class="logo">Wings of AI <span>/ Instagram Template</span></div>
   <div class="header-actions">
     <button class="btn btn-ghost" onclick="resetDefaults()">Reset</button>
-    <button class="btn btn-export" onclick="copyComfyPayload()">Export to ComfyUI</button>
+    <button class="btn btn-export" onclick="copyApiPayload()">Export Gemini payload</button>
   </div>
 </header>
 
@@ -505,7 +505,7 @@
 
   <!-- RIGHT PANEL: Prompt Output -->
   <div class="panel">
-    <div class="panel-title">ComfyUI Prompt</div>
+    <div class="panel-title">Image Prompt</div>
 
     <div class="section">
       <div class="prompt-label">
@@ -522,10 +522,10 @@
 
     <div class="section">
       <div class="prompt-label">
-        <span class="section-label">ComfyUI JSON Payload</span>
-        <button class="copy-btn" onclick="copyComfyPayload()">Copy</button>
+        <span class="section-label">Gemini JSON Payload</span>
+        <button class="copy-btn" onclick="copyApiPayload()">Copy</button>
       </div>
-      <div class="comfy-payload" id="comfy-payload"></div>
+      <div class="api-payload" id="api-payload"></div>
     </div>
 
     <div class="section">
@@ -534,8 +534,8 @@
         Width: <span style="color: var(--accent3)">1080px</span><br>
         Height: <span style="color: var(--accent3)">1350px</span><br>
         Ratio: <span style="color: var(--accent3)">4:5 (Instagram)</span><br>
-        Steps: <span style="color: var(--accent3)">4 (SDXL-Turbo)</span><br>
-        CFG: <span style="color: var(--accent3)">1.0</span>
+        Model: <span style="color: var(--accent3)">gemini-3.1-flash-image</span><br>
+        Size: <span style="color: var(--accent3)">2K</span>
       </div>
     </div>
   </div>
@@ -780,7 +780,7 @@ function render() {
   updatePrompt(v);
 }
 
-// ─── Build ComfyUI prompt ─────────────────────────────────
+// ─── Build image prompt + Gemini payload ──────────────────
 function updatePrompt(v) {
   const { p, l, headline, subtext, badge, brand } = v;
 
@@ -811,6 +811,8 @@ function updatePrompt(v) {
   document.getElementById('prompt-output').textContent = prompt;
   document.getElementById('neg-prompt-output').textContent = negPrompt;
 
+  // ComfyUI SDXL-Turbo workflow — retired along with the local GPU path.
+  /*
   const payload = {
     prompt: {
       "3": { class_type: "KSampler", inputs: { seed: Math.floor(Math.random()*999999), steps: 4, cfg: 1.0, sampler_name: "euler_ancestral", scheduler: "karras", denoise: 1.0, model: ["4",0], positive: ["6",0], negative: ["7",0], latent_image: ["5",0] } },
@@ -822,8 +824,20 @@ function updatePrompt(v) {
       "9": { class_type: "SaveImage", inputs: { images: ["8",0], filename_prefix: `wings_ai_instagram_${Date.now()}` } }
     }
   };
+  */
 
-  document.getElementById('comfy-payload').textContent = JSON.stringify(payload, null, 2);
+  // Gemini generateContent body. Gemini takes no separate negative prompt, so
+  // the exclusions ride along inside the positive prompt — the same thing
+  // app/services/gemini_image_client.py does server-side.
+  const payload = {
+    contents: [{ parts: [{ text: `${prompt}. Do not render any of the following: ${negPrompt}.` }] }],
+    generationConfig: {
+      responseModalities: ["TEXT", "IMAGE"],
+      responseFormat: { image: { aspectRatio: "4:5", imageSize: "2K" } }
+    }
+  };
+
+  document.getElementById('api-payload').textContent = JSON.stringify(payload, null, 2);
 }
 
 // ─── Copy helpers ─────────────────────────────────────────
@@ -831,9 +845,9 @@ function copyPrompt() {
   navigator.clipboard.writeText(document.getElementById('prompt-output').textContent);
   showToast('Prompt copied!');
 }
-function copyComfyPayload() {
-  navigator.clipboard.writeText(document.getElementById('comfy-payload').textContent);
-  showToast('ComfyUI payload copied!');
+function copyApiPayload() {
+  navigator.clipboard.writeText(document.getElementById('api-payload').textContent);
+  showToast('Gemini payload copied!');
 }
 
 function showToast(msg) {

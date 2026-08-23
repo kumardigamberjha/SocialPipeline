@@ -1,11 +1,17 @@
 """
-Pydantic models representing Supabase database tables for type safety and fast serialization.
+Pydantic DTOs used as FastAPI request/response models.
+
+The SQLAlchemy schema lives in :mod:`app.db.tables`. This module used to also
+carry a second, parallel ORM (``UserORM`` / ``OAuthTokenORM`` over ``users_auth``
+and ``oauth_tokens``) that nothing ever read or wrote, plus a module-level
+``create_all()`` that opened a SQLite file as an import side effect. Both are
+gone; only the Pydantic models remain.
 """
 
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
 from datetime import datetime
-import uuid
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
 
 # ── 1. Users ──
 class UserCreate(BaseModel):
@@ -115,4 +121,7 @@ class YoutubePublishedVideoCreate(BaseModel):
 
 class YoutubePublishedVideo(YoutubePublishedVideoCreate):
     pass
+
+
+# ── ORM: User ────────────────────────────────────────────────────────────────
 

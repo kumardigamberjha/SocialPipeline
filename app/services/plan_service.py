@@ -16,8 +16,12 @@ from 'pending' to 'script_generated'.
 import logging
 
 from fastapi import BackgroundTasks, HTTPException
+from sqlalchemy import update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import queries
+from app.db.tables import BlogPost, LinkedinPost, YoutubeScript
+from app.models.planner import VIDEO_PLATFORMS
 from app.services.dispatch import (
     CONTENT_LOOKUP,
     CONTENT_TYPES,
@@ -34,57 +38,68 @@ _CONTENT_LOOKUP = CONTENT_LOOKUP
 # ── Reconciliation ───────────────────────────────────────────────────────────
 
 
-def reconcile_plan_item_content(content: dict) -> dict:
+async def reconcile_plan_item_content(session: AsyncSession, content: dict) -> dict:
     """Advance a 'generating' content row from its run's terminal state.
     Returns the (possibly updated) row."""
     if content["review_status"] != "generating" or not content.get("run_id"):
         return content
 
-    run = queries.get_run_by_id(content["run_id"])
+    user_id = content["user_id"]
+    run = await queries.get_run_by_id(session, content["run_id"], user_id)
     if not run or run["status"] in ("pending", "running"):
         return content
 
     if run["status"] == "failed":
-        queries.update_plan_item_content(content["id"], review_status="failed")
+        await queries.update_plan_item_content(session, content["id"], user_id, review_status="failed")
         content["review_status"] = "failed"
         return content
 
     # run completed — link the produced content row
-    rows = _CONTENT_LOOKUP[content["content_type"]](content["run_id"])
+    rows = await _CONTENT_LOOKUP[content["content_type"]](session, content["run_id"], user_id)
     if not rows:
         # Completed run but no saved row (should not happen) — surface as failed.
-        queries.update_plan_item_content(content["id"], review_status="failed")
+        await queries.update_plan_item_content(session, content["id"], user_id, review_status="failed")
         content["review_status"] = "failed"
         return content
 
     ref_id = rows[-1]["id"]
-    queries.update_plan_item_content(content["id"], content_ref_id=ref_id, review_status="ready")
+    await queries.update_plan_item_content(session, content["id"], user_id,
+                                           content_ref_id=ref_id, review_status="ready")
     content["content_ref_id"] = ref_id
     content["review_status"] = "ready"
 
     if content["content_type"] == "youtube_script":
-        item = queries.get_plan_item_by_id(content["item_id"], content["user_id"])
-        if item and item["production_status"] == "pending":
-            queries.update_plan_item(item["id"], content["user_id"], production_status="script_generated")
+        item = await queries.get_plan_item_by_id(session, content["item_id"], user_id)
+        # Only advance items that actually run the video pipeline: on any other
+        # platform 'script_generated' is not a column the board can render, so a
+        # stray generation would make the card disappear from its Kanban.
+        if (
+            item
+            and item["production_status"] == "pending"
+            and (item.get("platform") or "youtube") in VIDEO_PLATFORMS
+        ):
+            await queries.update_plan_item(session, item["id"], user_id,
+                                           production_status="script_generated")
 
     return content
 
 
-def get_item_contents_reconciled(item_id: str, user_id: str) -> list[dict]:
-    return [reconcile_plan_item_content(c) for c in queries.get_plan_item_contents(item_id, user_id)]
+async def get_item_contents_reconciled(session: AsyncSession, item_id: str, user_id: str) -> list[dict]:
+    contents = await queries.get_plan_item_contents(session, item_id, user_id)
+    return [await reconcile_plan_item_content(session, c) for c in contents]
 
 
-def get_plan_detail(plan_id: str, user_id: str) -> dict | None:
+async def get_plan_detail(session: AsyncSession, plan_id: str, user_id: str) -> dict | None:
     """Plan + items + reconciled content summaries — the planner UI's main read."""
-    plan = queries.get_content_plan_by_id(plan_id, user_id)
+    plan = await queries.get_content_plan_by_id(session, plan_id, user_id)
     if not plan:
         return None
-    items = queries.get_plan_items(plan_id, user_id)
+    items = await queries.get_plan_items(session, plan_id, user_id)
     for item in items:
-        item["contents"] = get_item_contents_reconciled(item["id"], user_id)
+        item["contents"] = await get_item_contents_reconciled(session, item["id"], user_id)
         # Reconciliation may have advanced production_status — re-read cheaply.
         if any(c["content_type"] == "youtube_script" and c["review_status"] == "ready" for c in item["contents"]):
-            fresh = queries.get_plan_item_by_id(item["id"], user_id)
+            fresh = await queries.get_plan_item_by_id(session, item["id"], user_id)
             if fresh:
                 item["production_status"] = fresh["production_status"]
     plan["items"] = items
@@ -94,7 +109,7 @@ def get_plan_detail(plan_id: str, user_id: str) -> dict | None:
 # ── Content hydration (review modal) ─────────────────────────────────────────
 
 
-def hydrate_content(content: dict) -> dict:
+async def hydrate_content(session: AsyncSession, content: dict) -> dict:
     """Attach title/body from the source table to a plan_item_content row."""
     hydrated = dict(content)
     hydrated["title"] = None
@@ -105,14 +120,14 @@ def hydrate_content(content: dict) -> dict:
         return hydrated
 
     if content["content_type"] == "linkedin":
-        row = queries.get_linkedin_post_by_id(ref_id, user_id)
+        row = await queries.get_linkedin_post_by_id(session, ref_id, user_id)
         if row:
             hydrated["title"] = row["hook"]
             hydrated["body"] = row["post_text"]
             hydrated["meta"] = {"word_count": row["word_count"], "hashtag_count": row["hashtag_count"],
                                 "angle_type": row["angle_type"], "pipeline_approved": bool(row["approved"])}
     elif content["content_type"] == "blog":
-        row = queries.get_blog_by_id(ref_id, user_id)
+        row = await queries.get_blog_by_id(session, ref_id, user_id)
         if row:
             hydrated["title"] = row["title"]
             hydrated["body"] = row["content"]
@@ -120,7 +135,7 @@ def hydrate_content(content: dict) -> dict:
                                 "reading_time_minutes": row["reading_time_minutes"],
                                 "pipeline_approved": bool(row["approved"])}
     elif content["content_type"] == "youtube_script":
-        row = queries.get_youtube_script_by_id(ref_id, user_id)
+        row = await queries.get_youtube_script_by_id(session, ref_id, user_id)
         if row:
             hydrated["title"] = row["title"]
             hydrated["body"] = row["script"]
@@ -130,41 +145,53 @@ def hydrate_content(content: dict) -> dict:
     return hydrated
 
 
-def set_source_approved(content: dict, approved: bool) -> None:
+# Content type -> the table holding the body. A mapped class, not an
+# interpolated table name: the previous version built the UPDATE with an
+# f-string, which only stayed safe because the key came from a literal dict.
+_SOURCE_MODEL = {
+    "linkedin": LinkedinPost,
+    "blog": BlogPost,
+    "youtube_script": YoutubeScript,
+}
+
+
+async def set_source_approved(session: AsyncSession, content: dict, approved: bool) -> None:
     """Persist the human decision on the underlying content table too."""
     ref_id = content.get("content_ref_id")
     if not ref_id:
         return
-    table = {"linkedin": "linkedin_posts", "blog": "blog_posts", "youtube_script": "youtube_scripts"}[content["content_type"]]
-    db = queries.get_db()
-    db.execute(f"UPDATE {table} SET approved = ? WHERE id = ? AND user_id = ?",
-               (1 if approved else 0, ref_id, content["user_id"]))
-    db.commit()
+    model = _SOURCE_MODEL[content["content_type"]]
+    await session.execute(
+        update(model)
+        .where(model.id == ref_id, model.user_id == content["user_id"])
+        .values(approved=approved)
+    )
 
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 
 
-def _remaining_quota(user_id: str) -> int:
-    queries.reset_usage_if_expired(user_id)
-    usage = queries.get_usage(user_id)
+async def _remaining_quota(session: AsyncSession, user_id: str) -> int:
+    await queries.reset_usage_if_expired(session, user_id)
+    usage = await queries.get_usage(session, user_id)
     if not usage:
-        queries.init_usage(user_id)
-        usage = queries.get_usage(user_id)
+        await queries.init_usage(session, user_id)
+        usage = await queries.get_usage(session, user_id)
     if not usage:
         return 0
     return max(0, usage["max_runs_per_month"] - usage["runs_this_month"])
 
 
-def dispatch_item_content(item: dict, content_type: str, provider: str, niche: str,
-                          background_tasks: BackgroundTasks) -> dict:
+async def dispatch_item_content(session: AsyncSession, item: dict, content_type: str,
+                                provider: str, niche: str,
+                                background_tasks: BackgroundTasks) -> dict:
     """Create a run + plan_item_content link and dispatch one pipeline.
     Returns {content_type, run_id, content_id}."""
     user_id = item["user_id"]
     topic = item["topic"]
-    run = queries.create_run(user_id, topic, provider)
+    run = await queries.create_run(session, user_id, topic, provider)
     run_id = run["id"]
-    content = queries.create_plan_item_content(item["id"], user_id, content_type, run_id)
+    content = await queries.create_plan_item_content(session, item["id"], user_id, content_type, run_id)
 
     dispatch_pipeline(
         content_type=content_type,
@@ -180,14 +207,113 @@ def dispatch_item_content(item: dict, content_type: str, provider: str, niche: s
     return {"content_type": content_type, "run_id": run_id, "content_id": content["id"]}
 
 
-def dispatch_generation(item: dict, content_type: str, provider: str, niche: str,
-                        background_tasks: BackgroundTasks) -> list[dict]:
+async def dispatch_generation(session: AsyncSession, item: dict, content_type: str,
+                              provider: str, niche: str,
+                              background_tasks: BackgroundTasks) -> list[dict]:
     """Dispatch one content type or all three, gating on remaining quota upfront."""
     types = list(CONTENT_TYPES) if content_type == "all" else [content_type]
-    remaining = _remaining_quota(item["user_id"])
+    remaining = await _remaining_quota(session, item["user_id"])
     if remaining < len(types):
         raise HTTPException(
             status_code=429,
             detail=f"Not enough runs left this month: need {len(types)}, have {remaining}. Nothing was dispatched.",
         )
-    return [dispatch_item_content(item, t, provider, niche, background_tasks) for t in types]
+    return [
+        await dispatch_item_content(session, item, t, provider, niche, background_tasks)
+        for t in types
+    ]
+
+
+# ── Shared router logic ──────────────────────────────────────────────────────
+#
+# These two lived inside app/routers/planner.py as handler-local code. They moved
+# here when the assistant gained the ability to perform the same operations: a
+# FastAPI handler cannot be called in-process (its signature is Depends-shaped)
+# and an internal HTTP call would have to forge auth cookies and CSRF, so the
+# only honest way to share the behaviour is to share the function. The routers
+# import them back under their original names, so their call sites are unchanged.
+
+
+async def sync_calendar_event(
+    session: AsyncSession, plan_id: str, item: dict, user_id: str
+) -> None:
+    """Best-effort push of item changes to its Google Calendar event.
+
+    Never fails the edit: on a missing event the local link is cleared; other
+    errors are logged. A reschedule that silently fails to move the calendar
+    event is the most damaging failure mode this code has, which is exactly why
+    there must be only one copy of the recovery logic.
+    """
+    import asyncio
+
+    from app.services import google_calendar
+
+    plan = await queries.get_content_plan_by_id(session, plan_id, user_id)
+    try:
+        # Blocking HTTPS call to Google — off the event loop, or it stalls every
+        # other request in this worker for the round trip.
+        await asyncio.to_thread(
+            google_calendar.update_event_for_item,
+            user_id, item, plan["name"] if plan else "Content plan",
+        )
+    except google_calendar.EventGoneError:
+        logger.info("Calendar event for item %s was deleted in Google; clearing link.", item["id"])
+        await queries.clear_plan_item_calendar_event(session, item["id"], user_id)
+    except google_calendar.CalendarError as exc:
+        # Includes NotConnectedError — the edit still saved locally.
+        logger.warning("Calendar sync failed for item %s: %s", item["id"], exc)
+
+
+async def apply_review(
+    session: AsyncSession,
+    content: dict,
+    action: str,
+    regenerate: bool = False,
+    provider: str | None = None,
+    background_tasks: BackgroundTasks | None = None,
+) -> dict:
+    """Persist a human review decision, optionally re-dispatching generation.
+
+    ``content`` must already be reconciled by the caller — judging review state
+    from a stale 'generating' row is the most likely wrong answer this path can
+    give.
+
+    ``provider=None`` resolves the provider from the run that produced the
+    rejected draft, so a regenerate reuses whatever tier wrote the original.
+    That fallback is the main reason this is shared rather than reimplemented:
+    a second copy would quietly regress to always-'nvidia'.
+
+    Returns ``{"content": ..., "dispatched": [...]}`` — 'dispatched' only on a
+    reject-and-regenerate. Raises HTTPException(409) when the row is not
+    reviewable, and lets dispatch_generation's HTTPException(429) propagate.
+    """
+    if content["review_status"] not in ("ready", "approved", "rejected"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Content is not reviewable (status: {content['review_status']})",
+        )
+
+    user_id = content["user_id"]
+    new_status = "approved" if action == "approve" else "rejected"
+    await queries.update_plan_item_content(
+        session, content["id"], user_id, review_status=new_status
+    )
+    await set_source_approved(session, content, action == "approve")
+    content["review_status"] = new_status
+
+    result: dict = {"content": content}
+    if action == "reject" and regenerate and background_tasks is not None:
+        item = await queries.get_plan_item_by_id(session, content["item_id"], user_id)
+        plan = (
+            await queries.get_content_plan_by_id(session, item["plan_id"], user_id)
+        ) if item else None
+        if item:
+            run = (
+                await queries.get_run_by_id(session, content["run_id"], user_id)
+            ) if content.get("run_id") else None
+            resolved_provider = provider or (run and run.get("provider_used")) or "nvidia"
+            result["dispatched"] = await dispatch_generation(
+                session, item, content["content_type"], resolved_provider,
+                (plan or {}).get("niche") or "ai", background_tasks,
+            )
+    return result

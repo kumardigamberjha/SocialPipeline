@@ -11,8 +11,13 @@ Tier limits:
 """
 
 import logging
-from datetime import datetime, timezone
+from datetime import timedelta
+
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.db import queries
+from app.db.tables import AgentRun
 
 logger = logging.getLogger(__name__)
 
@@ -23,23 +28,21 @@ TIER_LIMITS = {
 }
 
 
-def check_and_increment(user_id: str) -> tuple[bool, str]:
+async def check_and_increment(session: AsyncSession, user_id: str) -> tuple[bool, str]:
     """
     Check if the user is within their tier limits. If yes, increment the
     monthly counter and return (True, ""). If no, return (False, reason).
 
-    For the dummy/anonymous user_id, always allows (no enforcement).
+    There is no longer an anonymous exemption: the dummy user that this used to
+    wave through no longer exists, and every caller now arrives authenticated.
     """
-    if user_id == "00000000-0000-0000-0000-000000000000":
-        return True, ""
-
     try:
-        queries.reset_usage_if_expired(user_id)
-        usage = queries.get_usage(user_id)
+        await queries.reset_usage_if_expired(session, user_id)
+        usage = await queries.get_usage(session, user_id)
 
         if not usage:
-            queries.init_usage(user_id)
-            usage = queries.get_usage(user_id)
+            await queries.init_usage(session, user_id)
+            usage = await queries.get_usage(session, user_id)
 
         if not usage:
             return True, ""
@@ -59,7 +62,7 @@ def check_and_increment(user_id: str) -> tuple[bool, str]:
         # Check hourly limit
         max_hourly = limits["max_per_hour"]
         if max_hourly is not None:
-            hourly_count = _count_recent_runs_sqlite(user_id, hours=1)
+            hourly_count = await _count_recent_runs(session, user_id, hours=1)
             if hourly_count >= max_hourly:
                 return False, (
                     f"Hourly rate limit reached ({hourly_count}/{max_hourly} runs/hour). "
@@ -67,25 +70,30 @@ def check_and_increment(user_id: str) -> tuple[bool, str]:
                 )
 
         # Increment the counter
-        queries.increment_usage(user_id)
+        await queries.increment_usage(session, user_id)
         return True, ""
 
     except Exception as e:
         logger.error("Usage check failed: %s", e)
-        # Fail-open: allow the request if the check itself errors
+        # Fail-open: a broken quota check must not take the product down. This
+        # is a billing control, not a security control — authentication and
+        # tenant scoping are enforced elsewhere and never fail open.
         return True, ""
 
 
-def _count_recent_runs_sqlite(user_id: str, hours: int = 1) -> int:
-    """Count agent_runs created within the last N hours for this user in SQLite."""
-    from app.db.database import get_db
+async def _count_recent_runs(
+    session: AsyncSession, user_id: str, hours: int = 1
+) -> int:
+    """Count agent_runs created within the last N hours for this user."""
     try:
-        db = get_db()
-        cursor = db.execute(
-            "SELECT COUNT(*) FROM agent_runs WHERE user_id = ? AND created_at >= datetime('now', ?)",
-            (user_id, f"-{hours} hours")
-        )
-        return cursor.fetchone()[0]
+        cutoff = func.now() - timedelta(hours=hours)
+        return (
+            await session.execute(
+                select(func.count())
+                .select_from(AgentRun)
+                .where(AgentRun.user_id == user_id, AgentRun.created_at >= cutoff)
+            )
+        ).scalar_one()
     except Exception as e:
         logger.error("Failed to count recent runs: %s", e)
         return 0

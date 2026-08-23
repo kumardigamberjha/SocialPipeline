@@ -4,8 +4,11 @@
  * ideas attached to a real YouTube playlist id — the real playlist is never written to.
  */
 
-const BACKEND_URL = "http://localhost:8000";
-const API_BASE = `${BACKEND_URL}/api/youtube-playlists`;
+import { request as apiRequest } from "@/lib/apiClient";
+
+// This module's routes live under /api/youtube-playlists rather than /api
+// directly, so every call below prefixes this onto the shared apiClient path.
+const BASE = "/youtube-playlists";
 
 export type VideoFormat = "short" | "full";
 export type ProductionStatus =
@@ -61,31 +64,8 @@ export interface UpdateItemPayload {
   production_status?: ProductionStatus;
 }
 
-function authHeaders(): Record<string, string> {
-  const headers: Record<string, string> = { "Content-Type": "application/json" };
-  if (typeof window !== "undefined") {
-    const token = window.localStorage.getItem("token");
-    if (token) headers["Authorization"] = `Bearer ${token}`;
-  }
-  return headers;
-}
-
-async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: { ...authHeaders(), ...(options.headers || {}) },
-  });
-  if (!res.ok) {
-    let detail = `Request failed (${res.status})`;
-    try {
-      const data = await res.json();
-      if (data?.detail) detail = typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail);
-    } catch {
-      /* non-JSON error body */
-    }
-    throw new Error(detail);
-  }
-  return res.json();
+function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  return apiRequest<T>(`${BASE}${path}`, options);
 }
 
 export const playlistItemsApi = {
