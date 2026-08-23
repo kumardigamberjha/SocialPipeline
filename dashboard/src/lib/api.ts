@@ -2,8 +2,7 @@
  * Simple API client for the Wings of AI backend.
  */
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_API || "http://localhost:8000";
-const API_BASE_URL = `${BACKEND_URL}/api`;
+import { request } from "@/lib/apiClient";
 
 export interface HealthResponse {
   status: string;
@@ -22,22 +21,13 @@ export interface GenerateResponse {
 }
 
 export const api = {
-  async getHealth(): Promise<HealthResponse> {
-    const response = await fetch(`${API_BASE_URL}/health`);
-    if (!response.ok) throw new Error("Backend health check failed");
-    return response.json();
-  },
+  // Public endpoint — no session required, so it's exempt from the
+  // apiClient's 401 -> refresh -> redirect cycle (there's no session to lose).
+  getHealth: () => request<HealthResponse>("/health", { skipAuthRetry: true }),
 
-  async generateContent(topic: string, provider: string = "ollama"): Promise<GenerateResponse> {
-    const response = await fetch(`${API_BASE_URL}/generate`, {
+  generateContent: (topic: string, provider: string = "ollama") =>
+    request<GenerateResponse>("/generate", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ topic, provider }),
-    });
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.detail || "Generation failed");
-    }
-    return response.json();
-  },
+    }),
 };

@@ -1,30 +1,68 @@
 "use client";
 
-import { Activity, Radio, Users } from "lucide-react";
+import { Activity, LogOut, Radio, Users } from "lucide-react";
 import { motion } from "framer-motion";
+import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { api, HealthResponse } from "@/lib/api";
+import { useAuth } from "@/lib/auth/AuthContext";
+
+const NAV_LINKS = [
+  { href: "/", label: "Nexus" },
+  { href: "/assistant", label: "Assistant" },
+  { href: "/topics", label: "Topics" },
+  { href: "/planner", label: "Planner" },
+  { href: "/youtube-analysis", label: "YouTube" },
+  { href: "/instagram-analysis", label: "Instagram" },
+  { href: "/personal-intelligence", label: "Intelligence" },
+];
 
 export default function Header() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [isOnline, setIsOnline] = useState(false);
+  const pathname = usePathname();
+  const { user, logout } = useAuth();
+  const router = useRouter();
+
+  async function handleLogout() {
+    await logout();
+    router.replace("/login");
+  }
 
   useEffect(() => {
-    const checkHealth = async () => {
+    let isMounted = true;
+    let timerId: NodeJS.Timeout | null = null;
+
+    const checkHealth = async (retries = 2, delay = 1500) => {
       try {
-        console.log("Checking backend health...");
         const data = await api.getHealth();
-        console.log("Health check success:", data);
-        setHealth(data);
-        setIsOnline(true);
+        if (isMounted) {
+          setHealth(data);
+          setIsOnline(true);
+        }
       } catch (err) {
-        console.error("Health check failed:", err);
-        setIsOnline(false);
+        if (isMounted && retries > 0) {
+          timerId = setTimeout(() => {
+            if (isMounted) checkHealth(retries - 1, delay * 1.5);
+          }, delay);
+          return;
+        }
+        if (isMounted) {
+          console.warn("Backend health check failed:", err);
+          setIsOnline(false);
+        }
       }
     };
+
     checkHealth();
-    const interval = setInterval(checkHealth, 30000);
-    return () => clearInterval(interval);
+    const interval = setInterval(() => checkHealth(1, 1000), 30000);
+
+    return () => {
+      isMounted = false;
+      if (timerId) clearTimeout(timerId);
+      clearInterval(interval);
+    };
   }, []);
 
   return (
@@ -52,6 +90,27 @@ export default function Header() {
             </p>
           </div>
         </div>
+
+        {/* Center — Navigation */}
+        <nav className="flex items-center gap-1 rounded-lg border border-white/5 bg-white/[0.02] p-1">
+          {NAV_LINKS.map(({ href, label }) => {
+            // "/planner" stays active on its sub-pages (e.g. /planner-analysis).
+            const isActive = href === "/" ? pathname === "/" : pathname.startsWith(href);
+            return (
+              <Link
+                key={href}
+                href={href}
+                className={`text-xs px-3 py-1.5 rounded-md uppercase tracking-wider transition-colors ${
+                  isActive
+                    ? "bg-blue-600/20 text-blue-300 border border-blue-500/30"
+                    : "text-slate-500 hover:text-slate-200"
+                }`}
+              >
+                {label}
+              </Link>
+            );
+          })}
+        </nav>
 
         {/* Right — Status Indicators */}
         <div className="flex items-center gap-4 sm:gap-6">
@@ -88,6 +147,43 @@ export default function Header() {
               LIVE
             </span>
           </motion.div>
+
+          {/* Separator */}
+          <div className="w-px h-5 bg-white/10 hidden sm:block" />
+
+          {/* Instagram Social Link */}
+          <a
+            href="https://instagram.com/codingindiaai"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full glass-card hover:bg-gradient-to-r hover:from-purple-600/30 hover:to-pink-600/30 border border-pink-500/20 text-xs font-mono text-pink-300 hover:text-pink-200 transition-all shadow-[0_0_12px_rgba(236,72,153,0.15)] group"
+            title="Follow Coding India AI on Instagram"
+          >
+            <svg className="w-3.5 h-3.5 text-pink-400 group-hover:scale-110 transition-transform" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect width="20" height="20" x="2" y="2" rx="5" ry="5"/>
+              <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"/>
+              <line x1="17.5" x2="17.51" y1="6.5" y2="6.5"/>
+            </svg>
+            <span className="hidden sm:inline font-semibold">@codingindiaai</span>
+          </a>
+
+          {user && (
+            <>
+              <div className="w-px h-5 bg-white/10 hidden sm:block" />
+              <div className="flex items-center gap-2">
+                <span className="hidden lg:inline text-xs font-mono text-slate-500 max-w-[10rem] truncate" title={user.email}>
+                  {user.email}
+                </span>
+                <button
+                  onClick={handleLogout}
+                  title="Sign out"
+                  className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-full glass-card hover:bg-red-500/10 border border-white/10 hover:border-red-500/30 text-xs font-mono text-slate-400 hover:text-red-300 transition-all"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            </>
+          )}
         </div>
       </div>
     </header>

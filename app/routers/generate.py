@@ -1,6 +1,9 @@
+import asyncio
 import logging
 import time
+
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import Settings, get_settings
 from app.crew import run_pipeline, run_blog_pipeline
@@ -14,6 +17,7 @@ from app.schemas import (
 )
 from app.core.auth_deps import get_current_user
 from app.db import queries
+from app.db.session import get_session
 
 logger = logging.getLogger(__name__)
 
@@ -28,33 +32,42 @@ router = APIRouter(prefix="/api", tags=["generate"])
 async def generate_content(
     body: GenerateRequest,
     settings: Settings = Depends(get_settings),
-    user: dict = Depends(get_current_user)
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> GenerateResponse:
     try:
         logger.info("POST /api/generate  ▸ topic=%r  provider=%s", body.topic, body.provider)
 
-        user_id = user['id']
-        queries.reset_usage_if_expired(user_id)
-        usage = queries.get_usage(user_id)
-        if usage and usage['runs_this_month'] >= usage['max_runs_per_month']:
+        user_id = user["id"]
+        await queries.reset_usage_if_expired(session, user_id)
+        usage = await queries.get_usage(session, user_id)
+        if usage and usage["runs_this_month"] >= usage["max_runs_per_month"]:
             raise HTTPException(status_code=429, detail="Usage limit exceeded for this billing period.")
 
         provider = body.provider or settings.default_provider
-        run = queries.create_run(user_id, body.topic, provider)
-        run_id = run['id']
-        queries.update_run_status(run_id, 'running')
-        
+        run = await queries.create_run(session, user_id, body.topic, provider)
+        run_id = run["id"]
+        await queries.update_run_status(session, run_id, user_id, "running")
+
         start = time.time()
-        
-        result = run_pipeline(
+
+        # run_pipeline is a synchronous multi-minute CrewAI kickoff. Awaited
+        # directly it froze the entire event loop — every other request in this
+        # worker, including /api/health — for the duration. Phase 4 moves this
+        # onto a queue; until then it at least runs off the loop.
+        result = await asyncio.to_thread(
+            run_pipeline,
             topic=body.topic,
             settings=settings,
             provider=body.provider,
         )
 
         duration = time.time() - start
-        queries.update_run_status(run_id, 'completed', final_result=result.output, duration=duration)
-        queries.increment_usage(user_id)
+        await queries.update_run_status(
+            session, run_id, user_id, "completed",
+            final_result=result.output, duration=duration,
+        )
+        await queries.increment_usage(session, user_id)
 
         return GenerateResponse(
             status="success",
@@ -66,16 +79,16 @@ async def generate_content(
 
     except RuntimeError as exc:
         logger.error("Pipeline runtime error: %s", exc)
-        if 'run_id' in locals():
-            queries.update_run_status(run_id, 'failed')
+        if "run_id" in locals():
+            await queries.update_run_status(session, run_id, user["id"], "failed")
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     except HTTPException:
         raise
     except Exception as exc:
         logger.exception("Unexpected error in /api/generate")
-        if 'run_id' in locals():
-            queries.update_run_status(run_id, 'failed')
+        if "run_id" in locals():
+            await queries.update_run_status(session, run_id, user["id"], "failed")
         raise HTTPException(
             status_code=500,
             detail=f"Internal server error: {type(exc).__name__}",
@@ -122,16 +135,17 @@ async def generate_blog(
     background_tasks: BackgroundTasks,
     settings: Settings = Depends(get_settings),
     user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> BlogGenerateResponse:
     user_id = user["id"]
 
-    queries.reset_usage_if_expired(user_id)
-    usage = queries.get_usage(user_id)
+    await queries.reset_usage_if_expired(session, user_id)
+    usage = await queries.get_usage(session, user_id)
     if usage and usage["runs_this_month"] >= usage["max_runs_per_month"]:
         raise HTTPException(status_code=429, detail="Usage limit exceeded for this billing period.")
 
     provider = body.provider or settings.default_provider
-    run = queries.create_run(user_id, body.topic, provider)
+    run = await queries.create_run(session, user_id, body.topic, provider)
     run_id = run["id"]
 
     logger.info("POST /api/blog/generate ▸ topic=%r provider=%s run_id=%s", body.topic, provider, run_id)
@@ -154,8 +168,9 @@ async def generate_blog(
 async def list_blog_posts(
     limit: int = 20,
     user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> list[BlogPostSummary]:
-    posts = queries.get_blog_posts(user["id"], limit=limit)
+    posts = await queries.get_blog_posts(session, user["id"], limit=limit)
     return [BlogPostSummary(**post) for post in posts]
 
 
@@ -167,8 +182,9 @@ async def list_blog_posts(
 async def get_blog_post(
     blog_id: str,
     user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> BlogPostOut:
-    post = queries.get_blog_by_id(blog_id, user["id"])
+    post = await queries.get_blog_by_id(session, blog_id, user["id"])
     if not post:
         raise HTTPException(status_code=404, detail="Blog post not found")
     return BlogPostOut(**post)
@@ -181,8 +197,9 @@ async def get_blog_post(
 async def delete_blog_post(
     blog_id: str,
     user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
 ) -> dict:
-    deleted = queries.soft_delete_blog(blog_id, user["id"])
+    deleted = await queries.soft_delete_blog(session, blog_id, user["id"])
     if not deleted:
         raise HTTPException(status_code=404, detail="Blog post not found")
     return {"status": "deleted", "id": blog_id}
@@ -193,8 +210,10 @@ async def delete_blog_post(
     response_model=BlogPostOut,
     summary="Public: get a published blog post by slug (no auth)",
 )
-async def get_public_blog(slug: str) -> BlogPostOut:
-    post = queries.get_blog_by_slug(slug)
+async def get_public_blog(
+    slug: str, session: AsyncSession = Depends(get_session)
+) -> BlogPostOut:
+    post = await queries.get_public_blog_by_slug(session, slug)
     if not post:
         raise HTTPException(status_code=404, detail="Blog post not found")
     return BlogPostOut(**post)

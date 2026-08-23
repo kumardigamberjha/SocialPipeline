@@ -19,7 +19,8 @@ import time
 from celery.exceptions import SoftTimeLimitExceeded
 
 from app.celery_app import celery_app
-from app.db import queries
+from app.db import sync_queries
+from app.db.sync_session import sync_session_scope
 from app.services.linkedin_pipeline import LinkedInPipelineOrchestrator
 
 logger = logging.getLogger(__name__)
@@ -34,12 +35,22 @@ logger = logging.getLogger(__name__)
     acks_late=True,
 )
 def run_linkedin_pipeline(self, run_id: str, topic: str, niche: str, user_id: str, provider: str):
+    # Each database touch opens its own short transaction. Holding one session
+    # open across the multi-minute pipeline would pin a Postgres connection and
+    # block autovacuum for the duration.
+    def _set_status(status: str, **kwargs):
+        with sync_session_scope() as session:
+            sync_queries.update_run_status(session, run_id, user_id, status, **kwargs)
+
     try:
-        queries.update_run_status(run_id, "running")
+        _set_status("running")
         start = time.time()
 
         def step_callback(agent_name: str, task_name: str, output: str):
-            queries.insert_task_step(run_id, agent_name, task_name, str(output))
+            with sync_session_scope() as session:
+                sync_queries.insert_task_step(
+                    session, run_id, user_id, agent_name, task_name, str(output)
+                )
 
         orchestrator = LinkedInPipelineOrchestrator(
             llm_provider=provider,
@@ -49,28 +60,36 @@ def run_linkedin_pipeline(self, run_id: str, topic: str, niche: str, user_id: st
         result = asyncio.run(orchestrator.run(topic, niche, user_id))
 
         duration = round(time.time() - start, 2)
-        queries.save_linkedin_post(
-            run_id=run_id,
-            user_id=user_id,
-            topic=topic,
-            post_text=result["post_text"],
-            hook=result["hook"],
-            angle_type=result["angle_type"],
-            word_count=result["word_count"],
-            approved=result["approved"],
-            niche=niche,
-        )
-        queries.update_run_status(run_id, "completed", final_result=result["post_text"], duration=duration)
-        queries.increment_usage(user_id)
+        # Saving the post, closing out the run and charging usage belong to one
+        # transaction: a crash between them previously left a completed run with
+        # no post, or a post the user was never billed for.
+        with sync_session_scope() as session:
+            sync_queries.save_linkedin_post(
+                session,
+                run_id=run_id,
+                user_id=user_id,
+                topic=topic,
+                post_text=result["post_text"],
+                hook=result["hook"],
+                angle_type=result["angle_type"],
+                word_count=result["word_count"],
+                approved=result["approved"],
+                niche=niche,
+            )
+            sync_queries.update_run_status(
+                session, run_id, user_id, "completed",
+                final_result=result["post_text"], duration=duration,
+            )
+            sync_queries.increment_usage(session, user_id)
         logger.info("LinkedIn pipeline DONE ▸ run_id=%s duration=%.2fs approved=%s", run_id, duration, result["approved"])
         return result
 
     except SoftTimeLimitExceeded:
         logger.error("LinkedIn pipeline TIMEOUT ▸ run_id=%s", run_id)
-        queries.update_run_status(run_id, "failed")
+        _set_status("failed")
         raise
 
     except Exception as exc:
         logger.exception("LinkedIn pipeline FAILED ▸ run_id=%s", run_id)
-        queries.update_run_status(run_id, "failed")
+        _set_status("failed")
         raise self.retry(exc=exc, countdown=10)

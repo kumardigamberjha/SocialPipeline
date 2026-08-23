@@ -1,19 +1,145 @@
-node_modules/
-.venv/
-generated_posts/
-output/
-.next/
+# ════════════════════════════════════════════════════════════
+#  Content Creator — Monorepo .gitignore
+# ════════════════════════════════════════════════════════════
 
-# Python
-__pycache__/
-*.pyc
-*.pyo
-
-# SQLite databases
-data/
-
-# Environment files
+# ── Secrets & credentials ────────────────────────────────────
 .env
-app/.env
-dashboard/.env
+.env.*
+!.env.example
+**/token*.json
+**/credentials*.json
+**/*secret*
+**/*_key.json
+google_auth_token.json
 
+# ── Python ───────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+*.cover
+
+# ── Node / Next.js (dashboard) ───────────────────────────────
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+/out/
+/build
+*.tsbuildinfo
+next-env.d.ts
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+.vercel
+
+# ── Databases & local data ───────────────────────────────────
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# ── Generated / pipeline output ────────────────────────────────
+output/
+output_videos/
+generated_posts/
+
+# Campaign rendered assets (large PNGs / images produced by build scripts)
+campaign/flyers/output/
+campaign/carousel/images/
+campaign/assets/renders/
+
+# ── Media & binary artifacts ─────────────────────────────────
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.wav
+*.mp3
+*.aac
+*.flac
+*.ogg
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.bmp
+*.tiff
+*.blend
+*.blend1
+
+# Exception: keep source/design assets that are intentionally versioned
+!campaign/assets/brand/**
+!dashboard/public/**
+improvements/
+campaign/
+output/
+research/
+
+# ── Scratch & temp files ─────────────────────────────────────
+scratch/
+*.tmp
+*.temp
+*.bak
+concat_list.txt
+
+# ── Alembic ──────────────────────────────────────────────────
+# Keep migrations, ignore auto-generated __pycache__ inside
+alembic/__pycache__/
+alembic/versions/__pycache__/
+
+# ── Docker ───────────────────────────────────────────────────
+# (docker-compose + Dockerfiles are kept — they're source)
+
+# ── OS & editor junk ─────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+*.pem
+*.key
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ── Claude / AI agent config ─────────────────────────────────
+.claude/
+
+# ── Standalone marketing site (deployed separately) ──────────
+website/
+
+# ── Misc local tooling ───────────────────────────────────────
+improvements/*.png
+start_comfy.sh
+test_music.wav
+
+build_final_synchronized_videos.py
+build_release_film.py
+
+
+
+mcp/

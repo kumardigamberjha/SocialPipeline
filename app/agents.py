@@ -13,10 +13,6 @@ from crewai import Agent, LLM
 from app.services.style_guide import NICHE_SYSTEM_PROMPT
 from app.tools.custom import (
     web_search_tool,
-    file_reader_tool,
-    code_execution_tool,
-    db_query_tool,
-    api_request_tool,
     generate_instagram_image_tool,
 )
 
@@ -141,7 +137,6 @@ def create_blog_agent(llm: LLM) -> Agent:
             "Focuses on clarity, code examples, and practical value."
         ),
         llm=llm,
-        tools=[file_reader_tool, code_execution_tool],
         verbose=True,
     )
 
@@ -168,7 +163,7 @@ def create_idea_agent(llm: LLM) -> Agent:
             "Generates creative, data-informed ideas that resonate with developers."
         ),
         llm=llm,
-        tools=[web_search_tool, api_request_tool, db_query_tool],
+        tools=[web_search_tool],
         verbose=True,
     )
 
@@ -176,7 +171,7 @@ def create_idea_agent(llm: LLM) -> Agent:
 def create_instagram_image_agent(llm: LLM) -> Agent:
     return Agent(
         role="Instagram Image Designer",
-        goal="Design and generate the visual image for an Instagram post using ComfyUI.",
+        goal="Design and generate the visual image for an Instagram post using Gemini image generation.",
         backstory=_niche_lock(
             "You are an expert Instagram visual designer. "
             "You know how to choose the right palette, layout, and style hints to generate an image that matches the given topic."
@@ -215,7 +210,7 @@ def create_longform_blog_agent(llm: LLM) -> Agent:
             "who will immediately know if you're bullshitting them."
         ),
         llm=llm,
-        tools=[file_reader_tool, code_execution_tool, web_search_tool],
+        tools=[web_search_tool],
         verbose=True,
         allow_delegation=False,
         max_iter=5,

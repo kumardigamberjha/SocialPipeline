@@ -2,6 +2,9 @@
 
 import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { request } from "@/lib/apiClient";
+import { wsOrigin } from "@/lib/config";
+import { SAVED_TOPICS_UPDATED_EVENT } from "@/lib/savedTopicsApi";
 import {
   Rocket,
   RefreshCw,
@@ -48,9 +51,9 @@ export default function ApprovalQueue({
   const modeDropdownRef = useRef<HTMLDivElement>(null);
 
   const pipelineModes = [
-    { value: "multi", label: "Full Suite", borderClass: "hover:border-blue-500/50", activeClass: "text-blue-400 bg-blue-500/10" },
-    { value: "linkedin", label: "LinkedIn Post", borderClass: "hover:border-purple-500/50", activeClass: "text-purple-400 bg-purple-500/10" },
-    { value: "blog", label: "Blog Article", borderClass: "hover:border-green-500/50", activeClass: "text-green-400 bg-green-500/10" },
+    { value: "multi", label: "Full Suite", description: "10-agent multi-platform pipeline", borderClass: "hover:border-blue-500/50", activeClass: "text-blue-400 bg-blue-500/10" },
+    { value: "linkedin", label: "LinkedIn Post", description: "Lean 4-agent LinkedIn pipeline", borderClass: "hover:border-purple-500/50", activeClass: "text-purple-400 bg-purple-500/10" },
+    { value: "blog", label: "Blog Article", description: "Long-form 5-agent blog pipeline", borderClass: "hover:border-green-500/50", activeClass: "text-green-400 bg-green-500/10" },
   ];
 
   const providers = [
@@ -84,7 +87,7 @@ export default function ApprovalQueue({
   const [generatedImages, setGeneratedImages] = useState<string[]>([]);
   const [palette, setPalette] = useState("void_purple");
   const [layout, setLayout] = useState("bottom_hero");
-  const [imageModel, setImageModel] = useState("sdxl_turbo");
+  const [imageModel, setImageModel] = useState("gemini_flash");
   const [imageScene, setImageScene] = useState("");
 
   const wsRef = useRef<WebSocket | null>(null);
@@ -118,51 +121,34 @@ export default function ApprovalQueue({
     setStatus("regenerating");
     onGeneratingChange?.(true);
 
-    const baseUrl = process.env.NEXT_PUBLIC_BACKEND_API || "http://localhost:8000";
-    const wsProtocol = baseUrl.startsWith("https") ? "wss" : "ws";
-    const wsHost = baseUrl.replace(/^https?:\/\//, "");
-
     try {
       let wsUrl = "";
-      
+
       if (pipelineMode === "linkedin") {
-        // LinkedIn pipeline requires a POST request to start the Celery task first
-        const res = await fetch(`${baseUrl}/api/linkedin/generate`, {
+        // LinkedIn pipeline requires a POST request to start the Celery task first.
+        // request() sends the session cookie + CSRF header the backend now requires.
+        const data = await request<{ run_id: string }>("/linkedin/generate", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ topic, niche: "ai", provider })
+          body: JSON.stringify({ topic, niche: "ai", provider }),
         });
-        
-        if (!res.ok) {
-          const errData = await res.json();
-          throw new Error(errData.detail || "Failed to start LinkedIn pipeline");
-        }
-        
-        const data = await res.json();
-        const runId = data.run_id;
-        wsUrl = `${wsProtocol}://${wsHost}/api/ws/linkedin/${runId}`;
+        wsUrl = `${wsOrigin()}/api/ws/linkedin/${data.run_id}`;
       } else if (pipelineMode === "blog") {
-         const res = await fetch(`${baseUrl}/api/blog/generate`, {
+        const data = await request<{ run_id: string }>("/blog/generate", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ topic, niche: "ai", provider })
+          body: JSON.stringify({ topic, niche: "ai", provider }),
         });
-        
-        if (!res.ok) {
-          const errData = await res.json();
-          throw new Error(errData.detail || "Failed to start Blog pipeline");
-        }
-        
-        const data = await res.json();
-        const runId = data.run_id;
-        wsUrl = `${wsProtocol}://${wsHost}/api/ws/blog/${runId}`;
+        wsUrl = `${wsOrigin()}/api/ws/blog/${data.run_id}`;
       } else {
         // Multi-platform pipeline (default)
         const clientId = Math.random().toString(36).substring(7);
         const endpoint = isAuto ? `auto-generate/${clientId}` : `generate/${clientId}`;
-        wsUrl = `${wsProtocol}://${wsHost}/api/ws/${endpoint}`;
+        wsUrl = `${wsOrigin()}/api/ws/${endpoint}`;
       }
-      
+
+      // Same-origin/same-site WebSocket handshakes carry the session cookie
+      // automatically — no token needs to be attached here. The backend
+      // authenticates the handshake and closes 4401 (or here, a 403 upgrade
+      // rejection) before accept() if there's no valid session.
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
@@ -182,6 +168,10 @@ export default function ApprovalQueue({
 
           if (data.type === "task_finished" || data.type === "agent_update") {
             setStreamedTasks(prev => [...prev, { task: data.task || data.agent, output: data.output || "Running..." }]);
+          } else if (data.type === "saved_topics") {
+            // Auto-research parked its unused candidates — tell the backlog
+            // banner to refetch instead of making it poll.
+            window.dispatchEvent(new Event(SAVED_TOPICS_UPDATED_EVENT));
           } else if (data.type === "linkedin_final") {
             setLinkedinFinal(data.content || "");
           } else if (data.type === "blog_final") {
@@ -233,10 +223,8 @@ export default function ApprovalQueue({
     setGeneratedImages([]);
     
     try {
-      const baseUrl = process.env.NEXT_PUBLIC_BACKEND_API || "http://localhost:8000";
-      const res = await fetch(`${baseUrl}/api/instagram/generate`, {
+      const data = await request<any>("/instagram/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           topic: imageScene.trim() || topic || "AI Developer Content",
           palette: palette,
@@ -244,17 +232,12 @@ export default function ApprovalQueue({
           model: imageModel,
         })
       });
-      
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || `Error: ${res.statusText}`);
-      }
-      
+
       if (data.images && data.images.length > 0) {
         setGeneratedImages(data.images.map((b64: string) => `data:image/png;base64,${b64}`));
         setImageStatus("done");
       } else {
-        throw new Error("No images returned. ComfyUI might have failed silently.");
+        throw new Error("No images returned. Gemini might have failed silently.");
       }
     } catch (err: any) {
       console.error(err);
@@ -286,8 +269,8 @@ export default function ApprovalQueue({
             <MessageSquare className="w-4 h-4 text-slate-500 shrink-0" />
             <input 
               type="text" 
-              placeholder="Enter viral topic (e.g. FastAPI vs Django for AI)..."
-              className="bg-transparent border-none outline-none text-sm text-white w-full placeholder:text-slate-600"
+              placeholder="Enter a tech, AI, or developer topic (e.g. Autonomous AI Agents with CrewAI & Python)..."
+              className="bg-transparent border-none outline-none text-sm text-white w-full placeholder:text-slate-500"
               value={topic}
               onChange={(e) => setTopic(e.target.value)}
               disabled={status === "regenerating"}
@@ -553,8 +536,9 @@ export default function ApprovalQueue({
                       value={imageModel}
                       onChange={(e) => setImageModel(e.target.value)}
                     >
-                      <option value="sdxl_turbo">SDXL Turbo (Fast ~3s)</option>
-                      <option value="flux_schnell">Flux Schnell (High Quality ~8s)</option>
+                      <option value="gemini_flash">Gemini Flash Image (Balanced)</option>
+                      <option value="gemini_flash_lite">Gemini Flash Lite Image (Fastest)</option>
+                      <option value="gemini_pro">Gemini Pro Image (Highest Quality)</option>
                     </select>
                   </div>
                 </div>
@@ -570,7 +554,7 @@ export default function ApprovalQueue({
                     ) : (
                       <PenTool className="w-4 h-4" />
                     )}
-                    {imageStatus === "generating" ? "Instructing ComfyUI..." : "Generate Instagram Image"}
+                    {imageStatus === "generating" ? "Generating with Gemini..." : "Generate Instagram Image"}
                   </button>
 
                   {/* Render resulting images */}

@@ -1,0 +1,44 @@
+# Secrets — must never enter a layer. app/.env holds every provider API key,
+# SECRET_KEY, the Google OAuth client secret and the Fernet encryption key.
+# Runtime secrets come from `env_file:` in docker-compose, not from the image.
+**/.env
+**/.env.*
+.env
+.env.*
+
+# Databases and generated artefacts
+data/
+output/
+generated_posts/
+run_logs/
+*.db
+*.db-shm
+*.db-wal
+
+# Python build/runtime junk
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VCS and tooling
+.git/
+.gitignore
+.github/
+.claude/
+
+# Frontend — built by dashboard/Dockerfile, not by this image
+dashboard/
+
+# Scratch and docs
+scratch/
+*.md
+!README.md
+
+# Standalone marketing site — never ship into a backend image
+website/

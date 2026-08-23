@@ -1,11 +1,17 @@
 """
-Pydantic models representing Supabase database tables for type safety and fast serialization.
+Pydantic DTOs used as FastAPI request/response models.
+
+The SQLAlchemy schema lives in :mod:`app.db.tables`. This module used to also
+carry a second, parallel ORM (``UserORM`` / ``OAuthTokenORM`` over ``users_auth``
+and ``oauth_tokens``) that nothing ever read or wrote, plus a module-level
+``create_all()`` that opened a SQLite file as an import side effect. Both are
+gone; only the Pydantic models remain.
 """
 
-from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
 from datetime import datetime
-import uuid
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
 
 # ── 1. Users ──
 class UserCreate(BaseModel):
@@ -87,3 +93,35 @@ class UsageLogCreate(BaseModel):
 
 class UsageLog(UsageLogCreate):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+
+# ── 8. YouTube Analytics ──
+class YoutubeTrafficSourceCreate(BaseModel):
+    traffic_source: str
+    views: int = 0
+    watch_time_hours: float = 0.0
+    avg_view_duration: Optional[str] = None
+    impressions: Optional[int] = None
+    impressions_ctr: Optional[float] = None
+    imported_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
+
+class YoutubeTrafficSource(YoutubeTrafficSourceCreate):
+    id: int
+
+class YoutubePublishedVideoCreate(BaseModel):
+    video_id: str
+    title: str
+    publish_time: Optional[str] = None
+    duration_seconds: Optional[int] = None
+    views: int = 0
+    watch_time_hours: float = 0.0
+    subscribers: Optional[int] = None
+    impressions: Optional[int] = None
+    impressions_ctr: Optional[float] = None
+    imported_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
+
+class YoutubePublishedVideo(YoutubePublishedVideoCreate):
+    pass
+
+
+# ── ORM: User ────────────────────────────────────────────────────────────────
+
