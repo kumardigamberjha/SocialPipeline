@@ -1,8 +1,10 @@
 import type { NextConfig } from "next";
+import path from "path";
 
 const BACKEND = process.env.BACKEND_ORIGIN ?? "http://127.0.0.1:8001";
 
 const nextConfig: NextConfig = {
+  outputFileTracingRoot: path.join(__dirname),
   /**
    * Build output directory. Overridable so a second build (the demo-film
    * capture run, which needs its own backend origin) can live beside the one
