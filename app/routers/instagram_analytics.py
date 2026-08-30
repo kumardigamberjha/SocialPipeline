@@ -30,7 +30,18 @@ from app.core.auth_deps import get_current_user
 from app.db import queries
 from app.db.session import get_session
 from app.services import instagram_ai_analysis, instagram_auth, roadmap_to_plan
-from app.services.instagram_cache import get_cached_instagram_data, refresh_instagram_cache
+from app.services.instagram_achievements_service import build_achievements
+from app.services.instagram_cache import (
+    get_cached_instagram_data,
+    refresh_instagram_cache,
+    update_cached_post,
+)
+from app.services.instagram_data import (
+    DEFAULT_RANGE,
+    RANGE_DAYS,
+    InstagramGraphAPIError,
+    fetch_single_post,
+)
 from app.services.personal_intelligence import get_directives
 
 logger = logging.getLogger(__name__)
@@ -48,7 +59,48 @@ def _get_cached(user_id: str) -> Dict[str, Any]:
     cached = get_cached_instagram_data(user_id)
     if cached:
         return cached
-    return {"profile": None, "stats": None, "posts": [], "hashtags": [], "synced_at": None, "source": "none"}
+    return {
+        "profile": None,
+        "stats": None,
+        "stats_by_range": {},
+        "posts": [],
+        "hashtags": [],
+        "coverage": {},
+        "synced_at": None,
+        "source": "none",
+    }
+
+
+def _empty_stats(time_range: str) -> Dict[str, Any]:
+    """The "nothing measured" stats block.
+
+    Every insights-derived field is None rather than 0, because a disconnected
+    account has not measured zero reach — it has measured nothing. The counts
+    that *are* zero (posts published in the window) genuinely are.
+    """
+    return {
+        "time_range": time_range,
+        "total_followers": 0,
+        "followers_gained": None,
+        "total_reach": None,
+        "total_views": None,
+        "total_impressions": None,
+        "accounts_engaged": None,
+        "total_interactions": None,
+        "profile_visits": None,
+        "link_clicks": None,
+        "posts_published": 0,
+        "total_reels_published": 0,
+        "total_carousels_published": 0,
+        "total_images_published": 0,
+        "avg_reel_views": None,
+        "avg_carousel_saves": None,
+        "avg_engagement_rate": None,
+        "insights_supported": RANGE_DAYS.get(time_range) is not None,
+        "insights_available": False,
+        "synced_at": None,
+        "source": "none",
+    }
 
 
 class RoadmapItemIn(BaseModel):
@@ -75,7 +127,12 @@ def get_instagram_profile(user: dict = Depends(get_current_user)):
     """Serves profile from Redis/DB cache. No live API call on page load."""
     data = _get_cached(user["id"])
     if data["profile"]:
-        return {**data["profile"], "synced_at": data.get("synced_at"), "source": data.get("source")}
+        return {
+            **data["profile"],
+            "synced_at": data.get("synced_at"),
+            "source": data.get("source"),
+            "stale": bool(data.get("stale")),
+        }
 
     connected = instagram_auth.connection_status(user["id"])["connected"]
     return {
@@ -90,36 +147,46 @@ def get_instagram_profile(user: dict = Depends(get_current_user)):
         "followers": 0,
         "following": 0,
         "total_posts": 0,
-        "avg_engagement_rate": 0.0,
-        "monthly_reach": 0,
-        "monthly_impressions": 0,
+        "avg_engagement_rate": None,
         "synced_at": None,
         "source": "none"
     }
 
 
 @router.get("/stats")
-def get_instagram_stats(time_range: str = "30_days", user: dict = Depends(get_current_user)):
-    """Serves stats from Redis/DB cache."""
+def get_instagram_stats(time_range: str = DEFAULT_RANGE, user: dict = Depends(get_current_user)):
+    """Serves stats from Redis/DB cache, scoped to ``time_range``.
+
+    This endpoint accepted ``time_range`` and then ignored it: one stats blob
+    answered 7 days, 30 days, 90 days and all-time identically, so changing the
+    dropdown appeared to do nothing (or worse, looked like the numbers were the
+    same in every window). The sync now computes each range separately and this
+    serves the requested one.
+    """
+    if time_range not in RANGE_DAYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown time_range {time_range!r}. Expected one of: {', '.join(RANGE_DAYS)}.",
+        )
+
     data = _get_cached(user["id"])
-    if data["stats"]:
-        return {**data["stats"], "time_range": time_range, "synced_at": data.get("synced_at"), "source": data.get("source")}
-    return {
-        "time_range": time_range,
-        "total_followers": 0,
-        "followers_gained": 0,
-        "total_reach": 0,
-        "total_impressions": 0,
-        "accounts_engaged": 0,
-        "profile_visits": 0,
-        "link_clicks": 0,
-        "total_reels_published": 0,
-        "total_carousels_published": 0,
-        "avg_reel_views": 0,
-        "avg_carousel_saves": 0,
-        "synced_at": None,
-        "source": "none"
+    envelope = {
+        "synced_at": data.get("synced_at"),
+        "source": data.get("source"),
+        "stale": bool(data.get("stale")),
     }
+
+    by_range = data.get("stats_by_range") or {}
+    if by_range.get(time_range):
+        return {**by_range[time_range], "time_range": time_range, **envelope}
+
+    # A snapshot from before per-range stats existed holds only one block, and
+    # it was computed over ~30 days of posts — so it answers that range and no
+    # other. Any other range reports honestly that it has nothing yet.
+    if data.get("stats") and time_range == DEFAULT_RANGE:
+        return {**data["stats"], "time_range": time_range, **envelope}
+
+    return {**_empty_stats(time_range), **envelope}
 
 
 @router.get("/posts")
@@ -138,6 +205,59 @@ def get_instagram_posts(
 def get_hashtag_analytics(user: dict = Depends(get_current_user)):
     """Serves hashtag data from Redis/DB cache."""
     return _get_cached(user["id"]).get("hashtags", [])
+
+
+@router.get("/achievements")
+def get_instagram_achievements(user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """Milestone achievements for the connected Instagram account.
+
+    Pure arithmetic over the already-synced snapshot, so it costs no Meta API
+    quota and needs no cache of its own. Every figure is measured or absent —
+    see ``instagram_achievements_service`` for which metrics Instagram can
+    honestly support a lifetime milestone for and which it cannot.
+    """
+    return build_achievements(_get_cached(user["id"]))
+
+
+@router.post("/posts/{media_id}/refresh")
+def refresh_instagram_post(media_id: str, user: dict = Depends(get_current_user)) -> Dict[str, Any]:
+    """Re-read one post's live metrics and update it in place.
+
+    Two Graph API calls against a single media id, rather than the whole-account
+    sync a user would otherwise have to run to correct one stale row. The
+    averages, hashtag scores and per-window counts derived from that post are
+    recomputed locally; the account-level insights are untouched because nothing
+    about them changed.
+    """
+    user_id = user["id"]
+    if not instagram_auth.connection_status(user_id)["connected"]:
+        raise HTTPException(
+            status_code=400,
+            detail="No Instagram token connected. Please complete OAuth first.",
+        )
+
+    try:
+        post = fetch_single_post(user_id, media_id)
+    except InstagramGraphAPIError as exc:
+        logger.warning("Instagram post refresh failed for %s/%s: %s", user_id, media_id, exc)
+        raise HTTPException(status_code=502, detail=f"Could not refresh this post: {exc}")
+
+    updated = update_cached_post(user_id, post)
+    if updated is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Nothing synced yet for this account — run Sync Metrics first.",
+        )
+
+    return {
+        "post": post,
+        # The blocks the refreshed post feeds into, so the page can update
+        # without a second round trip.
+        "stats": updated.get("stats"),
+        "stats_by_range": updated.get("stats_by_range"),
+        "hashtags": updated.get("hashtags"),
+        "profile": updated.get("profile"),
+    }
 
 
 @router.post("/sync")

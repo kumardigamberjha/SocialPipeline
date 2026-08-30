@@ -19,7 +19,7 @@ from googleapiclient.errors import HttpError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.redis_client import acache, uk
+from app.services.youtube_cache import get_cached, set_cached
 from app.services.youtube_data import _service, _wrap_http_error
 
 logger = logging.getLogger(__name__)
@@ -46,15 +46,9 @@ def get_own_channel_stats(user_id: str) -> dict:
 
 
 async def _cached_own_channel_stats(user_id: str) -> dict:
-    cache_key = uk(user_id, "yt-own-stats")
-    try:
-        raw = await acache().get(cache_key)
-        if raw:
-            import json
-
-            return json.loads(raw)
-    except Exception:
-        pass
+    cached = await get_cached(user_id, "yt-own-stats")
+    if cached is not None:
+        return cached
 
     try:
         stats = await asyncio.to_thread(get_own_channel_stats, user_id)
@@ -62,12 +56,7 @@ async def _cached_own_channel_stats(user_id: str) -> dict:
         logger.info("goal_service: could not fetch own channel stats for %s: %s", user_id, exc)
         return {}
 
-    try:
-        import json
-
-        await acache().setex(cache_key, _OWN_STATS_TTL, json.dumps(stats))
-    except Exception:
-        pass
+    await set_cached(user_id, "yt-own-stats", stats, ttl=_OWN_STATS_TTL)
     return stats
 
 
@@ -103,12 +92,32 @@ async def read_metric(
         return float((row or {}).get("n", 0) or 0), "synced"
 
     if metric == "watch_hours":
+        # Deliberately the CSV-import table, not youtube_videos_live.watch_time_hours:
+        # sync_video_analytics queries the Analytics API with days=90 and
+        # maxResults=200, so that column holds a *90-day* figure for the top 200
+        # videos and NULL for everything else. Summing it would report a quarter's
+        # watch time as a lifetime total.
         where = "AND publish_time >= :start_date" if start_date else ""
         row = (
             await session.execute(
                 text(
                     f"SELECT COALESCE(SUM(watch_time_hours), 0) AS n "
                     f"FROM youtube_published_videos WHERE user_id = :user_id {where}"
+                ),
+                {"user_id": user_id, "start_date": start_date},
+            )
+        ).mappings().first()
+        return float((row or {}).get("n", 0) or 0), "synced"
+
+    # Lifetime per-video counters straight off the Data API's statistics block,
+    # so unlike watch_hours these are safe to sum.
+    if metric in ("likes", "comments"):
+        column = "likes" if metric == "likes" else "comments"
+        row = (
+            await session.execute(
+                text(
+                    f"SELECT COALESCE(SUM({column}), 0) AS n FROM youtube_videos_live "
+                    f"WHERE user_id = :user_id {where_since}"
                 ),
                 {"user_id": user_id, "start_date": start_date},
             )

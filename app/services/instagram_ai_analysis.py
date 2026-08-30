@@ -120,16 +120,27 @@ def build_account_context(cached: dict, existing_items: list[dict]) -> str:
     posts = cached.get("posts") or []
     hashtags = cached.get("hashtags") or []
 
+    # An unmeasured metric is reported as unmeasured. Substituting 0 tells the
+    # model the account got no reach, which is a different claim from "Meta did
+    # not return reach for this account" — and one it will happily build a
+    # strategy around.
+    def measured(value, suffix: str = "") -> str:
+        return "not measured" if value is None else f"{value}{suffix}"
+
     lines = [
         f"Handle: {profile.get('handle', 'unknown')}",
         f"Bio: {profile.get('bio', '')}",
         f"Followers: {profile.get('followers', 0)}",
-        f"Avg engagement rate: {profile.get('avg_engagement_rate', 0)}",
+        f"Avg engagement rate: {measured(profile.get('avg_engagement_rate'), '%')}",
         "",
-        "STATS:",
-        f"- Total reach: {stats.get('total_reach', 0)}, impressions: {stats.get('total_impressions', 0)}",
-        f"- Reels published: {stats.get('total_reels_published', 0)}, avg reel views: {stats.get('avg_reel_views', 0)}",
-        f"- Carousels published: {stats.get('total_carousels_published', 0)}, avg carousel saves: {stats.get('avg_carousel_saves', 0)}",
+        f"STATS ({stats.get('time_range', 'recent')}):",
+        f"- Reach: {measured(stats.get('total_reach'))}, views: {measured(stats.get('total_views'))}",
+        f"- Followers gained: {measured(stats.get('followers_gained'))}, "
+        f"accounts engaged: {measured(stats.get('accounts_engaged'))}",
+        f"- Reels published: {stats.get('total_reels_published', 0)}, "
+        f"avg reel views: {measured(stats.get('avg_reel_views'))}",
+        f"- Carousels published: {stats.get('total_carousels_published', 0)}, "
+        f"avg carousel saves: {measured(stats.get('avg_carousel_saves'))}",
         "",
         "EXISTING POSTS:",
     ]
@@ -139,7 +150,10 @@ def build_account_context(cached: dict, existing_items: list[dict]) -> str:
     lines.append("")
     lines.append("TOP HASHTAGS:")
     for tag in hashtags[:10]:
-        lines.append(f"- {tag.get('tag', '')} (avg reach {tag.get('avg_reach', 0)}, {tag.get('category', '')})")
+        lines.append(
+            f"- {tag.get('tag', '')} (avg reach {measured(tag.get('avg_reach'))}, "
+            f"{tag.get('category', '')})"
+        )
 
     lines.append("")
     lines.append("ALREADY PLANNED:")

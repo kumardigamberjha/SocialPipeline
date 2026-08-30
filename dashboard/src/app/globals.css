@@ -102,3 +102,41 @@ body {
   background: rgba(148, 163, 184, 0.3);
 }
 
+
+/* ── Shareable report panels ──────────────────────────────────────────────────
+   Panels that will be screenshotted or printed must NOT rely on .glass-card:
+   its backdrop-filter has nothing to sample in a print context or a canvas
+   capture, so the card renders as a transparent rectangle. These carry their
+   own opaque background instead. */
+.share-card {
+  background: #0b1120;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+@media print {
+  /* Keep the dark treatment — the panels are designed for it, and a forced
+     light background would drop every foreground colour to unreadable. */
+  html,
+  body {
+    background: #020617 !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .share-card {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    box-shadow: none !important;
+  }
+
+  /* Never split a week card or a bullet list across a page boundary. */
+  .share-card section,
+  .share-card li,
+  .share-card > div > div {
+    break-inside: avoid;
+  }
+
+  @page {
+    margin: 12mm;
+  }
+}

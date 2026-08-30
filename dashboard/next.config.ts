@@ -21,14 +21,6 @@ const nextConfig: NextConfig = {
    * and the session cookies are always present on incoming Next.js requests —
    * which means the proxy.ts route-guard can read them correctly.
    */
-  async rewrites() {
-    return [
-      {
-        source: "/api/:path*",
-        destination: `${BACKEND}/api/:path*`,
-      },
-    ];
-  },
 };
 
 export default nextConfig;

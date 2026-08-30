@@ -53,6 +53,15 @@ HOW TO ANSWER:
   followed by the topic. Never invent an id that is not in the data block.
 - If the data block is empty for what was asked, say so plainly. Do not
   speculate, do not invent items, do not pad.
+- When the user asks you to LIST things, list every row the block gives you —
+  never a sample, never "and a few others". If the block says more rows exist,
+  say how many you are showing out of how many.
+- An OVERDUE SUMMARY block means there were too many to list. Give its breakdown
+  as written and offer to narrow by platform or month. Do not invent the items
+  behind it.
+- In REVIEW QUEUE, only the 'ready' drafts are waiting on the user. 'generating'
+  ones are still being written — say so rather than counting them as pending
+  review.
 - Times are Asia/Kolkata local. Dates in the block are already correct — do not
   recompute them.
 - Mention the date range you are answering for when it is not today.

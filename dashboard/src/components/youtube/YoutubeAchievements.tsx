@@ -1,9 +1,8 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useCallback } from "react";
 import {
   Trophy,
-  Share2,
   TrendingUp,
   Users,
   Eye,
@@ -11,20 +10,27 @@ import {
   ThumbsUp,
   MessageCircle,
   Upload,
+  RefreshCw,
+  AlertTriangle,
+  Info,
 } from "lucide-react";
 import { request } from "@/lib/apiClient";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
+// achieved_date and next_milestone_eta are nullable on purpose: the backend
+// sends null when it has no history to date a milestone from, or no growth rate
+// to project one. The cards drop those lines rather than showing a guess.
+
 interface AchievementMilestone {
   metric: string;
-  milestone: number;
+  milestone: number | null;
   milestone_label: string;
-  achieved_date: string;
+  achieved_date: string | null;
   current_value: number;
-  next_milestone: number;
+  next_milestone: number | null;
   next_milestone_label: string;
-  next_milestone_eta: string;
+  next_milestone_eta: string | null;
   progress_pct: number;
 }
 
@@ -38,132 +44,14 @@ interface TopPerformingMonth {
 }
 
 interface AchievementsData {
+  /** Which history produced the dates — see the provenance caption below. */
+  basis: "analytics_api" | "upload_month";
+  as_of: string;
+  months_of_history: number;
   key_achievements: AchievementMilestone[];
   top_performing_months: TopPerformingMonth[];
+  unavailable: { metric: string; reason: string }[];
 }
-
-// ─── Static fallback data (mirrors the screenshots) ──────────────────────────
-
-const FALLBACK: AchievementsData = {
-  key_achievements: [
-    {
-      metric: "subscribers",
-      milestone: 1500,
-      milestone_label: "1.5K",
-      achieved_date: "5th January 2025",
-      current_value: 1701,
-      next_milestone: 2000,
-      next_milestone_label: "2K",
-      next_milestone_eta: "9th August 2028",
-      progress_pct: Math.round((1701 / 2000) * 100),
-    },
-    {
-      metric: "views",
-      milestone: 150000,
-      milestone_label: "150K",
-      achieved_date: "20th September 2025",
-      current_value: 168345,
-      next_milestone: 175000,
-      next_milestone_label: "175K",
-      next_milestone_eta: "18th November 2026",
-      progress_pct: Math.round((168345 / 175000) * 100),
-    },
-    {
-      metric: "uploads",
-      milestone: 300,
-      milestone_label: "300",
-      achieved_date: "7th August 2024",
-      current_value: 388,
-      next_milestone: 400,
-      next_milestone_label: "400",
-      next_milestone_eta: "21st August 2026",
-      progress_pct: Math.round((388 / 400) * 100),
-    },
-    {
-      metric: "likes",
-      milestone: 3000,
-      milestone_label: "3K",
-      achieved_date: "18th October 2024",
-      current_value: 3918,
-      next_milestone: 4000,
-      next_milestone_label: "4K",
-      next_milestone_eta: "27th August 2026",
-      progress_pct: Math.round((3918 / 4000) * 100),
-    },
-    {
-      metric: "watch_time",
-      milestone: 7500,
-      milestone_label: "7.5K",
-      achieved_date: "27th November 2025",
-      current_value: 7820,
-      next_milestone: 8000,
-      next_milestone_label: "8K",
-      next_milestone_eta: "19th September 2026",
-      progress_pct: Math.round((7820 / 8000) * 100),
-    },
-    {
-      metric: "comments",
-      milestone: 500,
-      milestone_label: "500",
-      achieved_date: "4th November 2025",
-      current_value: 555,
-      next_milestone: 600,
-      next_milestone_label: "600",
-      next_milestone_eta: "13th September 2026",
-      progress_pct: Math.round((555 / 600) * 100),
-    },
-  ],
-  top_performing_months: [
-    {
-      metric: "subscribers",
-      milestone: 569,
-      milestone_label: "569",
-      achieved_date: "April 2023",
-      current_value: 5,
-      progress_pct: 1,
-    },
-    {
-      metric: "views",
-      milestone: 5400,
-      milestone_label: "5.4K",
-      achieved_date: "February 2025",
-      current_value: 522,
-      progress_pct: 10,
-    },
-    {
-      metric: "uploads",
-      milestone: 41,
-      milestone_label: "41",
-      achieved_date: "March 2021",
-      current_value: 7,
-      progress_pct: 17,
-    },
-    {
-      metric: "likes",
-      milestone: 295,
-      milestone_label: "295",
-      achieved_date: "May 2021",
-      current_value: 32,
-      progress_pct: 11,
-    },
-    {
-      metric: "watch_time",
-      milestone: 474.8,
-      milestone_label: "474.8",
-      achieved_date: "June 2021",
-      current_value: 33,
-      progress_pct: 7,
-    },
-    {
-      metric: "comments",
-      milestone: 60,
-      milestone_label: "60",
-      achieved_date: "June 2021",
-      current_value: 9,
-      progress_pct: 15,
-    },
-  ],
-};
 
 // ─── Metric config ────────────────────────────────────────────────────────────
 
@@ -199,25 +87,6 @@ function MetricIcon({ metric, size = 40 }: { metric: string; size?: number }) {
   );
 }
 
-function ShareButton({ shareText }: { shareText: string }) {
-  const handleShare = () => {
-    if (navigator.share) {
-      navigator.share({ title: "YouTube Achievement", text: shareText }).catch(() => {});
-    } else {
-      navigator.clipboard.writeText(shareText).catch(() => {});
-    }
-  };
-  return (
-    <button
-      onClick={handleShare}
-      className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold transition-colors flex-shrink-0"
-    >
-      <Share2 size={12} />
-      Share
-    </button>
-  );
-}
-
 // ─── Key Achievement Card ─────────────────────────────────────────────────────
 
 function KeyAchievementCard({
@@ -242,21 +111,26 @@ function KeyAchievementCard({
         <MetricIcon metric={item.metric} size={44} />
         <div className="flex-1 min-w-0">
           <p className="text-xl font-extrabold text-white leading-none">
-            {item.milestone_label}{" "}
+            {item.milestone_label || item.current_value.toLocaleString()}{" "}
             <span className="text-base font-semibold text-slate-300">{label}</span>
           </p>
-          <p className="text-xs text-slate-500 mt-0.5">Achieved on {item.achieved_date}</p>
+          {item.achieved_date ? (
+            <p className="text-xs text-slate-500 mt-0.5">Reached in {item.achieved_date}</p>
+          ) : (
+            <p className="text-xs text-slate-600 mt-0.5">Date not tracked</p>
+          )}
         </div>
-        <ShareButton shareText={`I just hit ${item.milestone_label} ${label} on YouTube! 🎉`} />
       </div>
 
-      <p className="text-xs text-slate-400">
-        On pace for{" "}
-        <span className="font-semibold text-white">
-          {item.next_milestone_label} {label}
-        </span>{" "}
-        by {item.next_milestone_eta}
-      </p>
+      {item.next_milestone_label && (
+        <p className="text-xs text-slate-400">
+          Next up:{" "}
+          <span className="font-semibold text-white">
+            {item.next_milestone_label} {label}
+          </span>
+          {item.next_milestone_eta ? ` — on pace for ${item.next_milestone_eta}` : ""}
+        </p>
+      )}
 
       <div className="space-y-1">
         <div className="w-full bg-white/10 rounded-full h-2.5 overflow-hidden">
@@ -301,9 +175,8 @@ function TopMonthCard({
             {item.milestone_label}{" "}
             <span className="text-base font-semibold text-slate-300">{label}</span>
           </p>
-          <p className="text-xs text-slate-500 mt-0.5">Achieved on {item.achieved_date}</p>
+          <p className="text-xs text-slate-500 mt-0.5">Best month: {item.achieved_date}</p>
         </div>
-        <ShareButton shareText={`My best month was ${item.milestone_label} ${label} (${item.achieved_date}) on YouTube! 🏆`} />
       </div>
 
       <p className="text-xs text-slate-400">
@@ -334,64 +207,179 @@ function TopMonthCard({
   );
 }
 
-// ─── Main Component ───────────────────────────────────────────────────────────
+// ─── Section shell ────────────────────────────────────────────────────────────
 
-export default function YoutubeAchievements() {
-  const [data, setData] = useState<AchievementsData>(FALLBACK);
-
-  useEffect(() => {
-    request<AchievementsData>("/youtube-analytics/achievements")
-      .then((res) => setData(res))
-      .catch(() => {
-        /* silently use fallback */
-      });
-  }, []);
-
-  const { key_achievements, top_performing_months } = data;
-
+function SectionHeader({ onRefresh, refreshing }: { onRefresh?: () => void; refreshing?: boolean }) {
   return (
-    <div className="space-y-8">
-      {/* Section header */}
-      <div className="flex items-center gap-2">
+    <div className="flex items-center justify-between gap-2">
+      <div className="flex items-center gap-2 flex-1">
         <Trophy size={18} className="text-amber-400" />
         <h2 className="text-sm font-bold tracking-[0.2em] uppercase text-slate-300">
           Achievements
         </h2>
         <div className="flex-1 h-px bg-gradient-to-r from-white/10 to-transparent ml-2" />
       </div>
+      {onRefresh && (
+        <button
+          onClick={onRefresh}
+          disabled={refreshing}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-slate-300 text-xs font-medium transition-colors disabled:opacity-50 cursor-pointer"
+          title="Refresh Achievements"
+        >
+          <RefreshCw size={13} className={refreshing ? "animate-spin text-blue-400" : ""} />
+          <span>{refreshing ? "Refreshing..." : "Refresh"}</span>
+        </button>
+      )}
+    </div>
+  );
+}
 
-      {/* Info banner */}
-      <div className="flex items-center justify-center gap-2 py-2 px-4 bg-amber-500/10 border border-amber-500/20 rounded-xl text-amber-300 text-xs text-center">
-        🔥 Let us help you celebrate your milestones! Click{" "}
-        <Share2 size={12} className="inline mx-1" />
-        Share on these to download a certificate you can share via social media.
-      </div>
+// ─── Main Component ───────────────────────────────────────────────────────────
 
-      {/* Key Achievements */}
-      <div className="space-y-4">
-        <div className="flex items-center gap-2">
-          <TrendingUp size={15} className="text-slate-400" />
-          <h3 className="text-base font-semibold text-white">Key Achievements</h3>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {key_achievements.map((item, i) => (
-            <KeyAchievementCard key={item.metric} item={item} isFirst={i === 0} />
-          ))}
-        </div>
-      </div>
+export default function YoutubeAchievements() {
+  const [data, setData] = useState<AchievementsData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-      {/* Top Performing Months */}
-      <div className="space-y-4">
-        <div className="flex items-center gap-2">
-          <Trophy size={15} className="text-amber-400" />
-          <h3 className="text-base font-semibold text-white">Top Performing Months</h3>
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {top_performing_months.map((item, i) => (
-            <TopMonthCard key={item.metric} item={item} isFirst={i === 0} />
-          ))}
+  const fetchAchievements = useCallback((isRefresh = false) => {
+    if (isRefresh) setRefreshing(true);
+    else setLoading(true);
+    setError(null);
+
+    const url = isRefresh
+      ? `/youtube-analytics/achievements?refresh=true&_t=${Date.now()}`
+      : `/youtube-analytics/achievements?_t=${Date.now()}`;
+
+    return request<AchievementsData>(url)
+      .then((res) => {
+        setData(res);
+      })
+      .catch((err) => {
+        setError(err?.message || "Could not load achievements.");
+      })
+      .finally(() => {
+        setLoading(false);
+        setRefreshing(false);
+      });
+  }, []);
+
+  useEffect(() => {
+    let ignore = false;
+    request<AchievementsData>(`/youtube-analytics/achievements?_t=${Date.now()}`)
+      .then((res) => {
+        if (!ignore) setData(res);
+      })
+      .catch((err) => {
+        if (!ignore) setError(err?.message || "Could not load achievements.");
+      })
+      .finally(() => {
+        if (!ignore) setLoading(false);
+      });
+    return () => {
+      ignore = true;
+    };
+  }, []);
+
+  if (loading) {
+    return (
+      <div className="space-y-8">
+        <SectionHeader />
+        <div className="flex items-center justify-center h-64">
+          <div className="animate-spin text-red-500">
+            <RefreshCw size={32} />
+          </div>
         </div>
       </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="space-y-8">
+        <SectionHeader onRefresh={() => fetchAchievements(true)} refreshing={refreshing} />
+        <div className="flex flex-col items-center gap-2 rounded-xl border border-red-500/20 bg-red-500/10 py-10 px-4 text-center">
+          <AlertTriangle size={22} className="text-red-400" />
+          <p className="text-sm font-semibold text-red-300">Could not load your achievements</p>
+          <p className="text-xs text-slate-400">{error}</p>
+        </div>
+      </div>
+    );
+  }
+
+  const keyAchievements = data?.key_achievements ?? [];
+  const topMonths = data?.top_performing_months ?? [];
+
+  if (keyAchievements.length === 0 && topMonths.length === 0) {
+    return (
+      <div className="space-y-8">
+        <SectionHeader onRefresh={() => fetchAchievements(true)} refreshing={refreshing} />
+        <div className="flex flex-col items-center gap-2 rounded-xl border border-white/[0.08] bg-white/[0.03] py-10 px-4 text-center">
+          <Trophy size={22} className="text-slate-500" />
+          <p className="text-sm font-semibold text-slate-300">No milestones yet</p>
+          <p className="text-xs text-slate-500 max-w-sm">
+            Import a YouTube Studio CSV or run a channel sync, and your milestones will
+            appear here.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-8">
+      <SectionHeader onRefresh={() => fetchAchievements(true)} refreshing={refreshing} />
+
+      {/* Provenance. An approximation must never read as an exact claim. */}
+      {data?.basis === "upload_month" && (
+        <div className="flex items-start gap-2 py-2 px-4 bg-white/[0.03] border border-white/[0.08] rounded-xl text-slate-400 text-xs">
+          <Info size={13} className="mt-0.5 flex-shrink-0 text-slate-500" />
+          <span>
+            Dates are estimated from each video&apos;s publish month, so they are
+            approximate. Connect the YouTube Analytics API for exact milestone dates and
+            month-by-month history.
+          </span>
+        </div>
+      )}
+
+      {keyAchievements.length > 0 && (
+        <div className="space-y-4">
+          <div className="flex items-center gap-2">
+            <TrendingUp size={15} className="text-slate-400" />
+            <h3 className="text-base font-semibold text-white">Key Achievements</h3>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {keyAchievements.map((item, i) => (
+              <KeyAchievementCard key={item.metric} item={item} isFirst={i === 0} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {topMonths.length > 0 && (
+        <div className="space-y-4">
+          <div className="flex items-center gap-2">
+            <Trophy size={15} className="text-amber-400" />
+            <h3 className="text-base font-semibold text-white">
+              {data?.basis === "upload_month" ? "Best Upload Months" : "Top Performing Months"}
+            </h3>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {topMonths.map((item, i) => (
+              <TopMonthCard key={item.metric} item={item} isFirst={i === 0} />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {data && data.unavailable.length > 0 && (
+        <p className="text-xs text-slate-600">
+          Not tracked yet:{" "}
+          {data.unavailable
+            .map((u) => `${METRIC_CONFIG[u.metric]?.label ?? u.metric} (${u.reason})`)
+            .join(", ")}
+        </p>
+      )}
     </div>
   );
 }

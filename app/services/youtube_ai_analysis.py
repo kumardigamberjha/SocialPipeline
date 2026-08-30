@@ -18,6 +18,7 @@ from pydantic import Field
 
 from app.config import get_settings
 from app.llm import build_llm
+from app.provider_tiers import UNKNOWN_GRADE
 from app.services.blog_pipeline.utils import CoercingBaseModel, call_llm_with_retry
 
 logger = logging.getLogger(__name__)
@@ -64,12 +65,32 @@ OUTPUT: Return ONLY valid JSON matching this schema exactly. No prose, no markdo
 """
 
 
+def _stamp_provenance(result: dict, used: dict, fallback_model: str) -> dict:
+    """Record which cascade tier produced this result, on the result itself.
+
+    ``result["model"]`` alone was not enough: it is a bare model string, so
+    deciding whether a report may be exported meant pattern-matching model names
+    at the export site. The grade is decided once, here, by the tier that
+    answered — and defaults to ``internal_only`` when nothing answered with a
+    tier stamp, so unknown provenance can never be exported.
+    """
+    result["model"] = used.get("model") or fallback_model
+    result["tier"] = {
+        "index": used.get("tier_index"),
+        "name": used.get("tier_name"),
+        "grade": used.get("tier_grade") or UNKNOWN_GRADE,
+        "model": used.get("model") or fallback_model,
+    }
+    return result
+
+
 def _build_analysis_llm_and_chain():
-    """Build the primary analysis LLM (Gemini) and the 4-tier fallback cascade:
-      Tier 1: Google Gemini Flash
-      Tier 2: NVIDIA DeepSeek AI (NVIDIA NIM)
-      Tier 3: Ollama Cloud (gemma4:31b-cloud)
-      Tier 4: Local Ollama (qwen2.5:latest)
+    """Build the primary analysis LLM and the ordered fallback cascade.
+
+    The order is declared in ``app.provider_tiers.DEFAULT_PROVIDER_CHAIN`` and
+    overridable with ``LLM_PROVIDER_CHAIN`` — deliberately not restated here,
+    because three copies of it in three docstrings had already drifted apart
+    and none of them matched the code.
     """
     from app.llm import build_fallback_cascade
     settings = get_settings()
@@ -127,7 +148,7 @@ async def analyze_channel(context: str, time_range: str = "all_time", directives
     )
 
     result = insights.model_dump()
-    result["model"] = _used.get("model") or model
+    _stamp_provenance(result, _used, model)
     return result
 
 
@@ -206,7 +227,7 @@ async def analyze_playlist_trends(
         used=_used,
     )
     result = trends.model_dump()
-    result["model"] = _used.get("model") or model
+    _stamp_provenance(result, _used, model)
     return result
 
 
@@ -284,11 +305,39 @@ async def analyze_video_growth(video_context: str, web_context: str, directives:
         used=_used,
     )
     result = recs.model_dump()
-    result["model"] = _used.get("model") or model
+    _stamp_provenance(result, _used, model)
     return result
 
 
 # ── Channel strategy report ───────────────────────────────────────────────────
+
+#: Appended to the directives of both models when
+#: ``youtube_metrics.time_of_day_recommendation_allowed`` says this channel's
+#: uploads do not carry enough publish timestamps to support an hour-level call.
+#:
+#: The audit used to be handed the raw hour buckets with no instruction attached,
+#: and wrote "Saturday & Sunday between 09:00-12:00 UTC (2.27x channel median)"
+#: onto page 1 while page 2's timing widget said, correctly, that there was not
+#: enough timestamp data to name a window. Same report, same data, opposite
+#: claims. The day finding is untouched by this — only the clock is.
+TIME_OF_DAY_FORBIDDEN = """- TIME OF DAY IS NOT AVAILABLE FOR THIS CHANNEL. Too few of its uploads carry a
+  publish timestamp to support an hour-level recommendation, and the report says
+  so elsewhere. You may recommend DAYS OF THE WEEK, and you must not write a
+  clock time, an hour, an hour range, a "between X and Y" window, or the letters
+  UTC anywhere in your output — not in the verdict, not in format insights, not
+  in the priorities, not in a rationale. Do not quote an average from a
+  time-of-day breakdown as if it were a recommendation. Recommend the day and
+  stop there."""
+
+#: The counterpart when the gate is open: state the window the report computed,
+#: not one derived independently.
+TIME_OF_DAY_ALLOWED_NOTE = """- The upload-timing block above carries the one computed publishing window. If
+  you name a time of day, name that window and no other."""
+
+
+def _time_of_day_directive(allowed: bool) -> str:
+    return TIME_OF_DAY_ALLOWED_NOTE if allowed else TIME_OF_DAY_FORBIDDEN
+
 
 
 class StrategyReport(CoercingBaseModel):
@@ -326,9 +375,11 @@ ONE creator, so they never need to ask a generic AI for planning again.
 
 RULES:
 - Every point must reference the creator's actual data (views, CTR, cadence,
-  length buckets, specific video titles) or a concrete trend from the search.
-- format_insights: call out which video LENGTHS and posting CADENCE perform best
-  for THIS channel, with the numbers.
+  length buckets, upload timing, specific video titles) or a concrete trend from the search.
+- format_insights: call out which video LENGTHS, posting CADENCE, and optimal upload DAYS perform best
+  for THIS channel, with the numbers. Name a time of day ONLY if the directives
+  above permit it — the timing gate, not your reading of the hour buckets,
+  decides whether this channel has enough timestamp data for an hour-level call.
 - content_gaps: use the web trends to name topics they should cover but haven't.
 - priorities: 4-6 concrete actions as plain strings, most important first
   (not "post consistently"). The array order carries the ranking — do not number
@@ -340,9 +391,30 @@ OUTPUT: Return ONLY valid JSON matching this schema exactly. No prose, no markdo
 
 
 async def analyze_strategy(
-    context: str, web_context: str, time_range: str = "all_time", directives: str = ""
+    context: str, web_context: str, time_range: str = "all_time", directives: str = "",
+    cadence=None, time_of_day_allowed: bool = True,
 ) -> dict:
-    """Channel-level strategy brief: what's working, gaps, and ranked priorities."""
+    """Channel-level strategy brief: what's working, gaps, and ranked priorities.
+
+    ``cadence`` (a ``youtube_report_rules.Cadence``) is appended to the directives
+    as the single permitted phrasing, because this model and the roadmap model were
+    previously free to state the publishing rate independently — and did, four
+    different ways in one document.
+
+    ``time_of_day_allowed`` is the verdict of the one timing gate,
+    ``youtube_metrics.time_of_day_recommendation_allowed``. When it is ``False``
+    the model is told, as a hard constraint, that it may name days and not hours;
+    the caller re-checks the prose afterwards, because a constraint in a prompt
+    is a request, not a guarantee.
+    """
+    directives = f"{directives}\n{_time_of_day_directive(time_of_day_allowed)}".strip()
+    if cadence is not None:
+        directives = (
+            f"{directives}\n"
+            f"- RECOMMENDED CADENCE IS ALREADY COMPUTED: \"{cadence.label}\". State the "
+            f"publishing rate only in those terms. Do not derive, round, or restate it as a "
+            f"different number of days, videos per week, or releases per month."
+        ).strip()
     llm, fallback_chain, model = _build_analysis_llm_and_chain()
     _used: dict = {}  # filled in with the tier that actually answered
     prompt = STRATEGY_PROMPT.format(
@@ -359,7 +431,7 @@ async def analyze_strategy(
         used=_used,
     )
     result = report.model_dump()
-    result["model"] = _used.get("model") or model
+    _stamp_provenance(result, _used, model)
     return result
 
 
@@ -384,7 +456,7 @@ class ContentRoadmap(CoercingBaseModel):
 
 
 _ROADMAP_SCHEMA_HINT = """{
-  "cadence": "recommended posting cadence for this channel (e.g. '2 videos/week')",
+  "cadence": "recommended posting cadence for this channel (e.g. '1 video/week (3-4 releases/month)')",
   "weeks": [
     {"focus": "the theme/goal for this week",
      "items": [
@@ -397,37 +469,188 @@ _ROADMAP_SCHEMA_HINT = """{
 }"""
 
 ROADMAP_PROMPT = """ROLE: You are a YouTube content planner. Build a {weeks}-week posting roadmap for
-ONE creator, grounded in their real performance and current web trends.
+ONE creator, grounded in their real performance, the strategy audit directives, and current web trends.
 
 {directives}
 
 === CHANNEL DATA ===
 {context}
 
+{strategy_constraints}
+
+{flagged_block}
+
 === CURRENT WEB TRENDS ===
 {web_context}
 
 RULES:
-- Produce exactly {weeks} weeks. Each week has a clear focus and 2-3 concrete video ideas.
-- Bias toward formats/lengths/themes that ALREADY perform for this channel, while
-  weaving in the trending angles from the search results.
-- Titles must be specific working titles (never "Intro to X").
-- Do NOT include dates — they are assigned separately.
+- Produce exactly {weeks} weeks.
+- For each week, provide a clear focus and EXACTLY {items_per_week} concrete video release concept(s) matching the target cadence of "{target_cadence}". Do not over-schedule items.
+- STRICT STRATEGY AUDIT COMPLIANCE: Every single video concept must directly advance the strategic priorities and double down on what is working.
+- FORBIDDEN TOPICS & FRAMINGS: Under NO circumstances should you propose video titles, themes, or framings that resemble topics flagged as underperforming or advised to drop in the Strategy Audit (e.g. abstract neuroscience/theory, generic lecture discourse, or dropped formats). Every title must be practical, applied, and high-CTR.
+- JUSTIFICATION & RATIONALE RULES (MANDATORY):
+  * Every item rationale MUST be anchored primarily to the channel's OWN proven performance: cite a specific named high-performing video of theirs with its view count, a winning format/length bucket, or a validated topic cluster from their catalogue.
+  * An external trend may ONLY be mentioned as a secondary thematic hook, and NEVER with raw external metrics attached.
+  * FORBIDDEN IN RATIONALES: NEVER cite raw external platform metrics or popularity claims (no GitHub star counts, no "stars/day", no "/day" rates, no upvote counts, no "Product Hunt", no "GitHub", no follower counts, no launch dates, no "went viral", no "trended"). If the only evidence for a trend is raw external metrics, drop the external reference entirely and justify solely from channel data.
+- Titles must be specific working titles (<12 words, never "Intro to X").
+- The "cadence" field in the output JSON MUST state "{target_cadence}" verbatim, and no
+  rationale may state a different publishing rate. Cadence is computed from this
+  channel's measured upload history; restating it differently contradicts the audit.
+- Do NOT include dates, weekday names or clock times — publishing days are
+  assigned separately in Python from the channel's measured history, and an hour
+  may only be named when the directives above allow one.
 
 OUTPUT: Return ONLY valid JSON matching this schema exactly. No prose, no markdown fences.
 {schema}
 """
 
 
+def _format_flagged_videos(flagged_videos: list[dict] | None) -> str:
+    """The specific videos the roadmap may not cite as proof that something works.
+
+    ``_format_strategy_constraints`` forwards the audit's prose bullets, which is
+    not enough: a bullet reading "abstract theory underdelivers" does not stop the
+    model naming a specific abstract-theory video as a proven pillar. That is what
+    shipped — "I Found A Neuroscience Paper On Messi's Brain" (213,644 views) was
+    listed as underperforming on page 1 and cited as a "high-engagement brain
+    research pillar" on page 3. So the titles go in as data.
+    """
+    if not flagged_videos:
+        return ""
+    rows = "\n".join(
+        f"  * {v.get('title', '')} — {int(v.get('views') or 0):,} views"
+        for v in flagged_videos[:15]
+    )
+    return (
+        "=== VIDEOS FLAGGED UNDERPERFORMING (DO NOT CITE AS POSITIVE EVIDENCE) ===\n"
+        f"{rows}\n"
+        "  --> ABSOLUTE RULE: none of the videos above may be referenced as a proven\n"
+        "      pillar, a success, a 'high-engagement' format, or a reason to make more\n"
+        "      of anything. They are the channel's weakest results. If a rationale would\n"
+        "      cite one of them as evidence, make a different point or drop the concept.\n"
+        "  --> Do not propose concepts that match the framings the audit told this\n"
+        "      channel to abandon, even under a new title."
+    )
+
+
+def _format_strategy_constraints(
+    audit_strategy: dict | None, target_cadence: str, items_per_week: int
+) -> str:
+    if not audit_strategy:
+        return (
+            f"=== TARGET CADENCE ===\n"
+            f"- Recommended Cadence: {target_cadence}\n"
+            f"- Video Count Target: EXACTLY {items_per_week} primary video concept per week."
+        )
+
+    sections = [
+        "=== STRATEGY AUDIT DIRECTIVES & CONSTRAINTS (MANDATORY COHERENCE WITH PAGE 1) ===",
+        "This roadmap MUST be 100% coherent with the Strategy Audit findings on Page 1 of the report:",
+    ]
+
+    under = audit_strategy.get("underperforming") or []
+    if under:
+        under_bullets = "\n".join(f"  * {u}" for u in under)
+        sections.append(
+            f"1. FORBIDDEN / UNDERPERFORMING FRAMINGS TO DROP (DO NOT PROPOSE):\n{under_bullets}\n"
+            f"  --> MANDATORY NEGATIVE CONSTRAINT: NEVER propose video titles or themes that use these "
+            f"underperforming framings or abstract topics (e.g., if the audit advises pivoting away from abstract "
+            f"theory, neuroscience, or theoretical lectures, DO NOT propose 'The Science of...', 'The Neuroscience of...', "
+            f"or purely theoretical concepts. Pivot completely to applied engineering, tangible builds, and high-performing formats)."
+        )
+
+    ww = audit_strategy.get("whats_working") or []
+    if ww:
+        ww_bullets = "\n".join(f"  * {w}" for w in ww)
+        sections.append(f"2. CORE WINNING FORMATS & TOPICS TO SCALE:\n{ww_bullets}")
+
+    gaps = audit_strategy.get("content_gaps") or []
+    if gaps:
+        gap_bullets = "\n".join(f"  * {g}" for g in gaps)
+        sections.append(f"3. IDENTIFIED AUDIENCE CONTENT GAPS:\n{gap_bullets}")
+
+    fmt = audit_strategy.get("format_insights") or []
+    if fmt:
+        fmt_bullets = "\n".join(f"  * {f}" for f in fmt)
+        sections.append(f"4. FORMAT & CADENCE RULES:\n{fmt_bullets}")
+
+    pri = audit_strategy.get("priorities") or []
+    if pri:
+        pri_bullets = "\n".join(f"  {idx+1}. {p}" for idx, p in enumerate(pri))
+        sections.append(
+            f"5. RANKED STRATEGIC PRIORITIES:\n{pri_bullets}\n"
+            f"  --> MANDATORY RULE: The 4-week roadmap must directly execute these priorities in order."
+        )
+
+    sections.append(
+        f"6. CADENCE & SCHEDULE VOLUME TARGET:\n"
+        f"  - Target Cadence: {target_cadence}\n"
+        f"  - Weekly Release Count: EXACTLY {items_per_week} primary video idea per week ({items_per_week * 4} videos total across 4 weeks). "
+        f"Do NOT over-schedule or list more videos than the target cadence."
+    )
+    return "\n\n".join(sections)
+
+
 async def generate_roadmap(
-    context: str, web_context: str, weeks: int = 4, directives: str = ""
+    context: str,
+    web_context: str,
+    weeks: int = 4,
+    directives: str = "",
+    audit_strategy: dict | None = None,
+    upload_timing: dict | None = None,
+    cadence=None,
+    flagged_videos: list[dict] | None = None,
+    violation_note: str = "",
+    time_of_day_allowed: bool | None = None,
 ) -> dict:
-    """A multi-week posting roadmap (dates assigned by the caller)."""
+    """A multi-week posting roadmap (dates assigned by the caller).
+
+    ``cadence`` is a ``youtube_report_rules.Cadence`` and is the only authority on
+    how many items to produce and what rate to state. This function used to derive
+    its own from ``uploads_per_week``/``upload_frequency`` literals while the audit
+    model independently wrote a different rate into its own prose — that is how one
+    report managed to claim an 8-10 day loop, 3-4 releases a month, one documentary
+    a week, and then list eight videos across four weeks.
+
+    ``violation_note`` is set on a regeneration pass to quote the model's previous
+    breach back at it.
+
+    ``time_of_day_allowed`` defaults to the gate's verdict for ``upload_timing``;
+    when it is false the roadmap may schedule days but never hours.
+    """
+    from app.services.youtube_metrics import timing_allows_time_of_day
+    from app.services.youtube_report_rules import Cadence, compute_cadence
+
+    if cadence is None:
+        cadence = compute_cadence({}, upload_timing)
+    assert isinstance(cadence, Cadence)
+
+    # Scheduling notes are prose too, and a roadmap rationale naming an hour
+    # contradicts page 2 exactly as loudly as a priority does. Default read from
+    # the timing block this call was already given, so a caller cannot forget.
+    if time_of_day_allowed is None:
+        time_of_day_allowed = timing_allows_time_of_day(upload_timing)
+    directives = f"{directives}\n{_time_of_day_directive(time_of_day_allowed)}".strip()
+
+    items_per_week = cadence.items_per_week
+    target_cadence = cadence.label
+
+    strategy_constraints = _format_strategy_constraints(
+        audit_strategy, target_cadence=target_cadence, items_per_week=items_per_week
+    )
+    flagged_block = _format_flagged_videos(flagged_videos)
+    if violation_note:
+        flagged_block = f"{flagged_block}\n\n{violation_note}".strip()
+
     llm, fallback_chain, model = _build_analysis_llm_and_chain()
     _used: dict = {}  # filled in with the tier that actually answered
     prompt = ROADMAP_PROMPT.format(
         weeks=weeks,
         context=context,
+        strategy_constraints=strategy_constraints,
+        flagged_block=flagged_block,
+        target_cadence=target_cadence,
+        items_per_week=items_per_week,
         web_context=web_context or "(no live results available)",
         schema=_ROADMAP_SCHEMA_HINT,
         directives=directives,
@@ -439,7 +662,19 @@ async def generate_roadmap(
         used=_used,
     )
     result = roadmap.model_dump()
-    result["model"] = _used.get("model") or model
+
+    # The cadence the report displays is computed, never quoted from the model —
+    # it is rendered verbatim in the roadmap header and the PDF.
+    result["cadence"] = cadence.label
+
+    # Trim over-scheduling rather than letting the item count become a fifth,
+    # contradicting statement of the cadence.
+    for week in result.get("weeks") or []:
+        items = week.get("items") or []
+        if len(items) > items_per_week:
+            week["items"] = items[:items_per_week]
+
+    _stamp_provenance(result, _used, model)
     return result
 
 

@@ -41,6 +41,7 @@ from app.db._util import (
     rows_to_dicts,
     slugify,  # noqa: F401  (re-exported; callers import it from here)
 )
+from app.provider_tiers import UNKNOWN_GRADE
 from app.db.tables import (
     AgentRun,
     ApiKey,
@@ -49,6 +50,7 @@ from app.db.tables import (
     AssistantMessage,
     BlogPost,
     ContentPlan,
+    GeneratedImage,
     GoogleOAuthToken,
     InstagramAiReport,
     LinkedinPost,
@@ -66,6 +68,8 @@ from app.db.tables import (
     YoutubeCompetitorDiscoveryRun,
     YoutubeCompetitorVideo,
     YoutubePlaylistItem,
+    YoutubeProspect,
+    YoutubeProspectReport,
     YoutubeScript,
     YoutubeVideoLive,
 )
@@ -173,10 +177,12 @@ async def update_run_status(
     status: str,
     final_result: str | None = None,
     duration: float | None = None,
+    topic: str | None = None,
+    image_url: str | None = None,
 ) -> bool:
     return await session.run_sync(
         lambda s: sync_queries.update_run_status(
-            s, run_id, user_id, status, final_result, duration
+            s, run_id, user_id, status, final_result, duration, topic, image_url
         )
     )
 
@@ -236,17 +242,123 @@ async def get_run_by_id(
     )
 
 
+def _build_runs_where(
+    user_id: str,
+    status: str | None = None,
+    search: str | None = None,
+    provider: str | None = None,
+    time_range: str | None = None,
+):
+    clauses = [AgentRun.user_id == user_id]
+    if status and status.lower() != "all":
+        if status.lower() in ("succeeded", "completed"):
+            clauses.append(AgentRun.status.in_(["completed", "published"]))
+        else:
+            clauses.append(AgentRun.status == status.lower())
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        clauses.append(
+            or_(
+                AgentRun.topic.ilike(term),
+                AgentRun.id.ilike(term),
+                AgentRun.provider_used.ilike(term),
+            )
+        )
+    if provider and provider.lower() != "all":
+        clauses.append(AgentRun.provider_used.ilike(f"%{provider.strip()}%"))
+    if time_range and time_range.lower() != "all":
+        now = _now()
+        tr = time_range.lower()
+        if tr == "today":
+            start_today = datetime(now.year, now.month, now.day, tzinfo=timezone.utc)
+            clauses.append(AgentRun.created_at >= start_today)
+        elif tr == "24h":
+            clauses.append(AgentRun.created_at >= now - timedelta(days=1))
+        elif tr == "7d":
+            clauses.append(AgentRun.created_at >= now - timedelta(days=7))
+        elif tr == "30d":
+            clauses.append(AgentRun.created_at >= now - timedelta(days=30))
+    return and_(*clauses)
+
+
 async def get_runs_by_user(
-    session: AsyncSession, user_id: str, limit: int = 50, offset: int = 0
+    session: AsyncSession,
+    user_id: str,
+    limit: int = 50,
+    offset: int = 0,
+    status: str | None = None,
+    search: str | None = None,
+    provider: str | None = None,
+    time_range: str | None = None,
+    sort_by: str = "created_at_desc",
 ) -> list[dict]:
-    return await _all(
-        session,
-        select(AgentRun)
-        .where(AgentRun.user_id == user_id)
-        .order_by(AgentRun.created_at.desc())
-        .limit(limit)
-        .offset(offset),
+    where_clause = _build_runs_where(user_id, status, search, provider, time_range)
+    stmt = select(AgentRun).where(where_clause)
+    if sort_by == "created_at_asc":
+        stmt = stmt.order_by(AgentRun.created_at.asc())
+    elif sort_by == "duration_desc":
+        stmt = stmt.order_by(AgentRun.duration_seconds.desc().nulls_last())
+    elif sort_by == "duration_asc":
+        stmt = stmt.order_by(AgentRun.duration_seconds.asc().nulls_last())
+    else:
+        stmt = stmt.order_by(AgentRun.created_at.desc())
+
+    return await _all(session, stmt.limit(limit).offset(offset))
+
+
+async def count_runs_by_user(
+    session: AsyncSession,
+    user_id: str,
+    status: str | None = None,
+    search: str | None = None,
+    provider: str | None = None,
+    time_range: str | None = None,
+) -> int:
+    where_clause = _build_runs_where(user_id, status, search, provider, time_range)
+    stmt = select(func.count()).select_from(AgentRun).where(where_clause)
+    result = await session.execute(stmt)
+    return result.scalar_one() or 0
+
+
+async def get_runs_stats_by_user(
+    session: AsyncSession,
+    user_id: str,
+) -> dict:
+    base_where = AgentRun.user_id == user_id
+    total_res = await session.execute(
+        select(
+            func.count().label("total"),
+            func.count().filter(AgentRun.status.in_(["completed", "published"])).label("completed"),
+            func.count().filter(AgentRun.status == "failed").label("failed"),
+            func.count().filter(AgentRun.status == "running").label("running"),
+            func.count().filter(AgentRun.status == "pending").label("pending"),
+            func.avg(AgentRun.duration_seconds).filter(AgentRun.duration_seconds.is_not(None)).label("avg_duration"),
+        ).where(base_where)
     )
+    row = total_res.mappings().first() or {}
+    total = row.get("total") or 0
+    completed = row.get("completed") or 0
+    failed = row.get("failed") or 0
+    running = row.get("running") or 0
+    pending = row.get("pending") or 0
+    avg_duration = round(float(row.get("avg_duration") or 0), 1)
+    success_rate = round((completed / total * 100), 1) if total > 0 else 0.0
+
+    prov_res = await session.execute(
+        select(AgentRun.provider_used).where(base_where, AgentRun.provider_used.is_not(None)).distinct()
+    )
+    providers = [p for (p,) in prov_res.all() if p]
+
+    return {
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "running": running,
+        "pending": pending,
+        "avg_duration": avg_duration,
+        "success_rate": success_rate,
+        "providers": providers,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -314,9 +426,9 @@ async def init_usage(session: AsyncSession, user_id: str) -> None:
         pg_insert(UsageLimit)
         .values(
             user_id=user_id,
-            plan="free",
+            plan="enterprise",
             runs_this_month=0,
-            max_runs_per_month=10,
+            max_runs_per_month=999999,
             reset_at=_now() + timedelta(days=30),
         )
         .on_conflict_do_nothing(index_elements=[UsageLimit.user_id])
@@ -954,6 +1066,115 @@ async def get_plan_items_across_platforms(
     else:
         stmt = stmt.order_by(PlanItem.created_at.desc())
     return await _all(session, stmt.limit(limit))
+
+
+def _overdue_clause(
+    user_id: str, today: str | date | None = None, platforms: list[str] | None = None
+):
+    """Past its scheduled date and not yet out the door.
+
+    The single definition of "overdue" in this codebase. The analytics count, the
+    assistant's list and its grouped summary all resolve to this, so the stat card
+    and the chat answer cannot disagree — which they did: the assistant listed one
+    day's items against a count spanning every past day.
+
+    ``today`` omitted falls back to Postgres ``current_date``; see the note in
+    ``get_planner_analytics`` for why that is a day off in a UTC container. An ISO
+    string is parsed to a ``date`` because asyncpg binds a DATE parameter from a
+    ``date`` and rejects a ``str`` outright.
+
+    An undated backlog idea is never overdue, hence the explicit NOT NULL.
+    """
+    if today is None:
+        day = func.current_date()
+    elif isinstance(today, str):
+        day = date.fromisoformat(today)
+    else:
+        day = today
+
+    clauses = [
+        PlanItem.user_id == user_id,
+        PlanItem.production_status.not_in(PUBLISHED_STATUSES),
+        PlanItem.scheduled_date.is_not(None),
+        PlanItem.scheduled_date < day,
+    ]
+    if platforms:
+        clauses.append(PlanItem.platform.in_(platforms))
+    return and_(*clauses)
+
+
+async def count_overdue_plan_items(
+    session: AsyncSession,
+    user_id: str,
+    today: str | date | None = None,
+    platforms: list[str] | None = None,
+) -> int:
+    """How many items are overdue — the number the assistant quotes.
+
+    Cheap enough to call before deciding whether to list the rows or summarize
+    them, which is the point: a count query is one index scan, not a fetch.
+    """
+    return (
+        await session.execute(
+            select(func.count())
+            .select_from(PlanItem)
+            .where(_overdue_clause(user_id, today, platforms))
+        )
+    ).scalar_one()
+
+
+async def get_overdue_plan_items(
+    session: AsyncSession,
+    user_id: str,
+    today: str | date | None = None,
+    platforms: list[str] | None = None,
+    limit: int = 60,
+) -> list[dict]:
+    """The overdue items themselves, most overdue first.
+
+    ``get_plan_items_across_platforms`` cannot express this: its date filter is a
+    closed range, and it applies no status predicate — so asking it for
+    "everything before today" also returns rows that already went out.
+
+    Index-backed by ix_plan_items_user_platform_scheduled.
+    """
+    stmt = (
+        select(PlanItem)
+        .where(_overdue_clause(user_id, today, platforms))
+        .order_by(
+            PlanItem.scheduled_date.asc(),
+            PlanItem.event_time.asc().nulls_last(),
+            PlanItem.created_at.asc(),
+        )
+        .limit(limit)
+    )
+    return await _all(session, stmt)
+
+
+async def summarize_overdue_plan_items(
+    session: AsyncSession,
+    user_id: str,
+    today: str | date | None = None,
+    platforms: list[str] | None = None,
+) -> list[dict]:
+    """Overdue counts grouped by platform and calendar month, oldest month first.
+
+    What the assistant answers with when there are too many items to list. One
+    GROUP BY, so the breakdown costs the same for 40 overdue items as for 4,000.
+    """
+    month = func.to_char(PlanItem.scheduled_date, "YYYY-MM").label("month")
+    return await _all(
+        session,
+        select(
+            PlanItem.platform,
+            month,
+            func.count().label("count"),
+            func.min(PlanItem.scheduled_date).label("oldest"),
+        )
+        .where(_overdue_clause(user_id, today, platforms))
+        .group_by(PlanItem.platform, month)
+        .order_by(month, PlanItem.platform),
+    )
 
 
 async def get_pending_review_contents(
@@ -1944,13 +2165,12 @@ async def get_planner_analytics(
     unpublished = PlanItem.production_status.not_in(PUBLISHED_STATUSES)
     # An undated backlog idea is neither overdue nor upcoming.
     dated = PlanItem.scheduled_date.is_not(None)
-    overdue = (
-        await session.execute(
-            select(func.count())
-            .select_from(PlanItem)
-            .where(owned_item, unpublished, dated, PlanItem.scheduled_date < today_expr)
-        )
-    ).scalar_one()
+    # Deliberately not inlined: this figure is the stat card, and the assistant
+    # lists the rows behind it. Both go through _overdue_clause so they cannot
+    # drift apart.
+    overdue = await count_overdue_plan_items(
+        session, user_id, today=today, platforms=[platform] if platform else None
+    )
     upcoming = (
         await session.execute(
             select(func.count())
@@ -2834,4 +3054,214 @@ async def get_assistant_actions_for_messages(
             AssistantAction.user_id == user_id,
         )
         .order_by(AssistantAction.created_at.asc()),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Image studio
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def create_generated_image(
+    session: AsyncSession,
+    user_id: str,
+    prompt: str,
+    filename: str,
+    model: str,
+    aspect_ratio: str,
+    image_size: str,
+    negative_prompt: str | None = None,
+    seed: int | None = None,
+    duration_s: float | None = None,
+) -> dict:
+    """Record one render. The row is what later proves the file is this user's."""
+    row = (
+        await session.execute(
+            insert(GeneratedImage)
+            .values(
+                id=generate_uuid(),
+                user_id=user_id,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                model=model,
+                aspect_ratio=aspect_ratio,
+                image_size=image_size,
+                seed=seed,
+                filename=filename,
+                duration_s=duration_s,
+            )
+            .returning(GeneratedImage)
+        )
+    ).one()
+    return row_to_dict(row)
+
+
+async def get_generated_images(
+    session: AsyncSession, user_id: str, limit: int = 50, offset: int = 0
+) -> list[dict]:
+    """The user's gallery, newest first. Index-backed by ix_generated_images_user_created."""
+    return await _all(
+        session,
+        select(GeneratedImage)
+        .where(GeneratedImage.user_id == user_id)
+        .order_by(GeneratedImage.created_at.desc(), GeneratedImage.id.desc())
+        .limit(limit)
+        .offset(offset),
+    )
+
+
+async def count_generated_images(session: AsyncSession, user_id: str) -> int:
+    return (
+        await session.execute(
+            select(func.count()).select_from(GeneratedImage).where(
+                GeneratedImage.user_id == user_id
+            )
+        )
+    ).scalar_one()
+
+
+async def get_generated_image(
+    session: AsyncSession, image_id: str, user_id: str
+) -> dict | None:
+    """One render, owner-scoped. The user_id predicate is the authorization."""
+    return await _one(
+        session,
+        select(GeneratedImage).where(
+            GeneratedImage.id == image_id, GeneratedImage.user_id == user_id
+        ),
+    )
+
+
+async def delete_generated_image(
+    session: AsyncSession, image_id: str, user_id: str
+) -> bool:
+    return await _touched(
+        session,
+        delete(GeneratedImage).where(
+            GeneratedImage.id == image_id, GeneratedImage.user_id == user_id
+        ),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# YouTube prospects — third-party channel audits for outreach
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def upsert_prospect(session: AsyncSession, user_id: str, row: dict) -> dict:
+    """Insert or refresh one prospect, keyed on ``(user_id, channel_id)``.
+
+    ``outreach_status`` is never overwritten by a refresh — re-running the audit
+    on someone already marked "contacted" must not reset them to "new".
+    """
+    valid = {c.name for c in YoutubeProspect.__table__.columns}
+    values = {"user_id": user_id, **{k: v for k, v in row.items() if k in valid}}
+    values.pop("id", None)
+    stmt = pg_insert(YoutubeProspect).values(values)
+    set_ = {
+        k: getattr(stmt.excluded, k)
+        for k in values
+        if k not in ("user_id", "channel_id", "created_at", "outreach_status")
+    }
+    set_["updated_at"] = func.now()
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[YoutubeProspect.user_id, YoutubeProspect.channel_id],
+        set_=set_,
+    ).returning(YoutubeProspect)
+    return row_to_dict((await session.execute(stmt)).one())
+
+
+async def list_prospects(session: AsyncSession, user_id: str, limit: int = 100) -> list[dict]:
+    return await _all(
+        session,
+        select(YoutubeProspect)
+        .where(YoutubeProspect.user_id == user_id)
+        .order_by(YoutubeProspect.created_at.desc())
+        .limit(limit),
+    )
+
+
+async def get_prospect(session: AsyncSession, user_id: str, channel_id: str) -> dict | None:
+    """One prospect, owner-scoped. The user_id predicate is the authorization."""
+    return await _one(
+        session,
+        select(YoutubeProspect).where(
+            YoutubeProspect.user_id == user_id, YoutubeProspect.channel_id == channel_id
+        ),
+    )
+
+
+async def update_prospect_status(
+    session: AsyncSession, user_id: str, channel_id: str, status: str
+) -> dict | None:
+    return await _one(
+        session,
+        update(YoutubeProspect)
+        .where(YoutubeProspect.user_id == user_id, YoutubeProspect.channel_id == channel_id)
+        .values(outreach_status=status, updated_at=func.now())
+        .returning(YoutubeProspect),
+    )
+
+
+async def delete_prospect(session: AsyncSession, user_id: str, channel_id: str) -> bool:
+    """Reports cascade via the FK on ``youtube_prospect_reports.prospect_id``."""
+    return await _touched(
+        session,
+        delete(YoutubeProspect).where(
+            YoutubeProspect.user_id == user_id, YoutubeProspect.channel_id == channel_id
+        ),
+    )
+
+
+async def create_prospect_report(
+    session: AsyncSession,
+    user_id: str,
+    prospect_id: str,
+    kind: str,
+    payload: dict,
+    weeks: int | None = None,
+    model: str | None = None,
+    tier: dict | None = None,
+) -> dict:
+    """Insert one report half, recording which cascade tier produced it.
+
+    ``tier`` comes from the report's provenance block. It is defaulted rather
+    than required so that a caller which forgets it writes an ``internal_only``
+    row — blocked from export — instead of an unmarked one that would sail
+    through the gate.
+    """
+    tier = tier or {}
+    return await _one(
+        session,
+        insert(YoutubeProspectReport)
+        .values(
+            id=generate_uuid(),
+            prospect_id=prospect_id,
+            user_id=user_id,
+            kind=kind,
+            weeks=weeks,
+            model=model,
+            tier_index=tier.get("index"),
+            tier_name=tier.get("name"),
+            tier_grade=tier.get("grade") or UNKNOWN_GRADE,
+            resolved_model=tier.get("model"),
+            payload_json=payload,
+        )
+        .returning(YoutubeProspectReport),
+    )
+
+
+async def get_latest_prospect_report(
+    session: AsyncSession, user_id: str, prospect_id: str, kind: str
+) -> dict | None:
+    return await _one(
+        session,
+        select(YoutubeProspectReport)
+        .where(
+            YoutubeProspectReport.user_id == user_id,
+            YoutubeProspectReport.prospect_id == prospect_id,
+            YoutubeProspectReport.kind == kind,
+        )
+        .order_by(YoutubeProspectReport.created_at.desc())
+        .limit(1),
     )

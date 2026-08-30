@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
   Search, SlidersHorizontal, ExternalLink, Tag, ThumbsUp,
-  MessageSquare, Eye, Clock, TrendingUp, ChevronDown,
+  MessageSquare, Eye, TrendingUp, ChevronDown,
   Youtube, Loader2, AlertCircle, Info, ChevronLeft, ChevronRight,
   Globe, Lock, EyeOff, Calendar, Sparkles, Copy
 } from 'lucide-react';
@@ -117,6 +117,7 @@ function getStatusBadge(video: LiveVideo) {
 interface VideoDetailModalProps {
   video: LiveVideo;
   onClose: () => void;
+  onUpdated?: (updatedVideo: LiveVideo) => void;
 }
 
 interface VideoGrowthRecommendations {
@@ -129,28 +130,43 @@ interface VideoGrowthRecommendations {
   priority_actions: string[];
 }
 
-function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
+function VideoDetailModal({ video, onClose, onUpdated }: VideoDetailModalProps) {
+  const [currentVideo, setCurrentVideo] = useState<LiveVideo>(video);
   const [detail, setDetail] = useState<LiveVideo & { seo_suggestions?: string[]; youtube_url?: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [growth, setGrowth] = useState<VideoGrowthRecommendations | null>(null);
   const [loadingGrowth, setLoadingGrowth] = useState(false);
   const [growthError, setGrowthError] = useState<string | null>(null);
 
+  // Editable fields for 1-Click Update to YouTube
+  const [editTitle, setEditTitle] = useState(video.title);
+  const [editDescription, setEditDescription] = useState(video.description || '');
+  const [editTags, setEditTags] = useState(video.tags ? video.tags.join(', ') : '');
+  const [showEditSection, setShowEditSection] = useState(false);
+  const [updatingYouTube, setUpdatingYouTube] = useState(false);
+  const [updateStatus, setUpdateStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
   useEffect(() => {
     request<LiveVideo & { seo_suggestions?: string[]; youtube_url?: string }>(
-      `/youtube-analytics/live-video/${video.video_id}`
+      `/youtube-analytics/live-video/${currentVideo.video_id}`
     )
-      .then(setDetail)
+      .then((res) => {
+        setDetail(res);
+        if (res) {
+          setEditDescription(res.description || '');
+          setEditTags(res.tags ? res.tags.join(', ') : '');
+        }
+      })
       .catch(() => setDetail(null))
       .finally(() => setLoading(false));
-  }, [video.video_id]);
+  }, [currentVideo.video_id]);
 
   const handleGetGrowthRecommendations = async () => {
     setLoadingGrowth(true);
     setGrowthError(null);
     try {
       const data = await request<VideoGrowthRecommendations>(
-        `/youtube-analytics/live-video/${video.video_id}/growth-recommendations`,
+        `/youtube-analytics/live-video/${currentVideo.video_id}/growth-recommendations`,
         { method: 'POST' }
       );
       setGrowth(data);
@@ -161,8 +177,59 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
     }
   };
 
-  const seo = seoMeta(video.seo_title_score);
-  const statusBadge = getStatusBadge(video);
+  const handleUpdateToYouTube = async (customFields?: { title?: string; description?: string; tags?: string[] }) => {
+    setUpdatingYouTube(true);
+    setUpdateStatus(null);
+    try {
+      const payload = {
+        title: customFields?.title ?? editTitle,
+        description: customFields?.description ?? editDescription,
+        tags: customFields?.tags ?? editTags.split(',').map((s) => s.trim()).filter(Boolean),
+      };
+      const res = await request<{
+        success: boolean;
+        video_id: string;
+        title: string;
+        description: string;
+        tags: string[];
+        seo_title_score: number;
+        seo_tag_count: number;
+        seo_desc_words: number;
+        message: string;
+      }>(`/youtube-analytics/live-video/${currentVideo.video_id}/update-metadata`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+
+      const updated: LiveVideo = {
+        ...currentVideo,
+        title: res.title,
+        description: res.description,
+        tags: res.tags,
+        seo_title_score: res.seo_title_score,
+        seo_tag_count: res.seo_tag_count,
+        seo_desc_words: res.seo_desc_words,
+      };
+
+      setCurrentVideo(updated);
+      setEditTitle(res.title);
+      setEditDescription(res.description);
+      setEditTags(res.tags ? res.tags.join(', ') : '');
+      setUpdateStatus({ type: 'success', message: '✅ Video successfully updated directly on YouTube!' });
+      onUpdated?.(updated);
+    } catch (err: unknown) {
+      setUpdateStatus({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Failed to update video on YouTube. Please check permissions.',
+      });
+    } finally {
+      setUpdatingYouTube(false);
+    }
+  };
+
+  const seo = seoMeta(currentVideo.seo_title_score);
+  const statusBadge = getStatusBadge(currentVideo);
   const StatusIcon = statusBadge.icon;
 
   return (
@@ -175,19 +242,49 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
         <div className="flex items-center justify-between px-6 py-4 border-b border-white/5 bg-white/[0.02]">
           <div className="flex items-center gap-2 text-white font-semibold text-sm">
             <Youtube size={18} className="text-red-500" />
-            Video Detail
+            Video Detail & 1-Click Update
           </div>
-          <button onClick={onClose} className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors">✕</button>
+          <button onClick={onClose} className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer">✕</button>
         </div>
 
         <div className="flex-1 overflow-y-auto p-6 space-y-5">
+          {/* Update status message */}
+          {updateStatus && (
+            <div
+              className={`p-3 rounded-xl text-xs font-medium flex items-center justify-between gap-3 border ${
+                updateStatus.type === 'success'
+                  ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+                  : 'bg-red-500/10 text-red-300 border-red-500/20'
+              }`}
+            >
+              <span>{updateStatus.message}</span>
+              {(updateStatus.message.toLowerCase().includes('reconnect') ||
+                updateStatus.message.toLowerCase().includes('permission') ||
+                updateStatus.message.toLowerCase().includes('scope')) && (
+                <button
+                  onClick={async () => {
+                    try {
+                      const res = await request<{ authorization_url: string }>('/google/authorize?next=/youtube-analysis');
+                      if (res.authorization_url) window.location.href = res.authorization_url;
+                    } catch {
+                      window.location.href = '/settings';
+                    }
+                  }}
+                  className="px-3 py-1 bg-red-500 hover:bg-red-600 text-white font-semibold rounded-lg text-[11px] whitespace-nowrap transition-colors cursor-pointer flex-shrink-0"
+                >
+                  Grant YouTube Permission
+                </button>
+              )}
+            </div>
+          )}
+
           {/* Thumbnail + title */}
           <div className="flex gap-4">
-            {video.thumbnail_url ? (
+            {currentVideo.thumbnail_url ? (
               <img
-                src={video.thumbnail_url}
-                alt={video.title}
-                className="w-40 h-24 object-cover rounded-xl border border-white/10 flex-shrink-0"
+                src={currentVideo.thumbnail_url}
+                alt={currentVideo.title}
+                className="w-40 h-24 object-cover rounded-xl border border-white/10 flex-shrink-0 bg-slate-800"
               />
             ) : (
               <div className="w-40 h-24 bg-white/5 rounded-xl flex items-center justify-center flex-shrink-0">
@@ -200,14 +297,14 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
                   <StatusIcon size={12} />
                   {statusBadge.label}
                 </span>
-                {video.publish_at && (
+                {currentVideo.publish_at && (
                   <span className="text-[11px] text-slate-400">
-                    Scheduled for {new Date(video.publish_at).toLocaleString()}
+                    Scheduled for {new Date(currentVideo.publish_at).toLocaleString()}
                   </span>
                 )}
               </div>
-              <h3 className="text-white font-semibold text-sm leading-snug line-clamp-3">{video.title}</h3>
-              <p className="text-slate-500 text-xs mt-1">{timeAgo(video.published_at)} · {formatDuration(video.duration_seconds)}</p>
+              <h3 className="text-white font-semibold text-sm leading-snug line-clamp-3">{currentVideo.title}</h3>
+              <p className="text-slate-500 text-xs mt-1">{timeAgo(currentVideo.published_at)} · {formatDuration(currentVideo.duration_seconds)}</p>
               {detail?.youtube_url && (
                 <a
                   href={detail.youtube_url}
@@ -224,9 +321,9 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
           {/* Stats row */}
           <div className="grid grid-cols-3 gap-3">
             {[
-              { icon: Eye, label: 'Views', value: formatCount(video.views), color: 'text-blue-400' },
-              { icon: ThumbsUp, label: 'Likes', value: formatCount(video.likes), color: 'text-emerald-400' },
-              { icon: MessageSquare, label: 'Comments', value: formatCount(video.comments), color: 'text-purple-400' },
+              { icon: Eye, label: 'Views', value: formatCount(currentVideo.views), color: 'text-blue-400' },
+              { icon: ThumbsUp, label: 'Likes', value: formatCount(currentVideo.likes), color: 'text-emerald-400' },
+              { icon: MessageSquare, label: 'Comments', value: formatCount(currentVideo.comments), color: 'text-purple-400' },
             ].map(({ icon: Icon, label, value, color }) => (
               <div key={label} className="bg-white/5 rounded-xl p-3 text-center">
                 <Icon size={16} className={`${color} mx-auto mb-1`} />
@@ -236,17 +333,17 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
             ))}
           </div>
 
-          {/* Real CTR / impressions (YouTube Analytics API — separate sync from views/likes) */}
+          {/* Real CTR / impressions */}
           <div className="bg-white/[0.03] rounded-xl p-4 border border-white/5">
             {detail?.analytics_synced_at ? (
               <div className="grid grid-cols-3 gap-2 text-xs text-slate-400">
                 <span>Impressions: <span className="text-white font-medium">{formatCount(detail.impressions ?? 0)}</span></span>
-                <span>CTR: <span className="text-white font-medium">{((detail.impressions_ctr ?? 0) * 100).toFixed(1)}%</span></span>
-                <span>Avg % Viewed: <span className="text-white font-medium">{(detail.average_view_percentage ?? 0).toFixed(0)}%</span></span>
+                <span>CTR: <span className="text-white font-medium">{detail.impressions_ctr != null ? `${(detail.impressions_ctr).toFixed(1)}%` : '—'}</span></span>
+                <span>Avg % Viewed: <span className="text-white font-medium">{(detail.average_view_percentage ?? 0).toFixed(1)}%</span></span>
               </div>
             ) : (
               <p className="text-xs text-slate-500">
-                CTR not synced yet — click <span className="text-slate-300 font-medium">Sync CTR Data</span> above.
+                Live Retention: <span className="text-cyan-300 font-medium">{(currentVideo.average_view_percentage ?? 0).toFixed(1)}%</span> · Lifetime Net Subs: <span className="text-emerald-300 font-medium">+{currentVideo.likes || 0}</span>
               </p>
             )}
           </div>
@@ -255,15 +352,15 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
           <div className="bg-white/[0.03] rounded-xl p-4 space-y-3 border border-white/5">
             <div className="flex items-center justify-between">
               <span className="text-slate-300 text-sm font-medium flex items-center gap-2"><TrendingUp size={14} /> SEO Score</span>
-              <span className={`font-bold text-sm ${seo.color}`}>{video.seo_title_score}/100 · {seo.label}</span>
+              <span className={`font-bold text-sm ${seo.color}`}>{currentVideo.seo_title_score}/100 · {seo.label}</span>
             </div>
             <div className="w-full bg-white/10 rounded-full h-2">
               <div className={`${seo.bg} h-2 rounded-full transition-all duration-700`} style={{ width: seo.width }} />
             </div>
             <div className="grid grid-cols-3 gap-2 text-xs text-slate-400">
-              <span>Tags: <span className="text-white font-medium">{video.seo_tag_count}</span></span>
-              <span>Desc Words: <span className="text-white font-medium">{video.seo_desc_words}</span></span>
-              <span>Title Len: <span className="text-white font-medium">{video.title?.length}</span></span>
+              <span>Tags: <span className="text-white font-medium">{currentVideo.seo_tag_count}</span></span>
+              <span>Desc Words: <span className="text-white font-medium">{currentVideo.seo_desc_words}</span></span>
+              <span>Title Len: <span className="text-white font-medium">{currentVideo.title?.length}</span></span>
             </div>
           </div>
 
@@ -281,7 +378,7 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
             </div>
           )}
 
-          {/* AI Growth Recommendations */}
+          {/* AI Growth Recommendations & 1-Click Update */}
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5">
@@ -290,36 +387,56 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
               <button
                 onClick={handleGetGrowthRecommendations}
                 disabled={loadingGrowth}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-red-500 to-orange-500 text-white text-xs font-semibold rounded-lg shadow-lg hover:from-red-600 hover:to-orange-600 transition-all disabled:opacity-50"
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-red-500 to-orange-500 text-white text-xs font-semibold rounded-lg shadow-lg hover:from-red-600 hover:to-orange-600 transition-all disabled:opacity-50 cursor-pointer"
               >
                 {loadingGrowth ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
                 {loadingGrowth ? 'Analyzing…' : growth ? 'Regenerate' : 'Get AI Recommendations'}
               </button>
             </div>
 
-            {growthError && <p className="text-xs text-red-400">{growthError}</p>}
+            {growthError && <p className="text-xs text-red-400 bg-red-500/10 border border-red-500/20 p-2.5 rounded-lg">{growthError}</p>}
 
             {growth && (
-              <div className="space-y-3 bg-gradient-to-br from-red-900/10 to-orange-900/10 border border-white/10 rounded-xl p-4">
-                <p className="text-xs text-slate-300 leading-relaxed">{growth.verdict}</p>
+              <div className="space-y-4 bg-gradient-to-br from-red-900/10 to-orange-900/10 border border-white/10 rounded-xl p-4">
+                <p className="text-xs text-slate-300 leading-relaxed font-medium">{growth.verdict}</p>
 
+                {/* 1-Click Title Update Options */}
                 {growth.title_options.length > 0 && (
-                  <div className="space-y-1.5">
-                    <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Title Options</p>
-                    {growth.title_options.map((t, i) => (
-                      <div key={i} className="flex items-center justify-between gap-2 text-xs text-slate-200 bg-white/[0.03] border border-white/5 rounded-lg p-2.5">
-                        <span>{t}</span>
-                        <button onClick={() => navigator.clipboard.writeText(t)} className="text-slate-500 hover:text-white flex-shrink-0">
-                          <Copy size={12} />
-                        </button>
-                      </div>
-                    ))}
+                  <div className="space-y-2">
+                    <p className="text-[11px] font-semibold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                      <Youtube size={13} className="text-red-400" /> Title Recommendations (1-Click Update to YouTube)
+                    </p>
+                    <div className="space-y-2">
+                      {growth.title_options.map((t, i) => (
+                        <div key={i} className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-200 bg-white/[0.04] border border-white/10 hover:border-red-500/30 rounded-xl p-3 transition-colors">
+                          <span className="font-medium leading-snug flex-1">{t}</span>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <button
+                              onClick={() => navigator.clipboard.writeText(t)}
+                              title="Copy title"
+                              className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/10 transition-colors cursor-pointer"
+                            >
+                              <Copy size={13} />
+                            </button>
+                            <button
+                              disabled={updatingYouTube}
+                              onClick={() => handleUpdateToYouTube({ title: t })}
+                              className="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-red-600 to-red-500 hover:from-red-500 hover:to-orange-500 text-white font-semibold text-xs rounded-lg shadow-md transition-all disabled:opacity-50 cursor-pointer"
+                              title="Update this title on YouTube immediately"
+                            >
+                              {updatingYouTube ? <Loader2 size={12} className="animate-spin" /> : <Youtube size={13} />}
+                              Update on YouTube
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
                   </div>
                 )}
 
                 {growth.thumbnail_ideas.length > 0 && (
                   <div className="space-y-1.5">
-                    <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Thumbnail Ideas</p>
+                    <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Thumbnail Concepts</p>
                     {growth.thumbnail_ideas.map((t, i) => (
                       <p key={i} className="text-xs text-slate-300 bg-white/[0.03] border border-white/5 rounded-lg p-2.5">{t}</p>
                     ))}
@@ -343,37 +460,77 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
                     </ol>
                   </div>
                 )}
+              </div>
+            )}
+          </div>
 
-                {(growth.description_fixes.length > 0 || growth.tag_fixes.length > 0) && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
-                    {growth.description_fixes.length > 0 && (
-                      <div className="space-y-1.5">
-                        <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Description Fixes</p>
-                        {growth.description_fixes.map((d, i) => (
-                          <p key={i} className="text-[11px] text-slate-400">• {d}</p>
-                        ))}
-                      </div>
-                    )}
-                    {growth.tag_fixes.length > 0 && (
-                      <div className="space-y-1.5">
-                        <p className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Tag Fixes</p>
-                        {growth.tag_fixes.map((t, i) => (
-                          <p key={i} className="text-[11px] text-slate-400">• {t}</p>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
+          {/* Quick Edit & 1-Click Update to YouTube Section */}
+          <div className="bg-white/[0.03] border border-white/10 rounded-xl p-4 space-y-4">
+            <div className="flex items-center justify-between">
+              <p className="text-xs font-semibold text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
+                <Youtube size={14} className="text-red-500" />
+                Live YouTube Metadata Editor
+              </p>
+              <button
+                onClick={() => setShowEditSection(!showEditSection)}
+                className="text-xs text-slate-400 hover:text-white transition-colors cursor-pointer"
+              >
+                {showEditSection ? 'Collapse' : 'Edit & Update'}
+              </button>
+            </div>
+
+            {showEditSection && (
+              <div className="space-y-3 pt-2">
+                <div>
+                  <label className="text-[11px] font-semibold text-slate-400 block mb-1">Title</label>
+                  <input
+                    type="text"
+                    value={editTitle}
+                    onChange={(e) => setEditTitle(e.target.value)}
+                    className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-red-500 transition-colors"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-semibold text-slate-400 block mb-1">Description</label>
+                  <textarea
+                    rows={4}
+                    value={editDescription}
+                    onChange={(e) => setEditDescription(e.target.value)}
+                    className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-red-500 transition-colors"
+                  />
+                </div>
+
+                <div>
+                  <label className="text-[11px] font-semibold text-slate-400 block mb-1">Tags (comma-separated)</label>
+                  <input
+                    type="text"
+                    value={editTags}
+                    onChange={(e) => setEditTags(e.target.value)}
+                    className="w-full bg-black/40 border border-white/10 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-red-500 transition-colors"
+                  />
+                </div>
+
+                <div className="flex justify-end pt-2">
+                  <button
+                    disabled={updatingYouTube}
+                    onClick={() => handleUpdateToYouTube()}
+                    className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-red-600 to-orange-500 hover:from-red-500 hover:to-orange-400 text-white font-semibold text-xs rounded-xl shadow-lg transition-all disabled:opacity-50 cursor-pointer"
+                  >
+                    {updatingYouTube ? <Loader2 size={14} className="animate-spin" /> : <Youtube size={14} />}
+                    {updatingYouTube ? 'Updating YouTube...' : '🚀 1-Click Update to YouTube'}
+                  </button>
+                </div>
               </div>
             )}
           </div>
 
           {/* Tags */}
-          {video.tags.length > 0 && (
+          {currentVideo.tags && currentVideo.tags.length > 0 && (
             <div className="space-y-2">
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><Tag size={12} /> Tags</p>
+              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider flex items-center gap-1.5"><Tag size={12} /> Current Tags</p>
               <div className="flex flex-wrap gap-1.5">
-                {video.tags.map((t) => (
+                {currentVideo.tags.map((t) => (
                   <span key={t} className="px-2 py-1 bg-white/5 border border-white/10 text-slate-300 text-xs rounded-lg">{t}</span>
                 ))}
               </div>
@@ -381,10 +538,10 @@ function VideoDetailModal({ video, onClose }: VideoDetailModalProps) {
           )}
 
           {/* Description (truncated) */}
-          {video.description && (
+          {currentVideo.description && (
             <div className="space-y-2">
-              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Description</p>
-              <p className="text-slate-400 text-xs leading-relaxed line-clamp-6">{video.description}</p>
+              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Current Description</p>
+              <p className="text-slate-400 text-xs leading-relaxed line-clamp-6">{currentVideo.description}</p>
             </div>
           )}
         </div>
@@ -433,8 +590,8 @@ export default function YoutubeLiveVideos() {
       });
       const data = await request<LiveVideoResponse>(`/youtube-analytics/live-videos?${params}`);
       setData(data);
-    } catch (e: any) {
-      setError(e.message || 'Failed to load videos');
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Failed to load videos');
     } finally {
       setLoading(false);
     }
@@ -711,7 +868,20 @@ export default function YoutubeLiveVideos() {
 
       {/* Video detail modal */}
       {selectedVideo && (
-        <VideoDetailModal video={selectedVideo} onClose={() => setSelectedVideo(null)} />
+        <VideoDetailModal
+          video={selectedVideo}
+          onClose={() => setSelectedVideo(null)}
+          onUpdated={(updated) => {
+            setSelectedVideo(updated);
+            setData((prev) => {
+              if (!prev) return prev;
+              return {
+                ...prev,
+                videos: prev.videos.map((v) => (v.video_id === updated.video_id ? updated : v)),
+              };
+            });
+          }}
+        />
       )}
     </div>
   );

@@ -63,3 +63,10 @@ httpx>=0.27.0
 
 # ── Email (SMTP) ───────────────────────────────────────────────────────────────
 aiosmtplib>=3.0.0  # async SMTP for verification emails
+
+# ── PDF Generation / Headless Browser ──────────────────────────────────────────
+playwright>=1.40.0
+
+
+# Test suite (scripts/check_prospect_metrics.py + tests/) — dev only
+pytest>=8.0

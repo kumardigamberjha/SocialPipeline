@@ -167,6 +167,17 @@ def build_instagram_prompt(
 # ─────────────────────────────────────────────────────────────
 
 
+# Failures a different key can actually fix. Quota on the free tier is counted
+# per project, so 429 is the case this exists for; 401/403 cover a key that was
+# revoked, restricted or mistyped.
+#
+# Deliberately excluded: 503 (the *model* is overloaded — every key queues for
+# the same capacity, so retrying just spends the backup's quota on the same
+# outcome), 400/404 (a malformed request or a bad model id fails identically
+# for anyone), and 5xx other than 503.
+_KEY_SCOPED_FAILURES = frozenset({401, 403, 429})
+
+
 class GeminiImageClient:
     """Thin async wrapper over ``models/{model}:generateContent``.
 
@@ -177,8 +188,24 @@ class GeminiImageClient:
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None):
         settings = get_settings()
         self.api_key = api_key or settings.gemini_api_key
+        # Only meaningful when the caller did not pin a key explicitly: an
+        # explicit api_key means "use this one", not "start here".
+        self.backup_api_key = None if api_key else settings.gemini_backup_api_key
         self.model = model or settings.gemini_image_model
         self.timeout = settings.gemini_image_timeout
+
+    def _keys(self) -> list[tuple[str, str]]:
+        """(label, key) pairs to try, in order. Labels are for logging only."""
+        pairs = [("primary", self.api_key), ("backup", self.backup_api_key)]
+        seen: set[str] = set()
+        out = []
+        for label, key in pairs:
+            # A backup identical to the primary is a config mistake, not a
+            # fallback — trying it twice just spends the same exhausted quota.
+            if key and key not in seen:
+                seen.add(key)
+                out.append((label, key))
+        return out
 
     async def health_check(self) -> bool:
         """True when a key is configured and the model is reachable.
@@ -188,19 +215,25 @@ class GeminiImageClient:
         is checked. Failures are treated as "not ready" so the routers keep
         returning 503 instead of surfacing a raw traceback.
         """
-        if not self.api_key:
+        keys = self._keys()
+        if not keys:
             logger.warning("GEMINI_API_KEY is not set; image generation is disabled")
             return False
-        try:
-            async with httpx.AsyncClient(timeout=5) as client:
-                r = await client.get(
-                    f"{GEMINI_API_BASE}/models/{self.model}",
-                    headers={"x-goog-api-key": self.api_key},
+        for label, key in keys:
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    r = await client.get(
+                        f"{GEMINI_API_BASE}/models/{self.model}",
+                        headers={"x-goog-api-key": key},
+                    )
+                if r.status_code == 200:
+                    return True
+                logger.warning(
+                    "Gemini image health check: %s key returned %s", label, r.status_code
                 )
-                return r.status_code == 200
-        except Exception as exc:
-            logger.warning("Gemini image health check failed: %s", exc)
-            return False
+            except Exception as exc:
+                logger.warning("Gemini image health check (%s key) failed: %s", label, exc)
+        return False
 
     async def generate(
         self,
@@ -211,7 +244,8 @@ class GeminiImageClient:
         seed: Optional[int] = None,
     ) -> list[bytes]:
         """Generate image bytes for one prompt. Raises RuntimeError on failure."""
-        if not self.api_key:
+        keys = self._keys()
+        if not keys:
             raise RuntimeError("GEMINI_API_KEY is not configured.")
 
         settings = get_settings()
@@ -237,20 +271,44 @@ class GeminiImageClient:
             "generationConfig": generation_config,
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            r = await client.post(
-                f"{GEMINI_API_BASE}/models/{model_id}:generateContent",
-                headers={
-                    "x-goog-api-key": self.api_key,
-                    "Content-Type": "application/json",
-                },
-                content=json.dumps(payload),
-            )
+        r = None
+        attempts = 0
+        for index, (label, key) in enumerate(keys):
+            attempts += 1
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                r = await client.post(
+                    f"{GEMINI_API_BASE}/models/{model_id}:generateContent",
+                    headers={
+                        "x-goog-api-key": key,
+                        "Content-Type": "application/json",
+                    },
+                    content=json.dumps(payload),
+                )
 
-        if r.status_code != 200:
+            if r.status_code == 200:
+                if index:
+                    logger.info("Gemini image: %s key served the request", label)
+                break
+
+            remaining = index < len(keys) - 1
+            if r.status_code in _KEY_SCOPED_FAILURES and remaining:
+                logger.warning(
+                    "Gemini image: %s key returned %s; retrying with the next key",
+                    label, r.status_code,
+                )
+                continue
+            break
+
+        if r is None or r.status_code != 200:
             # The body carries Google's own reason (bad model id, quota, safety
-            # block); surface it rather than a bare status code.
-            raise RuntimeError(f"Gemini image API returned {r.status_code}: {r.text[:500]}")
+            # block); surface it rather than a bare status code. The count is
+            # what was actually *attempted*, not what is configured — a 503 stops
+            # after one key on purpose, and claiming "tried 2" would send someone
+            # hunting for a second failure that never happened.
+            tried = f" (tried {attempts} keys)" if attempts > 1 else ""
+            raise RuntimeError(
+                f"Gemini image API returned {r.status_code}{tried}: {r.text[:500]}"
+            )
 
         data = r.json()
         candidates = data.get("candidates") or []

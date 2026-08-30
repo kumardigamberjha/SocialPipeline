@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import {
   ListVideo,
   RefreshCw,
@@ -71,7 +71,7 @@ export default function YoutubePlaylistBoard() {
   const [uploadsId, setUploadsId] = useState("");
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
 
-  const loadPlaylists = async () => {
+  const loadPlaylists = useCallback(async () => {
     setStatus("loading");
     setErrorMsg("");
     try {
@@ -99,10 +99,44 @@ export default function YoutubePlaylistBoard() {
       setErrorMsg(e instanceof Error ? e.message : "Request failed");
       setStatus("error");
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadPlaylists();
+    let ignore = false;
+    (async () => {
+      try {
+        const data = await request<{
+          channel_title?: string;
+          uploads_playlist_id?: string;
+          playlists?: Playlist[];
+        }>(`${BASE}/playlists`);
+        if (!ignore) {
+          setChannelTitle(data.channel_title || "");
+          setUploadsId(data.uploads_playlist_id || "");
+          setPlaylists(data.playlists || []);
+          setStatus("ready");
+        }
+      } catch (e) {
+        if (!ignore) {
+          if (e instanceof ApiError) {
+            if (e.status === 403) {
+              setStatus("need_reconnect");
+              return;
+            }
+            if (e.status === 401 || e.status === 400) {
+              setErrorMsg(e.message);
+              setStatus("need_connect");
+              return;
+            }
+          }
+          setErrorMsg(e instanceof Error ? e.message : "Request failed");
+          setStatus("error");
+        }
+      }
+    })();
+    return () => {
+      ignore = true;
+    };
   }, []);
 
   const connectGoogle = async () => {

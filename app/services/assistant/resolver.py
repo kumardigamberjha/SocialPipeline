@@ -49,7 +49,9 @@ INTENTS (pick exactly one):
 - schedule_lookup a specific day/week/month's scheduled items
 - review_queue    drafts waiting to be approved or rejected
 - backlog         uncovered/saved topics not yet planned
-- analytics       performance, counts, how am I doing, what's overdue
+- overdue         items past their scheduled date and not yet published
+                  ("what's overdue", "kya pending hai", "bacha hua", "what did I miss")
+- analytics       performance, counts, how am I doing
 - item_lookup     a specific item found by words in its topic
 - action_request  the user asks to change something (publish/reschedule/generate/approve/reject)
 - smalltalk       greetings, thanks
@@ -67,8 +69,12 @@ DATE RULES — always output YYYY-MM-DD, anchored to today ({today}):
 - "this week" / "is hafte"         -> Monday .. Sunday of the week containing today
 - "next week" / "agle hafte"       -> Monday+7 .. Sunday+7
 - "this month" / "is mahine"       -> first .. last day of this month
-- "overdue" / "pending" / "bacha hua" -> null .. today-1
 - no date mentioned                -> today .. today
+
+The "overdue" intent takes NO dates: set date_from and date_to to null and
+date_expression to "overdue". The server computes that window itself, and it
+reaches further back than any range you could write — an item missed in June is
+still overdue today. date_expression is always a string, never null.
 
 "kal" means BOTH yesterday and tomorrow in Hindi. Decide from the verb:
 "kal ka video kaunsa HAI" (present/future) -> tomorrow.
@@ -81,8 +87,8 @@ mujhe, hai, dikha, karna) or uses Devanagari; otherwise "en".
 search_terms: only for item_lookup — the distinctive words from the topic the
 user named. Never the whole question.
 
-needs_analytics: true only when the user asks about performance, totals,
-overdue counts, or how they are doing.
+needs_analytics: true only when the user asks about performance, totals, or how
+they are doing. The overdue intent carries its own count — do not set this for it.
 
 RECENT TURNS (for pronoun resolution only):
 {history}

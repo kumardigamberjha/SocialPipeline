@@ -1,14 +1,15 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Film, Search, Sparkles, Swords, Users } from "lucide-react";
+import { Film, Search, Sparkles, Swords, Users, BarChart3 } from "lucide-react";
 import { ApiError } from "@/lib/apiClient";
 import { Competitor, competitorsApi } from "@/lib/youtubeCompetitorsApi";
 import CompetitorDiscoveryModal from "./CompetitorDiscoveryModal";
 import CompetitorList from "./CompetitorList";
 import CompetitorVideosTab from "./CompetitorVideosTab";
+import CompetitorBenchmark from "./CompetitorBenchmark";
 
-type SubTab = "channels" | "videos";
+type SubTab = "channels" | "videos" | "benchmark";
 
 interface SelectedChannel {
   channel_id: string;
@@ -149,6 +150,12 @@ export default function CompetitorsTab() {
               icon={<Film size={13} />}
               label={selectedChannel ? `${selectedChannel.title} videos` : "Top Videos"}
             />
+            <SubNavBtn
+              active={subTab === "benchmark"}
+              onClick={() => setSubTab("benchmark")}
+              icon={<BarChart3 size={13} />}
+              label="Benchmark"
+            />
           </div>
 
           {/* ── Tab Content ──────────────────────────────────────────────── */}
@@ -167,6 +174,10 @@ export default function CompetitorsTab() {
               filterChannelTitle={selectedChannel?.title ?? null}
               onClearFilter={handleClearFilter}
             />
+          )}
+
+          {subTab === "benchmark" && (
+            <CompetitorBenchmark />
           )}
         </>
       )}

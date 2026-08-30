@@ -4,8 +4,10 @@ import Link from "next/link";
 import React, { useState, useEffect } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { request } from '@/lib/apiClient';
+import InstagramAchievements from './InstagramAchievements';
 import {
   Instagram,
+  Trophy,
   Users,
   Film,
   Calendar,
@@ -23,20 +25,53 @@ import {
   Wand2,
   CheckCircle2,
   CalendarRange,
+  Info,
+  AlertTriangle,
 } from 'lucide-react';
 
+interface InstagramProfile {
+  handle: string | null;
+  brand_name: string;
+  url: string | null;
+  bio: string;
+  followers: number;
+  following: number;
+  total_posts: number;
+  /** Mean of the per-post rates that could be computed; null when none could. */
+  avg_engagement_rate: number | null;
+  profile_picture_url?: string;
+  synced_at?: string | null;
+  source?: string;
+}
+
+// `null` means Meta did not report the metric for this account — not zero.
+// Instagram account insights need a Business/Creator account and the insights
+// scope, and several metrics were dropped in newer API versions. Rendering a
+// missing measurement as 0 is what made this page look precise and wrong.
 interface InstagramStats {
+  time_range: string;
   total_followers: number;
-  followers_gained: number;
-  total_reach: number;
-  total_impressions: number;
-  accounts_engaged: number;
-  profile_visits: number;
-  link_clicks: number;
+  followers_gained: number | null;
+  total_reach: number | null;
+  total_views: number | null;
+  total_impressions: number | null;
+  accounts_engaged: number | null;
+  total_interactions: number | null;
+  profile_visits: number | null;
+  link_clicks: number | null;
+  posts_published: number;
   total_reels_published: number;
   total_carousels_published: number;
-  avg_reel_views: number;
-  avg_carousel_saves: number;
+  total_images_published: number;
+  avg_reel_views: number | null;
+  avg_carousel_saves: number | null;
+  avg_engagement_rate: number | null;
+  /** False for all_time: the insights endpoint is windowed, so that range
+      cannot have account metrics regardless of permissions. */
+  insights_supported: boolean;
+  insights_available: boolean;
+  /** The snapshot behind this predates insights provenance — re-sync for real figures. */
+  stale?: boolean;
 }
 
 interface InstagramPost {
@@ -44,25 +79,41 @@ interface InstagramPost {
   title: string;
   type: 'reel' | 'carousel' | 'single';
   publish_time: string;
-  views: number;
+  // Exact for every post — straight off the media edge.
   likes: number;
   comments: number;
-  shares: number;
-  saves: number;
-  reach: number;
-  engagement_rate: string;
+  // Insights-derived, so null when Meta withheld them.
+  views: number | null;
+  shares: number | null;
+  saves: number | null;
+  reach: number | null;
+  /** Percent as a number now, where this used to be the string "6.2%". */
+  engagement_rate: number | null;
+  insights_available: boolean;
+  metrics_updated_at: string;
+  permalink: string;
   caption: string;
 }
 
 interface HashtagItem {
   tag: string;
   posts_used: number;
-  avg_reach: number;
-  score: number;
+  posts_measured: number;
+  avg_reach: number | null;
+  score: number | null;
   category: string;
 }
 
 const HASHTAGS_PER_PAGE = 10;
+
+// The window each stats block covers, so a KPI subtitle names its own scope
+// instead of the vague "this period" that used to sit under every range.
+const RANGE_LABELS: Record<string, string> = {
+  "7_days": "last 7 days",
+  "30_days": "last 30 days",
+  "90_days": "last 90 days",
+  "all_time": "all time",
+};
 
 const PALETTES = [
   "void_purple", "cyber_teal", "neon_coral", "solar_amber",
@@ -76,7 +127,7 @@ const LAYOUTS = [
 
 
 export default function InstagramAnalyticsDashboard() {
-  const [profile, setProfile] = useState<any>(null);
+  const [profile, setProfile] = useState<InstagramProfile | null>(null);
   const [stats, setStats] = useState<InstagramStats | null>(null);
   const [posts, setPosts] = useState<InstagramPost[]>([]);
   const [hashtags, setHashtags] = useState<HashtagItem[]>([]);
@@ -87,7 +138,7 @@ export default function InstagramAnalyticsDashboard() {
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [timeRange, setTimeRange] = useState("30_days");
-  const [tab, setTab] = useState<'analytics' | 'strategy'>('analytics');
+  const [tab, setTab] = useState<'analytics' | 'achievements' | 'strategy'>('analytics');
   const [formatFilter, setFormatFilter] = useState<'all' | 'reel' | 'carousel'>('all');
 
   const [isGeneratingStrategy, setIsGeneratingStrategy] = useState(false);
@@ -105,6 +156,11 @@ export default function InstagramAnalyticsDashboard() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedResult, setGeneratedResult] = useState<any>(null);
 
+  // Which single post is being re-read from Meta right now, and the last
+  // per-post failure (kept out of the console so the user actually sees it).
+  const [refreshingPostId, setRefreshingPostId] = useState<string | null>(null);
+  const [postError, setPostError] = useState<string | null>(null);
+
   const [authStatus, setAuthStatus] = useState<any>(null);
   const [oauthBanner, setOauthBanner] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
 
@@ -116,7 +172,7 @@ export default function InstagramAnalyticsDashboard() {
     try {
       const [profRes, statsRes, postsRes, tagsRes, authRes, strategyRes, roadmapRes] =
         await Promise.allSettled([
-          request<any>('/instagram-analytics/profile'),
+          request<InstagramProfile>('/instagram-analytics/profile'),
           request<InstagramStats>(`/instagram-analytics/stats?time_range=${timeRange}`),
           request<InstagramPost[]>(`/instagram-analytics/posts?limit=10&format_filter=${formatFilter}`),
           request<HashtagItem[]>('/instagram-analytics/hashtags'),
@@ -353,6 +409,45 @@ export default function InstagramAnalyticsDashboard() {
     return num.toString();
   };
 
+  // An em dash for an absent measurement. `formatNumber(x || 0)` would print
+  // "0", which is a claim the data does not support — the whole point of the
+  // backend returning null.
+  const formatMetric = (num: number | null | undefined) =>
+    num === null || num === undefined ? '—' : formatNumber(num);
+
+  const formatRate = (rate: number | null | undefined) =>
+    rate === null || rate === undefined ? '—' : `${rate}%`;
+
+  /** Re-read one post's live metrics without a whole-account sync. */
+  const handleRefreshPost = async (postId: string) => {
+    setRefreshingPostId(postId);
+    setPostError(null);
+    try {
+      const res = await request<{
+        post: InstagramPost;
+        stats: InstagramStats;
+        stats_by_range: Record<string, InstagramStats>;
+        hashtags: HashtagItem[];
+        profile: InstagramProfile;
+      }>(`/instagram-analytics/posts/${encodeURIComponent(postId)}/refresh`, {
+        method: 'POST',
+      });
+      // Patch in place: re-fetching the list would drop the user's scroll
+      // position and their format filter for a single-row change.
+      setPosts((prev) => prev.map((p) => (p.id === postId ? res.post : p)));
+      // The response carries every range; take the one on screen, not the
+      // default, or a 7-day view would silently start showing 30-day numbers.
+      const forRange = res.stats_by_range?.[timeRange] ?? res.stats;
+      if (forRange) setStats(forRange);
+      if (res.hashtags) setHashtags(res.hashtags);
+      if (res.profile) setProfile((prev) => ({ ...prev, ...res.profile }));
+    } catch (err) {
+      setPostError(err instanceof Error ? err.message : 'Could not refresh that post.');
+    } finally {
+      setRefreshingPostId(null);
+    }
+  };
+
   if (loading && !stats) {
     return (
       <div className="flex items-center justify-center h-96">
@@ -500,13 +595,14 @@ export default function InstagramAnalyticsDashboard() {
         </div>
       </div>
 
-      {/* Sub-tabs: Analytics | AI Strategy.
+      {/* Sub-tabs: Analytics | Achievements | AI Strategy.
           Content planning lives entirely in /planner now — this page used to
           carry a second Kanban over the very same plan_items rows. */}
       <div className="border-b border-white/5">
         <nav className="flex items-center gap-2 -mb-px">
           {([
             { key: 'analytics', label: 'Analytics & Posts', Icon: BarChart2 },
+            { key: 'achievements', label: 'Achievements', Icon: Trophy },
             { key: 'strategy', label: 'AI Strategy & Roadmap', Icon: Sparkles },
           ] as const).map(({ key, label, Icon }) => (
             <button
@@ -528,6 +624,44 @@ export default function InstagramAnalyticsDashboard() {
       {/* TAB 1: ANALYTICS & POSTS */}
       {tab === 'analytics' && (
         <div className="space-y-8">
+          {stats?.stale && (
+            <div className="flex items-start gap-2 py-2.5 px-4 rounded-xl border border-sky-500/20 bg-sky-500/[0.06] text-xs text-sky-200/90">
+              <Info size={13} className="mt-0.5 flex-shrink-0 text-sky-400" />
+              <span>
+                These figures were synced before per-post metrics were verifiable, so reach,
+                views, saves and engagement can&apos;t be vouched for and show as “—”.
+                Likes, comments and post counts are real. Click{" "}
+                <span className="font-semibold text-sky-100">Sync Metrics</span> to pull
+                measured numbers from Instagram.
+              </span>
+            </div>
+          )}
+
+          {/* Two different absences, worded differently on purpose. Either way
+              the affected KPIs read "—", never the zeros this page used to show. */}
+          {stats && !stats.stale && !stats.insights_supported && (
+            <div className="flex items-start gap-2 py-2.5 px-4 rounded-xl border border-white/[0.08] bg-white/[0.03] text-xs text-slate-400">
+              <Info size={13} className="mt-0.5 flex-shrink-0 text-slate-500" />
+              <span>
+                Instagram&apos;s account insights are windowed, so reach, profile visits and
+                followers gained have no all-time figure. Post counts and per-post
+                engagement below do cover your whole history — pick a 7, 30 or 90 day range
+                for the account metrics.
+              </span>
+            </div>
+          )}
+          {stats && !stats.stale && stats.insights_supported && !stats.insights_available && (
+            <div className="flex items-start gap-2 py-2.5 px-4 rounded-xl border border-amber-500/20 bg-amber-500/[0.06] text-xs text-amber-200/90">
+              <Info size={13} className="mt-0.5 flex-shrink-0 text-amber-400" />
+              <span>
+                Account-level insights (reach, profile visits, followers gained) aren&apos;t
+                available for this connection. They need an Instagram Business or Creator
+                account with the insights permission granted — reconnect to grant it. Post
+                counts and per-post engagement below are unaffected.
+              </span>
+            </div>
+          )}
+
           {/* KPI Cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
             <div className="glass-card p-6 rounded-2xl border border-white/5 bg-white/[0.02]">
@@ -538,7 +672,15 @@ export default function InstagramAnalyticsDashboard() {
                 <div>
                   <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Followers</p>
                   <p className="text-2xl font-bold text-white">{formatNumber(stats?.total_followers || 0)}</p>
-                  <span className="text-xs text-green-400 font-medium">+{stats?.followers_gained} this period</span>
+                  {/* Was an unconditional green "+0 this period", which read as
+                      a measured flat month rather than an absent metric. */}
+                  {stats?.followers_gained === null || stats?.followers_gained === undefined ? (
+                    <span className="text-xs text-slate-500">Growth not measured</span>
+                  ) : (
+                    <span className={`text-xs font-medium ${stats.followers_gained >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {stats.followers_gained >= 0 ? '+' : ''}{formatNumber(stats.followers_gained)} {RANGE_LABELS[timeRange] ?? 'this period'}
+                    </span>
+                  )}
                 </div>
               </div>
             </div>
@@ -549,9 +691,11 @@ export default function InstagramAnalyticsDashboard() {
                   <Eye size={24} />
                 </div>
                 <div>
-                  <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Total Reach</p>
-                  <p className="text-2xl font-bold text-white">{formatNumber(stats?.total_reach || 0)}</p>
-                  <span className="text-xs text-slate-500">{formatNumber(stats?.total_impressions || 0)} impressions</span>
+                  <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Reach</p>
+                  <p className="text-2xl font-bold text-white">{formatMetric(stats?.total_reach)}</p>
+                  {/* `views` is Meta's replacement for the retired impressions
+                      metric, which this line used to duplicate reach into. */}
+                  <span className="text-xs text-slate-500">{formatMetric(stats?.total_views)} views</span>
                 </div>
               </div>
             </div>
@@ -563,8 +707,10 @@ export default function InstagramAnalyticsDashboard() {
                 </div>
                 <div>
                   <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Avg Reel Views</p>
-                  <p className="text-2xl font-bold text-white">{formatNumber(stats?.avg_reel_views || 0)}</p>
-                  <span className="text-xs text-amber-400 font-medium">Highest engagement</span>
+                  <p className="text-2xl font-bold text-white">{formatMetric(stats?.avg_reel_views)}</p>
+                  <span className="text-xs text-amber-400 font-medium">
+                    {stats?.total_reels_published ?? 0} reels {RANGE_LABELS[timeRange] ?? ''}
+                  </span>
                 </div>
               </div>
             </div>
@@ -575,9 +721,11 @@ export default function InstagramAnalyticsDashboard() {
                   <Bookmark size={24} />
                 </div>
                 <div>
-                  <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Carousel Saves</p>
-                  <p className="text-2xl font-bold text-white">{formatNumber(stats?.avg_carousel_saves || 0)}</p>
-                  <span className="text-xs text-blue-400 font-medium">High save rate</span>
+                  <p className="text-xs font-medium text-slate-400 uppercase tracking-wider">Avg Carousel Saves</p>
+                  <p className="text-2xl font-bold text-white">{formatMetric(stats?.avg_carousel_saves)}</p>
+                  <span className="text-xs text-blue-400 font-medium">
+                    {stats?.total_carousels_published ?? 0} carousels {RANGE_LABELS[timeRange] ?? ''}
+                  </span>
                 </div>
               </div>
             </div>
@@ -628,18 +776,33 @@ export default function InstagramAnalyticsDashboard() {
                   <tr>
                     <th className="px-6 py-4">Title / Caption</th>
                     <th className="px-6 py-4">Format</th>
-                    <th className="px-6 py-4 text-right">Views / Reach</th>
+                    <th className="px-6 py-4 text-right">Views</th>
+                    <th className="px-6 py-4 text-right">Reach</th>
                     <th className="px-6 py-4 text-right">Likes</th>
                     <th className="px-6 py-4 text-right">Shares</th>
                     <th className="px-6 py-4 text-right">Saves</th>
                     <th className="px-6 py-4 text-right">Engagement</th>
+                    <th className="px-6 py-4 text-right">Update</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/5">
                   {posts.map((post) => (
                     <tr key={post.id} className="hover:bg-white/[0.04] transition-colors">
                       <td className="px-6 py-4 max-w-xs">
-                        <div className="font-medium text-slate-200 line-clamp-1">{post.title}</div>
+                        <div className="font-medium text-slate-200 line-clamp-1">
+                          {post.permalink ? (
+                            <a
+                              href={post.permalink}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="hover:text-pink-300 transition-colors"
+                            >
+                              {post.title}
+                            </a>
+                          ) : (
+                            post.title
+                          )}
+                        </div>
                         <div className="text-xs text-slate-500 mt-1 line-clamp-1">{post.caption}</div>
                       </td>
                       <td className="px-6 py-4">
@@ -650,20 +813,62 @@ export default function InstagramAnalyticsDashboard() {
                           {post.type}
                         </span>
                       </td>
-                      <td className="px-6 py-4 text-right font-semibold text-white">{formatNumber(post.views || post.reach)}</td>
+                      {/* Views and reach are separate measurements. This column
+                          used to be `post.views || post.reach` — two different
+                          metrics under one heading, and both were
+                          `likes + comments` whenever the insights call failed. */}
+                      <td className="px-6 py-4 text-right font-semibold text-white">{formatMetric(post.views)}</td>
+                      <td className="px-6 py-4 text-right text-slate-300 font-mono">{formatMetric(post.reach)}</td>
                       <td className="px-6 py-4 text-right text-slate-300 font-mono">{formatNumber(post.likes)}</td>
-                      <td className="px-6 py-4 text-right text-slate-300 font-mono">{formatNumber(post.shares)}</td>
-                      <td className="px-6 py-4 text-right text-slate-300 font-mono">{formatNumber(post.saves)}</td>
+                      <td className="px-6 py-4 text-right text-slate-300 font-mono">{formatMetric(post.shares)}</td>
+                      <td className="px-6 py-4 text-right text-slate-300 font-mono">{formatMetric(post.saves)}</td>
                       <td className="px-6 py-4 text-right">
-                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-green-500/10 text-green-400 border border-green-500/20">
-                          {post.engagement_rate}
-                        </span>
+                        {post.engagement_rate === null || post.engagement_rate === undefined ? (
+                          <span className="text-slate-600 font-mono text-xs">—</span>
+                        ) : (
+                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-green-500/10 text-green-400 border border-green-500/20">
+                            {formatRate(post.engagement_rate)}
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-6 py-4 text-right">
+                        <button
+                          onClick={() => handleRefreshPost(post.id)}
+                          disabled={refreshingPostId !== null}
+                          title={
+                            post.metrics_updated_at
+                              ? `Re-read this post's metrics from Instagram (last read ${new Date(post.metrics_updated_at).toLocaleString()})`
+                              : "Re-read this post's metrics from Instagram"
+                          }
+                          className="inline-flex items-center justify-center w-8 h-8 rounded-lg border border-white/10 bg-white/5 text-slate-400 hover:text-pink-300 hover:border-pink-500/30 hover:bg-pink-500/10 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                        >
+                          <RefreshCw
+                            size={13}
+                            className={refreshingPostId === post.id ? 'animate-spin text-pink-400' : ''}
+                          />
+                        </button>
                       </td>
                     </tr>
                   ))}
+                  {posts.length === 0 && (
+                    <tr>
+                      <td colSpan={9} className="px-6 py-10 text-center text-sm text-slate-500">
+                        {profile?.handle
+                          ? 'No posts match this filter.'
+                          : 'Connect your Instagram account and run Sync Metrics to see your posts.'}
+                      </td>
+                    </tr>
+                  )}
                 </tbody>
               </table>
             </div>
+
+            {postError && (
+              <div className="flex items-start gap-2 mx-6 mb-6 py-2.5 px-4 rounded-xl border border-red-500/20 bg-red-500/[0.06] text-xs text-red-300">
+                <AlertTriangle size={13} className="mt-0.5 flex-shrink-0 text-red-400" />
+                <span>{postError}</span>
+              </div>
+            )}
           </div>
 
           {/* Hashtag Analytics */}
@@ -678,8 +883,19 @@ export default function InstagramAnalyticsDashboard() {
                 .map((h) => (
                   <div key={h.tag} className="p-4 rounded-xl glass-card border border-white/5 bg-white/[0.01]">
                     <p className="text-sm font-mono font-semibold text-pink-300">{h.tag}</p>
-                    <p className="text-xs text-slate-400 mt-1">{formatNumber(h.avg_reach)} avg reach</p>
-                    <p className="text-[10px] text-slate-500">{h.posts_used} posts used</p>
+                    <p className="text-xs text-slate-400 mt-1">
+                      {h.avg_reach === null || h.avg_reach === undefined
+                        ? 'Reach not measured'
+                        : `${formatNumber(h.avg_reach)} avg reach`}
+                    </p>
+                    {/* posts_used counts every post carrying the tag;
+                        posts_measured is the subset the average is over. */}
+                    <p className="text-[10px] text-slate-500">
+                      {h.posts_used} posts used
+                      {h.posts_measured > 0 && h.posts_measured < h.posts_used
+                        ? ` · ${h.posts_measured} measured`
+                        : ''}
+                    </p>
                     <span className="inline-block mt-2 text-[10px] px-2 py-0.5 rounded bg-white/5 text-slate-400 uppercase tracking-wider">
                       {h.category}
                     </span>
@@ -715,6 +931,9 @@ export default function InstagramAnalyticsDashboard() {
           </div>
         </div>
       )}
+
+      {/* TAB 2: ACHIEVEMENTS */}
+      {tab === 'achievements' && <InstagramAchievements />}
 
       {/* Visual studio — a free-form image-generation scratchpad.
           Distinct from the planner's per-item "Generate image": that one renders
@@ -787,7 +1006,7 @@ export default function InstagramAnalyticsDashboard() {
         </div>
       )}
 
-      {/* TAB 2: AI STRATEGY & ROADMAP */}
+      {/* TAB 3: AI STRATEGY & ROADMAP */}
       {tab === 'strategy' && (
         <div className="space-y-8">
           {/* Generate actions */}

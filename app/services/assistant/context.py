@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from typing import get_args
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,6 +48,11 @@ MAX_RECONCILE = 10       # 'generating' rows worth re-checking against their run
 MAX_BACKLOG = 20
 MAX_BASELINE_ITEMS = 10
 MAX_SEARCH_TERMS = 5
+
+# Overdue is unbounded backwards, so it is the one read that can return hundreds
+# of rows. Past this many, a per-platform/per-month breakdown is both cheaper and
+# more useful than a list nobody will read to the end of.
+OVERDUE_LIST_CEILING = 40
 
 # ── Text limits ──────────────────────────────────────────────────────────────
 TOPIC_CHARS = 120
@@ -106,6 +111,10 @@ class ContextPack:
     review: list[dict] = field(default_factory=list)
     backlog: list[dict] = field(default_factory=list)
     backlog_total: int = 0
+    # Overdue rows live in `items`; these two carry the true total (which may
+    # exceed what was fetched) and the grouped breakdown used in its place.
+    overdue_total: int = 0
+    overdue_summary: list[dict] = field(default_factory=list)
     analytics: dict | None = None
     reports: list[dict] = field(default_factory=list)
 
@@ -197,7 +206,19 @@ def resolve_range(plan: QueryPlan, today: date) -> tuple[str | None, str | None]
     A plan with no dates at all means "no date filter" for the backlog and
     review intents — those are not date-scoped questions — and "today" for
     everything else.
+
+    The overdue intent is the one case with a genuinely half-open range, and it
+    is resolved here rather than trusted from the plan: the model used to emit
+    ``null .. today-1`` and the collapse below rewrote it to a single day, which
+    is how "list my overdue items" came back with one row against a count of 15.
     """
+    if plan.intent == "overdue":
+        # Open-ended backwards on purpose — an item missed in June is still
+        # overdue. The row cap and the summary fallback bound the answer, not
+        # the range. Any dates the model sent are ignored; they cannot improve
+        # on this and have only ever narrowed it wrongly.
+        return None, (today - timedelta(days=1)).isoformat()
+
     start = parse_iso_date(plan.date_from)
     end = parse_iso_date(plan.date_to)
 
@@ -399,7 +420,25 @@ async def build_context(
         "daily_digest", "schedule_lookup", "item_lookup",
         "action_request", "unknown", "smalltalk",
     )
-    if wants_items or range_from:
+    if plan.intent == "overdue":
+        # Its own read, not the range query: `statuses` is deliberately ignored
+        # here because the unpublished predicate *is* the status filter, and
+        # intersecting a model-supplied ["published"] with it returns nothing.
+        # `platforms` still applies — "what's overdue on YouTube" is a fair ask.
+        pack.overdue_total = await queries.count_overdue_plan_items(
+            session, user_id, today=today.isoformat(), platforms=platforms or None
+        )
+        if pack.overdue_total > OVERDUE_LIST_CEILING:
+            pack.overdue_summary = await queries.summarize_overdue_plan_items(
+                session, user_id, today=today.isoformat(), platforms=platforms or None
+            )
+        else:
+            rows = await queries.get_overdue_plan_items(
+                session, user_id, today=today.isoformat(),
+                platforms=platforms or None, limit=OVERDUE_LIST_CEILING,
+            )
+            pack.items = [_project_item(r) for r in rows]
+    elif wants_items or range_from:
         rows = await queries.get_plan_items_across_platforms(
             session,
             user_id,
@@ -461,29 +500,58 @@ async def build_context(
 
 # Sections are dropped in this order when the budget is exceeded — least
 # load-bearing first. Items are last because without them there is no answer.
-_DROP_ORDER = ("reports", "analytics", "backlog", "review", "items")
+_DROP_ORDER = ("reports", "analytics", "backlog", "review", "overdue", "items")
+
+
+def _item_line(it: dict) -> str:
+    return (
+        f"[{it['short_id']}] {it['platform']} | {it['scheduled_date'] or 'no date'} "
+        f"| {it['event_time'] or '--:--'} | {it['production_status']} "
+        f"| {it['video_format']} | {it['topic']}"
+        + (f" | notes: {it['notes']}" if it["notes"] else "")
+    )
 
 
 def _render_items(pack: ContextPack) -> str:
+    if pack.intent == "overdue":
+        # The summary replaces the rows entirely; without this the block would
+        # read "none scheduled in this range" beside a count of 137.
+        if pack.overdue_summary:
+            return ""
+        if not pack.items:
+            return "OVERDUE: nothing is past due. Every dated item is published or still ahead."
+        header = (
+            f"OVERDUE ({pack.overdue_total} item(s) past their scheduled date and not yet "
+            "published — this is the complete list, oldest first) "
+            "(id | platform | date | time | status | format | topic):"
+        )
+        return "\n".join([header] + [_item_line(it) for it in pack.items])
+
     if not pack.items:
         return "ITEMS: none scheduled in this range."
     lines = ["ITEMS (id | platform | date | time | status | format | topic):"]
-    for it in pack.items:
-        lines.append(
-            f"[{it['short_id']}] {it['platform']} | {it['scheduled_date'] or 'no date'} "
-            f"| {it['event_time'] or '--:--'} | {it['production_status']} "
-            f"| {it['video_format']} | {it['topic']}"
-            + (f" | notes: {it['notes']}" if it["notes"] else "")
-        )
+    lines += [_item_line(it) for it in pack.items]
     if pack.truncated.get("items"):
         lines.append(f"(showing the first {len(pack.items)}; there are more)")
     return "\n".join(lines)
 
 
 def _render_review(pack: ContextPack) -> str:
+    """Ready and generating drafts, counted separately.
+
+    Only 'ready' is waiting on the user — that is what the dashboard's "To
+    review" tile counts. Blending the two here is what made the assistant say
+    "one item in the review queue" beside a tile reading 0.
+    """
     if not pack.review:
         return "REVIEW QUEUE: empty."
-    lines = [f"REVIEW QUEUE ({len(pack.review)}) (content_id | type | status | platform | topic):"]
+    ready = sum(1 for r in pack.review if r.get("review_status") == "ready")
+    generating = sum(1 for r in pack.review if r.get("review_status") == "generating")
+    lines = [
+        f"REVIEW QUEUE ({ready} ready for the user to decide on, "
+        f"{generating} still generating) "
+        "(content_id | type | status | platform | topic):"
+    ]
     for r in pack.review:
         line = (
             f"[{r['short_id']}] {r['content_type']} | {r['review_status']} "
@@ -502,6 +570,32 @@ def _render_backlog(pack: ContextPack) -> str:
         return f"BACKLOG: {pack.backlog_total} uncovered topic(s)."
     lines = [f"BACKLOG ({pack.backlog_total} uncovered, showing {len(pack.backlog)}):"]
     lines += [f"[{b['short_id']}] {b['topic']}" for b in pack.backlog]
+    return "\n".join(lines)
+
+
+def _render_overdue(pack: ContextPack) -> str:
+    """The grouped breakdown, used only when there are too many rows to list."""
+    if not pack.overdue_summary:
+        return ""
+    by_platform: dict[str, list[str]] = {}
+    oldest = None
+    for row in pack.overdue_summary:
+        platform = row.get("platform") or "unknown"
+        by_platform.setdefault(platform, []).append(
+            f"{row.get('month')}: {row.get('count')}"
+        )
+        row_oldest = str(row.get("oldest") or "")
+        if row_oldest and (oldest is None or row_oldest < oldest):
+            oldest = row_oldest
+
+    lines = [
+        f"OVERDUE SUMMARY: {pack.overdue_total} items are past their scheduled date "
+        f"and not yet published — too many to list individually."
+    ]
+    if oldest:
+        lines.append(f"Oldest is scheduled {oldest}.")
+    lines.append("Counts by platform and month:")
+    lines += [f"  {p}: {', '.join(months)}" for p, months in sorted(by_platform.items())]
     return "\n".join(lines)
 
 
@@ -528,6 +622,7 @@ def _render_reports(pack: ContextPack) -> str:
 
 
 _RENDERERS = {
+    "overdue": _render_overdue,
     "items": _render_items,
     "review": _render_review,
     "backlog": _render_backlog,
@@ -548,9 +643,15 @@ def render_context(pack: ContextPack) -> str:
     and notes are user-authored free text, and reach this table from AI topic
     suggestion and roadmap import as well as from typing.
     """
+    if pack.intent == "overdue":
+        # "any .. 2026-08-23" reads like a bounded range the model should quote
+        # back; "on or before" says what the window actually is.
+        range_line = f"RANGE: everything on or before {pack.range_to}"
+    else:
+        range_line = f"RANGE: {pack.range_from or 'any'} .. {pack.range_to or 'any'}"
     header = (
         f"TODAY: {pack.today} (Asia/Kolkata)\n"
-        f"RANGE: {pack.range_from or 'any'} .. {pack.range_to or 'any'}\n"
+        f"{range_line}\n"
         f"INTENT: {pack.intent}\n"
     )
 

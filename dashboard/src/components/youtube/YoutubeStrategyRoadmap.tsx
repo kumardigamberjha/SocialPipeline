@@ -20,6 +20,7 @@ import AnalysisHistoryPicker, {
   formatRunTime,
   type HistoryEntry,
 } from "@/components/analysis/AnalysisHistoryPicker";
+import { Section } from "@/components/youtube/shared/ReportSections";
 import {
   youtubeAnalyticsApi,
   normalizeRun,
@@ -33,41 +34,6 @@ import {
 } from "@/lib/youtubeAnalyticsApi";
 
 const ROADMAP_WEEKS = 4;
-
-function Section({
-  icon: Icon,
-  title,
-  tint,
-  items,
-  ordered = false,
-}: {
-  icon: React.ElementType;
-  title: string;
-  tint: string;
-  items: string[];
-  ordered?: boolean;
-}) {
-  if (!items || items.length === 0) return null;
-  return (
-    <div className="rounded-xl bg-white/[0.02] border border-white/5 p-4">
-      <p className={`flex items-center gap-2 text-xs font-bold uppercase tracking-wider mb-3 ${tint}`}>
-        <Icon size={14} /> {title}
-      </p>
-      <ul className="space-y-2">
-        {items.map((item, i) => (
-          <li key={i} className="flex gap-2 text-sm text-slate-300 leading-relaxed">
-            {ordered ? (
-              <span className={`text-xs font-bold tabular-nums ${tint} flex-shrink-0 w-4`}>{i + 1}</span>
-            ) : (
-              <span className={`mt-1.5 w-1.5 h-1.5 rounded-full flex-shrink-0 ${tint.replace("text-", "bg-")}`} />
-            )}
-            <span>{item}</span>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
 
 /** "Generated 22 Aug 2026, 14:32 · gemini/gemini-2.5-flash" */
 function RunStamp({ createdAt, model }: { createdAt: string | null; model?: string }) {

@@ -11,11 +11,14 @@ import {
   Calendar,
   ChevronsLeft,
   ChevronsRight,
+  History,
+  Image as ImageIcon,
   Instagram,
   LayoutDashboard,
   LogOut,
   MessageSquare,
   Radio,
+  Telescope,
   User as UserIcon,
   Users,
   X,
@@ -34,11 +37,14 @@ export interface NavItem {
 
 export const NAV_ITEMS: NavItem[] = [
   { href: "/", label: "Nexus", subLabel: "Command Center", icon: LayoutDashboard },
+  { href: "/history", label: "History", subLabel: "Pipeline Runs & Logs", icon: History },
   { href: "/assistant", label: "Assistant", subLabel: "AI Schedule & Strategy", icon: MessageSquare },
   { href: "/topics", label: "Topics", subLabel: "Research Backlog", icon: BookOpen },
   { href: "/planner", label: "Planner", subLabel: "Cross-Platform Pipeline", icon: Calendar },
+  { href: "/image-studio", label: "Image Studio", subLabel: "Prompt to Image", icon: ImageIcon },
   { href: "/youtube-analysis", label: "YouTube", subLabel: "Channel & Competitors", icon: Youtube },
   { href: "/instagram-analysis", label: "Instagram", subLabel: "Media & Audience", icon: Instagram },
+  { href: "/prospects", label: "Prospects", subLabel: "Channel Audits", icon: Telescope },
   { href: "/personal-intelligence", label: "Intelligence", subLabel: "Knowledge & Directives", icon: Brain },
 ];
 
@@ -128,21 +134,20 @@ export default function Sidebar({
         className={`fixed top-0 bottom-0 left-0 z-50 flex flex-col bg-slate-950/95 border-r border-white/5 backdrop-blur-xl transition-all duration-300 ease-in-out ${
           // Desktop sizing
           isCollapsed ? "md:w-[68px]" : "md:w-[260px]"
-        } ${
+          } ${
           // Mobile slide-over transform
           isMobileOpen
             ? "translate-x-0 w-[280px]"
             : "-translate-x-full md:translate-x-0"
-        }`}
+          }`}
       >
         {/* ── 1. Header / Branding ── */}
         <div className="flex h-16 shrink-0 items-center justify-between border-b border-white/5 px-3.5">
           <Link
             href="/"
             onClick={onMobileClose}
-            className={`group flex items-center gap-3 overflow-hidden transition-opacity hover:opacity-90 ${
-              isCollapsed ? "justify-center w-full md:w-auto" : ""
-            }`}
+            className={`group flex items-center gap-3 overflow-hidden transition-opacity hover:opacity-90 ${isCollapsed ? "justify-center w-full md:w-auto" : ""
+              }`}
           >
             <motion.div
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-blue-500 via-indigo-500 to-purple-600 shadow-lg shadow-blue-500/20"
@@ -205,11 +210,10 @@ export default function Sidebar({
                     <Link
                       href={item.href}
                       onClick={onMobileClose}
-                      className={`group relative flex h-10 w-full items-center gap-3 rounded-lg px-2.5 text-xs font-medium transition-all ${
-                        active
+                      className={`group relative flex h-10 w-full items-center gap-3 rounded-lg px-2.5 text-xs font-medium transition-all ${active
                           ? "bg-blue-600/15 text-blue-300 border border-blue-500/30 shadow-[0_0_12px_rgba(59,130,246,0.12)]"
                           : "text-slate-400 hover:bg-white/5 hover:text-slate-200 border border-transparent"
-                      } ${isCollapsed && !isMobileOpen ? "justify-center px-0" : ""}`}
+                        } ${isCollapsed && !isMobileOpen ? "justify-center px-0" : ""}`}
                     >
                       {/* Active Indicator Bar */}
                       {active && (
@@ -217,9 +221,8 @@ export default function Sidebar({
                       )}
 
                       <Icon
-                        className={`h-4.5 w-4.5 shrink-0 transition-transform group-hover:scale-105 ${
-                          active ? "text-blue-400" : "text-slate-400 group-hover:text-slate-200"
-                        }`}
+                        className={`h-4.5 w-4.5 shrink-0 transition-transform group-hover:scale-105 ${active ? "text-blue-400" : "text-slate-400 group-hover:text-slate-200"
+                          }`}
                       />
 
                       {(!isCollapsed || isMobileOpen) && (
@@ -248,28 +251,24 @@ export default function Sidebar({
                 isCollapsed={isCollapsed && !isMobileOpen}
               >
                 <div
-                  className={`flex h-9 items-center gap-2.5 rounded-lg px-2.5 text-xs font-medium ${
-                    isCollapsed && !isMobileOpen ? "justify-center w-full px-0" : ""
-                  }`}
+                  className={`flex h-9 items-center gap-2.5 rounded-lg px-2.5 text-xs font-medium ${isCollapsed && !isMobileOpen ? "justify-center w-full px-0" : ""
+                    }`}
                 >
                   <span className="relative flex h-2.5 w-2.5 shrink-0">
                     <span
-                      className={`absolute inline-flex h-full w-full rounded-full opacity-75 animate-ping ${
-                        isOnline ? "bg-green-400" : "bg-red-400"
-                      }`}
+                      className={`absolute inline-flex h-full w-full rounded-full opacity-75 animate-ping ${isOnline ? "bg-green-400" : "bg-red-400"
+                        }`}
                     />
                     <span
-                      className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
-                        isOnline ? "bg-green-500 animate-pulse-green" : "bg-red-500"
-                      }`}
+                      className={`relative inline-flex h-2.5 w-2.5 rounded-full ${isOnline ? "bg-green-500 animate-pulse-green" : "bg-red-500"
+                        }`}
                     />
                   </span>
 
                   {(!isCollapsed || isMobileOpen) && (
                     <span
-                      className={`truncate text-xs uppercase tracking-wider ${
-                        isOnline ? "text-green-400 font-medium" : "text-red-400"
-                      }`}
+                      className={`truncate text-xs uppercase tracking-wider ${isOnline ? "text-green-400 font-medium" : "text-red-400"
+                        }`}
                     >
                       {isOnline ? "System Online" : "System Offline"}
                     </span>
@@ -284,9 +283,8 @@ export default function Sidebar({
                 isCollapsed={isCollapsed && !isMobileOpen}
               >
                 <div
-                  className={`flex h-9 items-center gap-2.5 rounded-lg glass-card px-2.5 text-xs ${
-                    isCollapsed && !isMobileOpen ? "justify-center w-full px-0" : ""
-                  }`}
+                  className={`flex h-9 items-center gap-2.5 rounded-lg glass-card px-2.5 text-xs ${isCollapsed && !isMobileOpen ? "justify-center w-full px-0" : ""
+                    }`}
                 >
                   <div className="relative">
                     <Users className="h-4 w-4 shrink-0 text-blue-400" />
@@ -312,9 +310,8 @@ export default function Sidebar({
                 isCollapsed={isCollapsed && !isMobileOpen}
               >
                 <div
-                  className={`flex h-8 items-center gap-2 rounded-lg px-2.5 text-xs ${
-                    isCollapsed && !isMobileOpen ? "justify-center w-full px-0" : ""
-                  }`}
+                  className={`flex h-8 items-center gap-2 rounded-lg px-2.5 text-xs ${isCollapsed && !isMobileOpen ? "justify-center w-full px-0" : ""
+                    }`}
                 >
                   <motion.div
                     className="flex items-center gap-1.5"
@@ -332,45 +329,14 @@ export default function Sidebar({
               </SidebarTooltip>
             </div>
           </div>
-
-          {/* Social / Connect */}
-          <div className="border-t border-white/5 pt-4">
-            {(!isCollapsed || isMobileOpen) && (
-              <div className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-[0.25em] text-slate-500">
-                Connect
-              </div>
-            )}
-
-            <SidebarTooltip
-              label="@codingindiaai"
-              subLabel="Instagram Channel"
-              isCollapsed={isCollapsed && !isMobileOpen}
-            >
-              <a
-                href="https://instagram.com/codingindiaai"
-                target="_blank"
-                rel="noopener noreferrer"
-                className={`group flex h-9 items-center gap-2.5 rounded-lg border border-pink-500/20 glass-card px-2.5 text-xs text-pink-300 transition-all hover:bg-gradient-to-r hover:from-purple-600/20 hover:to-pink-600/20 hover:text-pink-200 shadow-[0_0_10px_rgba(236,72,153,0.08)] ${
-                  isCollapsed && !isMobileOpen ? "justify-center w-full px-0" : ""
-                }`}
-                title="Follow Coding India AI on Instagram"
-              >
-                <Instagram className="h-4 w-4 shrink-0 text-pink-400 group-hover:scale-110 transition-transform" />
-                {(!isCollapsed || isMobileOpen) && (
-                  <span className="font-mono font-medium text-xs truncate">@codingindiaai</span>
-                )}
-              </a>
-            </SidebarTooltip>
-          </div>
         </div>
 
         {/* ── 3. Bottom: User Profile & Collapse Toggle ── */}
         <div className="shrink-0 border-t border-white/5 bg-slate-950/80 p-2 flex flex-col gap-1.5">
           {user && (
             <div
-              className={`flex items-center justify-between gap-2 rounded-lg p-1.5 ${
-                isCollapsed && !isMobileOpen ? "justify-center" : ""
-              }`}
+              className={`flex items-center justify-between gap-2 rounded-lg p-1.5 ${isCollapsed && !isMobileOpen ? "justify-center" : ""
+                }`}
             >
               <SidebarTooltip
                 label={user.email || "Account"}
@@ -378,9 +344,8 @@ export default function Sidebar({
                 isCollapsed={isCollapsed && !isMobileOpen}
               >
                 <div
-                  className={`flex items-center gap-2 overflow-hidden ${
-                    isCollapsed && !isMobileOpen ? "justify-center" : ""
-                  }`}
+                  className={`flex items-center gap-2 overflow-hidden ${isCollapsed && !isMobileOpen ? "justify-center" : ""
+                    }`}
                 >
                   <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-slate-800 border border-white/10 text-slate-300">
                     <UserIcon className="h-3.5 w-3.5" />
@@ -434,9 +399,8 @@ export default function Sidebar({
             >
               <button
                 onClick={onToggleCollapse}
-                className={`flex h-8 w-full items-center gap-2 rounded-lg border border-white/5 bg-white/[0.02] px-2 text-xs text-slate-400 hover:bg-white/5 hover:text-slate-200 transition-all ${
-                  isCollapsed ? "justify-center" : "justify-between"
-                }`}
+                className={`flex h-8 w-full items-center gap-2 rounded-lg border border-white/5 bg-white/[0.02] px-2 text-xs text-slate-400 hover:bg-white/5 hover:text-slate-200 transition-all ${isCollapsed ? "justify-center" : "justify-between"
+                  }`}
                 aria-label={isCollapsed ? "Expand sidebar" : "Collapse sidebar"}
               >
                 {isCollapsed ? (

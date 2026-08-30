@@ -506,6 +506,17 @@ class PlanItemContent(Base):
 
     __table_args__ = (
         Index("ix_plan_item_content_item_created", "item_id", text("created_at DESC")),
+        # Serves the assistant's user-wide review-queue read
+        # (queries.get_pending_review_contents); ix_plan_item_content_item_created
+        # leads with item_id and cannot. Created in 0008 but never declared here,
+        # so `alembic revision --autogenerate` saw an index with no model behind
+        # it and emitted a drop (b139d561a452). Declared now so that cannot recur.
+        Index(
+            "ix_plan_item_content_user_review",
+            "user_id",
+            "review_status",
+            text("created_at DESC"),
+        ),
     )
 
 
@@ -708,7 +719,19 @@ class InstagramSnapshot(Base):
     # index on user_id would only cost write throughput.
     user_id: Mapped[str] = _owner_fk(index=False)
     profile_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # The default range's stats, kept for readers that want just one block.
     stats_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # Every supported time_range -> its own stats block. Without this the
+    # dashboard's range dropdown was decorative: one blob answered all four.
+    stats_by_range_json: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
+    # What the sync could actually see (posts paginated vs. the account's total,
+    # how many carry insights). Achievements reads it to decide whether a sum is
+    # a lifetime total or a partial sample.
+    coverage_json: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+    )
     posts_json: Mapped[list] = mapped_column(JSONB, nullable=False)
     hashtags_json: Mapped[list] = mapped_column(JSONB, nullable=False)
     synced_at: Mapped[datetime] = _created_at()
@@ -810,6 +833,12 @@ class YoutubeVideoLive(Base):
     average_view_percentage: Mapped[float] = mapped_column(
         Double, nullable=False, server_default=text("0")
     )
+    # Real total watch time in hours from the Analytics API
+    # (estimatedMinutesWatched / 60). NULL until sync-analytics has run.
+    watch_time_hours: Mapped[float | None] = mapped_column(Double, nullable=True)
+    # Net subscribers gained from this video (subscribersGained metric).
+    # NULL until sync-analytics has run.
+    subscribers_gained: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     analytics_synced_at: Mapped[datetime | None] = mapped_column(TZDateTime)
 
     __table_args__ = (
@@ -1111,6 +1140,107 @@ class YoutubeCompetitorVideo(Base):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Prospect audits — third-party channels analysed for outreach
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class YoutubeProspect(Base):
+    """A third-party channel the user has audited for outreach.
+
+    Deliberately separate from ``youtube_competitors`` rather than reusing it.
+    A competitor is a channel the user has chosen to track, feeding the weekly
+    sync and every analysis prompt; a prospect is someone they looked up once to
+    pitch. Folding prospects into that table would silently poison the user's
+    competitive set — and ``youtube_competitor_videos`` has a composite FK that
+    would require a competitor row per lookup.
+    """
+
+    __tablename__ = "youtube_prospects"
+
+    id: Mapped[str] = _pk_uuid()
+    user_id: Mapped[str] = _owner_fk(index=False)
+    channel_id: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
+    handle: Mapped[str | None] = mapped_column(Text)
+    description: Mapped[str | None] = mapped_column(Text)
+    thumbnail_url: Mapped[str | None] = mapped_column(Text)
+    country: Mapped[str | None] = mapped_column(Text)
+    subscriber_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    view_count: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    video_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Deterministic, Python-computed figures backing the outreach line. Stored
+    # so the copy shown later always matches the numbers it was generated from,
+    # even after the channel's real stats have moved on.
+    metrics_json: Mapped[dict | None] = mapped_column(JSONB)
+    headline_json: Mapped[dict | None] = mapped_column(JSONB)
+    outreach_line: Mapped[str | None] = mapped_column(Text)
+    outreach_status: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'new'")
+    )  # new | contacted | replied | archived
+    duration_available: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("true")
+    )
+    last_report_at: Mapped[datetime | None] = mapped_column(TZDateTime)
+    created_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "channel_id", name="uq_youtube_prospects_user_channel"),
+        Index("ix_youtube_prospects_user_created", "user_id", text("created_at DESC")),
+    )
+
+
+class YoutubeProspectReport(Base):
+    """One generated audit or roadmap for a prospect.
+
+    Kept as history rather than a column on the prospect so a re-run never
+    destroys the version the user already pasted into an email.
+    """
+
+    __tablename__ = "youtube_prospect_reports"
+
+    id: Mapped[str] = _pk_uuid()
+    prospect_id: Mapped[str] = mapped_column(
+        UUIDStr, ForeignKey("youtube_prospects.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[str] = _owner_fk(index=False)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)  # audit | roadmap
+    weeks: Mapped[int | None] = mapped_column(Integer)
+    # Display name, e.g. "Gemini 3.7 Flash". Kept for backwards compatibility
+    # with rows written before tier tracking; resolved_model is the real answer.
+    model: Mapped[str | None] = mapped_column(Text)
+
+    # ── Provenance ───────────────────────────────────────────────────────────
+    # Which rung of app.provider_tiers actually produced this report. Without
+    # these an audit written by a local 7B fallback was indistinguishable — in
+    # the database, the API and the exported PDF — from one written by Gemini.
+    #
+    # tier_grade is the gate: only 'client_grade' may be exported, printed or
+    # shared. It defaults to 'internal_only' precisely so that a row whose
+    # provenance was never recorded fails closed rather than open.
+    tier_index: Mapped[int | None] = mapped_column(Integer)
+    tier_name: Mapped[str | None] = mapped_column(Text)
+    tier_grade: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'internal_only'")
+    )
+    # The exact model string that answered, e.g. "gemini/gemini-3.7-flash".
+    # Internal-facing only: never rendered into a client export.
+    resolved_model: Mapped[str | None] = mapped_column(Text)
+
+    payload_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        Index(
+            "ix_youtube_prospect_reports_prospect_kind",
+            "prospect_id",
+            "kind",
+            text("created_at DESC"),
+        ),
+        Index("ix_youtube_prospect_reports_user", "user_id", text("created_at DESC")),
+    )
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Personal intelligence — user-defined rules and tracked goals
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1347,6 +1477,44 @@ class AssistantAction(Base):
     )
 
 
+class GeneratedImage(Base):
+    """One prompt-to-image render from the Image Studio.
+
+    The row exists so the file can be served back safely. Rendered images live in
+    ``settings.image_output_dir``, which is deliberately *not* a static mount —
+    see ``planner.get_item_image``: under docker-compose the dashboard cannot see
+    that directory anyway, and mounting it would make every tenant's renders
+    public. Ownership is proven by this row, then the file is streamed.
+    """
+
+    __tablename__ = "generated_images"
+
+    id: Mapped[str] = _pk_uuid()
+    user_id: Mapped[str] = _owner_fk(index=False)  # covered by the composite below
+
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    # Gemini has no negative-prompt field; the client folds exclusions into the
+    # positive prompt. Stored separately so the UI can show what was asked for.
+    negative_prompt: Mapped[str | None] = mapped_column(Text)
+
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    aspect_ratio: Mapped[str] = mapped_column(Text, nullable=False)
+    image_size: Mapped[str] = mapped_column(Text, nullable=False)
+    seed: Mapped[int | None] = mapped_column(BigInteger)
+
+    # Basename only, always resolved through _image_path's traversal guard.
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    duration_s: Mapped[float | None] = mapped_column(Double)
+
+    created_at: Mapped[datetime] = _created_at()
+
+    __table_args__ = (
+        # The gallery reads newest-first for one user, which is the only access
+        # pattern; a bare user_id index would be redundant with this.
+        Index("ix_generated_images_user_created", "user_id", text("created_at DESC")),
+    )
+
+
 # Tables that belong to a single tenant. Used by the isolation tests to assert
 # that no query touches one of these without a user_id predicate.
 TENANT_TABLES: frozenset[str] = frozenset(
@@ -1358,6 +1526,7 @@ TENANT_TABLES: frozenset[str] = frozenset(
         "assistant_messages",
         "blog_posts",
         "content_plans",
+        "generated_images",
         "google_oauth_tokens",
         "instagram_oauth_tokens",
         "instagram_snapshots",
@@ -1379,6 +1548,8 @@ TENANT_TABLES: frozenset[str] = frozenset(
         "youtube_competitor_videos",
         "youtube_competitors",
         "youtube_playlist_items",
+        "youtube_prospect_reports",
+        "youtube_prospects",
         "youtube_published_videos",
         "youtube_scripts",
         "youtube_traffic_sources",

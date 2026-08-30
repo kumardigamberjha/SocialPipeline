@@ -12,6 +12,8 @@ from typing import Literal
 from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.provider_tiers import ProviderTier, resolve_chain
+
 # Insecure placeholder shipped in source. Refused in production by
 # _reject_insecure_production_config below.
 _PLACEHOLDER_SECRET_KEY = "change-this-to-a-random-64-char-string-in-production"
@@ -40,8 +42,18 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     gemini_api_key: str | None = None
+    # Second key, tried only when the primary fails for a reason another key can
+    # actually fix — quota exhausted, or the key itself rejected. Quota on the
+    # free tier is per project, so a second key is a second daily allowance.
+    # Note `extra="ignore"` above: without this field the env var is dropped
+    # silently rather than raising, which is why it appeared to do nothing.
+    gemini_backup_api_key: str | None = None
     gemma_api_key: str | None = None
     ollama_cloud_api_key: str | None = None
+    # Tier 3 of the analysis cascade. This lived in app/.env with no field to
+    # receive it, so `extra="ignore"` above silently discarded it — the exact
+    # trap the gemini_backup_api_key comment warns about.
+    openrouter_api_key: str | None = None
     meta_access_token: str | None = None
     instagram_app_id: str | None = None
     instagram_app_secret: str | None = None
@@ -91,13 +103,13 @@ class Settings(BaseSettings):
     # Wall-clock ceiling for a whole LLM fallback cascade, not one call.
     # Must stay under Cloudflare's ~100s proxy timeout: the analysis endpoints
     # run the cascade synchronously inside the request handler.
-    llm_timeout: int = 85
+    llm_timeout: int = 120
     ollama_model: str = "ollama/gemma4:31b-cloud"
     # Local Ollama model (used as the last priority local fallback)
     local_ollama_model: str = "ollama/qwen2.5:latest"
     # Ollama cloud model (3rd priority fallback)
     ollama_cloud_model: str = "ollama/gemma4:31b-cloud"
-    # Primary model (1st priority): Google Gemini
+    # Tiers 1 and 2 of the analysis cascade: Google Gemini on two keys.
     analysis_model: str = "gemini/gemini-3.6-flash"
     ollama_analysis_model: str = "gemini/gemini-3.6-flash"
     # 2nd priority fallback: NVIDIA DeepSeek AI (NVIDIA NIM)
@@ -111,6 +123,33 @@ class Settings(BaseSettings):
     nvidia_model: str = "nvidia_nim/deepseek-ai/deepseek-v4-flash-0731"
     ollama_api_base: str = "http://localhost:11434"
     openai_api_base: str = ""
+
+    # ── OpenRouter (analysis cascade tier 3) ──────────────────────────
+    openrouter_api_base: str = "https://openrouter.ai/api/v1"
+    openrouter_model: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    # Optional attribution headers OpenRouter surfaces on its dashboard.
+    openrouter_referer: str = ""
+    openrouter_title: str = "Content Creator"
+
+    # ── Per-tier wall-clock budgets ───────────────────────────────────
+    # Each lands on the LLM object as ``llm.timeout``; call_llm_with_retry
+    # reads it back off the object rather than keeping a parallel table.
+    # Measured on this deployment: gemma4:31b-cloud ~80 tok/s, and the free
+    # Nemotron tier is a large reasoning model that streams slowly, so it
+    # needs a genuinely wide budget or it fails 100% of the time.
+    gemini_tier_timeout: int = 75
+    openrouter_timeout: int = 150
+    ollama_cloud_tier_timeout: int = 60
+    local_ollama_tier_timeout: int = 90
+
+    # Comma-separated provider_tiers keys, to reorder or shorten the analysis
+    # cascade without a code change. Empty means DEFAULT_PROVIDER_CHAIN.
+    llm_provider_chain: str = ""
+    # Ceiling for the whole audit cascade. Wider than llm_timeout because a
+    # strict cascade retries each tier before advancing (3 attempts on a
+    # transient fault), and the audit runs on a background-friendly path
+    # rather than behind the Cloudflare proxy timeout.
+    audit_llm_timeout: int = 300
 
     # ── YouTube competitor tracking ───────────────────────────────────────
     # The weekly Sunday sync refreshes at most this many approved competitors
@@ -202,6 +241,7 @@ class Settings(BaseSettings):
     # ── App ───────────────────────────────────────────────────
     app_name: str = "Wings of AI – Content Pipeline"
     app_version: str = "1.0.0"
+    report_brand_name: str = "Growth Intelligence"
     log_level: str = "INFO"
     cors_origins: str = "*"  # comma-separated in prod
 
@@ -251,6 +291,20 @@ class Settings(BaseSettings):
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
+
+    @property
+    def provider_chain(self) -> tuple["ProviderTier", ...]:
+        """The ordered analysis cascade, including tiers that are not configured.
+
+        Unconfigured tiers are kept so that a tier index means the same provider
+        in every log line and health payload; the builder skips them.
+        """
+        return resolve_chain(self.llm_provider_chain)
+
+    @property
+    def usable_provider_chain(self) -> tuple["ProviderTier", ...]:
+        """Only the tiers that can actually be attempted right now."""
+        return tuple(t for t in self.provider_chain if t.is_configured(self))
 
     @model_validator(mode="after")
     def _mirror_encryption_key_aliases(self) -> "Settings":
@@ -318,6 +372,15 @@ class Settings(BaseSettings):
             problems.append(
                 "ALLOW_INPROCESS_FALLBACK must be false in production; "
                 "run a Celery worker for every queue instead"
+            )
+
+        # Without a configured client-grade tier every audit is internal_only,
+        # so the export gate refuses all of them and the product silently has
+        # no deliverable. That is a config error, not a runtime condition.
+        if not any(t.is_client_grade and t.is_configured(self) for t in self.provider_chain):
+            problems.append(
+                "no client-grade LLM tier is configured (set GEMINI_API_KEY or "
+                "GEMINI_BACKUP_API_KEY); every audit would be blocked from export"
             )
 
         if problems:

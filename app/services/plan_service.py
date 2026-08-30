@@ -14,6 +14,7 @@ from 'pending' to 'script_generated'.
 """
 
 import logging
+import os
 
 from fastapi import BackgroundTasks, HTTPException
 from sqlalchemy import update
@@ -172,14 +173,17 @@ async def set_source_approved(session: AsyncSession, content: dict, approved: bo
 
 
 async def _remaining_quota(session: AsyncSession, user_id: str) -> int:
+    if os.getenv("ENABLE_USAGE_LIMITS", "false").lower() not in ("true", "1"):
+        return 999999
     await queries.reset_usage_if_expired(session, user_id)
     usage = await queries.get_usage(session, user_id)
     if not usage:
         await queries.init_usage(session, user_id)
         usage = await queries.get_usage(session, user_id)
     if not usage:
-        return 0
-    return max(0, usage["max_runs_per_month"] - usage["runs_this_month"])
+        return 999999
+    max_runs = usage.get("max_runs_per_month") or 999999
+    return max(0, max_runs - usage.get("runs_this_month", 0))
 
 
 async def dispatch_item_content(session: AsyncSession, item: dict, content_type: str,

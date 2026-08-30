@@ -34,3 +34,13 @@ def setup_logging(level: str = "INFO") -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+    class _LiteLLMFilter(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            msg = str(record.getMessage())
+            if "DeprecationWarning" in msg and "Gemini 3+" in msg:
+                return False
+            return True
+
+    logging.getLogger("LiteLLM").addFilter(_LiteLLMFilter())
+    logging.getLogger("litellm").addFilter(_LiteLLMFilter())

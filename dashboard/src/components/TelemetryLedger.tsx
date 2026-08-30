@@ -1,6 +1,7 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
+import Link from "next/link";
 import {
   TrendingUp,
   CheckCircle2,
@@ -13,6 +14,8 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ArrowRight,
+  Sparkles,
 } from "lucide-react";
 
 import { useState, useEffect, useCallback } from "react";
@@ -167,6 +170,7 @@ const statusBadge: Record<string, any> = {
 
 export default function TelemetryLedger() {
   const [metrics, setMetrics] = useState<PostMetric[]>([]);
+  const [totalCount, setTotalCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [page, setPage] = useState(0);
@@ -179,22 +183,31 @@ export default function TelemetryLedger() {
   useEffect(() => {
     setLoading(true);
     setExpandedId(null);
-    request<any[]>(`/runs?limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`)
-      .then((data: any[]) => {
-        const mapped = data.map((run) => ({
+    // Request ONLY completed/succeeded runs for the main dashboard ledger
+    request<any>(`/runs?status=completed&limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`)
+      .then((res: any) => {
+        const rawItems = Array.isArray(res) ? res : res?.items || [];
+        const total = typeof res?.total === "number" ? res.total : null;
+        setTotalCount(total);
+
+        const mapped = rawItems.map((run: any) => ({
           id: run.id,
           topic: run.topic || "Unknown Topic",
-          status: run.status || "running",
+          status: run.status || "completed",
           final_result: run.final_result,
           duration_seconds: run.duration_seconds,
-          impressions: run.status === "completed" ? Math.floor(Math.random() * 10000 + 1000).toLocaleString() : "—",
-          likes: run.status === "completed" ? Math.floor(Math.random() * 500 + 50).toString() : "—",
-          comments: run.status === "completed" ? Math.floor(Math.random() * 100 + 10).toString() : "—",
-          ctr: run.status === "completed" ? (Math.random() * 5 + 1).toFixed(1) + "%" : "—",
-          trendUp: run.status === "completed",
+          impressions: Math.floor(Math.random() * 10000 + 1000).toLocaleString(),
+          likes: Math.floor(Math.random() * 500 + 50).toString(),
+          comments: Math.floor(Math.random() * 100 + 10).toString(),
+          ctr: (Math.random() * 5 + 1).toFixed(1) + "%",
+          trendUp: true,
         }));
         setMetrics(mapped);
-        setHasNext(data.length === PAGE_SIZE);
+        if (total !== null) {
+          setHasNext((page + 1) * PAGE_SIZE < total);
+        } else {
+          setHasNext(rawItems.length === PAGE_SIZE);
+        }
         setLoading(false);
       })
       .catch((err) => {
@@ -227,15 +240,29 @@ export default function TelemetryLedger() {
     <section className="w-full">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         {/* Section header */}
-        <div className="flex items-center gap-2 mb-6">
-          <div className="w-1 h-4 bg-gradient-to-b from-cyan-500 to-blue-500 rounded-full" />
-          <h2 className="text-[11px] font-bold tracking-[0.25em] uppercase text-slate-400">
-            Telemetry Ledger
-          </h2>
-          <span className="text-[10px] text-slate-600 ml-2">
-            Historical Data
-          </span>
-          <div className="flex-1 h-px bg-gradient-to-r from-white/10 to-transparent ml-2" />
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6">
+          <div className="flex items-center gap-2">
+            <div className="w-1 h-4 bg-gradient-to-b from-cyan-500 to-blue-500 rounded-full" />
+            <h2 className="text-[11px] font-bold tracking-[0.25em] uppercase text-slate-400">
+              Telemetry Ledger
+            </h2>
+            <span className="text-[10px] text-slate-600 ml-1">
+              Historical Data
+            </span>
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold tracking-wider uppercase bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 ml-2">
+              <CheckCircle2 className="w-3 h-3" />
+              Succeeded Only
+            </span>
+            <div className="hidden sm:block flex-1 h-px bg-gradient-to-r from-white/10 to-transparent ml-2" />
+          </div>
+
+          <Link
+            href="/history"
+            className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-400 hover:text-blue-300 transition-colors group self-start sm:self-auto bg-blue-500/10 hover:bg-blue-500/15 border border-blue-500/20 rounded-lg px-3 py-1.5"
+          >
+            <span>View All History & Filters</span>
+            <ArrowRight className="w-3.5 h-3.5 transition-transform group-hover:translate-x-0.5" />
+          </Link>
         </div>
 
         {/* Table */}
@@ -266,10 +293,16 @@ export default function TelemetryLedger() {
           </div>
 
           {metrics.length === 0 && !loading && (
-            <div className="p-8 text-center text-slate-500 text-sm">No historical runs found in Supabase.</div>
+            <div className="p-8 text-center text-slate-500 text-sm">
+              No succeeded runs recorded yet. Check all pipeline runs in{" "}
+              <Link href="/history" className="text-blue-400 hover:text-blue-300 underline font-medium">
+                History
+              </Link>
+              .
+            </div>
           )}
           {loading && (
-            <div className="p-8 text-center text-slate-500 text-sm animate-pulse">Loading telemetry from backend...</div>
+            <div className="p-8 text-center text-slate-500 text-sm animate-pulse">Loading succeeded runs from backend...</div>
           )}
 
           {/* Table Rows */}
@@ -443,7 +476,9 @@ export default function TelemetryLedger() {
           {/* Table Footer */}
           <div className="flex items-center justify-between px-5 py-3 border-t border-white/5">
             <span className="text-[10px] text-slate-600 tracking-wider">
-              {metrics.length > 0
+              {totalCount !== null
+                ? `Showing ${metrics.length > 0 ? page * PAGE_SIZE + 1 : 0}–${page * PAGE_SIZE + metrics.length} of ${totalCount} succeeded runs`
+                : metrics.length > 0
                 ? `Showing records ${page * PAGE_SIZE + 1}–${page * PAGE_SIZE + metrics.length}`
                 : "No records"}
             </span>

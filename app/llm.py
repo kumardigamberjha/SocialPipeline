@@ -7,8 +7,28 @@ Supported providers: google (Gemini), nvidia (DeepSeek / NIM), ollama (Cloud & L
 import logging
 from typing import Any
 
+import litellm
+litellm.cooldown_cache = False
+litellm.telemetry = False
+litellm.suppress_debug_info = True
+litellm.request_timeout = 30  # connection-level timeout; prevents "timed out after None seconds"
+
+
+class _LiteLLMGeminiWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.getMessage())
+        if "DeprecationWarning" in msg and "Gemini 3+" in msg:
+            return False
+        return True
+
+
+logging.getLogger("LiteLLM").addFilter(_LiteLLMGeminiWarningFilter())
+logging.getLogger("litellm").addFilter(_LiteLLMGeminiWarningFilter())
+
 from crewai import LLM
 from app.config import Settings
+from app.provider_tiers import ProviderTier
+from app.services.openrouter_client import build_openrouter_llm
 
 logger = logging.getLogger(__name__)
 
@@ -24,10 +44,15 @@ logger = logging.getLogger(__name__)
 # These land on the LLM object as ``llm.timeout`` and are the single source of
 # truth for the budget: ``call_llm_with_retry`` reads them back off the object
 # rather than keeping a parallel tier→seconds table that could drift.
-GEMINI_TIMEOUT = 45
+# These are the historical defaults, kept as module constants because the
+# builders below take them as default arguments. The *cascade* reads its
+# budgets from Settings (see app/provider_tiers.py), so a deployment can
+# retune a tier without touching code; these only apply to direct calls.
+GEMINI_TIMEOUT = 75
 OLLAMA_CLOUD_TIMEOUT = 60
 NVIDIA_TIMEOUT = 120
 LOCAL_OLLAMA_TIMEOUT = 90
+OPENROUTER_TIMEOUT = 150
 
 
 def build_gemini_llm(
@@ -36,17 +61,22 @@ def build_gemini_llm(
     model: str | None = None,
     timeout: int = GEMINI_TIMEOUT,
     max_tokens: int | None = None,
+    api_key: str | None = None,
 ) -> LLM:
     """Build Tier 1 Google Gemini LLM."""
-    if not settings.gemini_api_key:
+    key = api_key or settings.gemini_api_key
+    if not key:
         raise ValueError("Missing gemini_api_key")
     model_name = model or settings.analysis_model or "gemini/gemini-3.6-flash"
     if not model_name.startswith("gemini/"):
         model_name = f"gemini/{model_name}"
+    # For Gemini 3 / Gemini 2.5 reasoning models, LiteLLM warns and reasoning can degrade
+    # when temperature < 1.0. Use temperature = 1.0 for Gemini 3+ models.
+    gemini_temp = 1.0 if ("gemini-3" in model_name or "gemini-2.5" in model_name) else temperature
     kwargs: dict[str, Any] = {
         "model": model_name,
-        "api_key": settings.gemini_api_key,
-        "temperature": temperature,
+        "api_key": key,
+        "temperature": gemini_temp,
         "timeout": timeout,
         # crewai's *native* Gemini provider (GeminiCompletion, on google-genai)
         # supports no timeout at all — it has no such field, so the value above
@@ -138,62 +168,135 @@ def build_local_ollama_llm(
     return LLM(**kwargs)
 
 
+# Cooldown-map keys observed at build time, keyed by tier. Lets /api/health
+# report which tiers are currently parked for quota without instantiating the
+# whole cascade on every 30s poll — and without this module having to
+# reimplement the provider-specific model-string normalisation that crewai
+# applies (it strips the "ollama/" prefix, for instance).
+_TIER_COOLDOWN_KEYS: dict[str, str] = {}
+
+
+_TIER_BUILDERS = {
+    "gemini": lambda settings, tier, temperature, max_tokens: build_gemini_llm(
+        settings,
+        temperature=temperature,
+        model=tier.model(settings),
+        timeout=tier.timeout(settings),
+        max_tokens=max_tokens,
+        api_key=tier.api_key(settings),
+    ),
+    "openrouter": lambda settings, tier, temperature, max_tokens: build_openrouter_llm(
+        settings,
+        temperature=temperature,
+        model=tier.model(settings),
+        timeout=tier.timeout(settings),
+        max_tokens=max_tokens,
+    ),
+    "ollama_cloud": lambda settings, tier, temperature, max_tokens: build_ollama_cloud_llm(
+        settings,
+        temperature=temperature,
+        model=tier.model(settings),
+        timeout=tier.timeout(settings),
+        max_tokens=max_tokens,
+    ),
+    "ollama_local": lambda settings, tier, temperature, max_tokens: build_local_ollama_llm(
+        settings,
+        temperature=temperature,
+        model=tier.model(settings),
+        timeout=tier.timeout(settings),
+        max_tokens=max_tokens,
+    ),
+}
+
+
+def build_tier_cascade(
+    settings: Settings,
+    temperature: float = 0.4,
+    max_tokens: int | None = None,
+) -> list[tuple[ProviderTier, Any]]:
+    """Instantiate the ordered provider chain from ``settings.provider_chain``.
+
+    Every returned LLM carries its :class:`ProviderTier` as ``llm.provider_tier``.
+    That is what lets ``call_llm_with_retry`` report the tier that actually
+    answered without a parallel lookup table — and it is why the primary and the
+    fallbacks need no different treatment.
+
+    A tier that is unconfigured or fails to construct is skipped **with a
+    warning** and does not shift the others: tier indices come from the
+    declaration, so "tier 4" means Ollama Cloud whether or not tier 3 is on.
+    """
+    max_tokens = max_tokens or settings.llm_max_tokens
+    built: list[tuple[ProviderTier, Any]] = []
+
+    for tier in settings.provider_chain:
+        if not tier.is_configured(settings):
+            logger.warning(
+                "LLM cascade: skipping %s — not configured (model=%r, key=%s)",
+                tier.name,
+                tier.model(settings),
+                "set" if tier.api_key(settings) else "missing",
+            )
+            continue
+        builder = _TIER_BUILDERS.get(tier.builder)
+        if builder is None:
+            logger.warning("LLM cascade: %s has unknown builder %r", tier.name, tier.builder)
+            continue
+        try:
+            llm = builder(settings, tier, temperature, max_tokens)
+        except Exception as exc:
+            logger.warning("LLM cascade: could not build %s: %s", tier.name, exc)
+            continue
+        # The tier travels with the object. Everything downstream — retry
+        # classification, the `used` stamp, the export gate — reads it from here.
+        try:
+            llm.provider_tier = tier
+        except Exception:  # pragma: no cover - defensive, for slotted LLM classes
+            logger.debug("Could not stamp provider_tier onto %s", tier.name)
+        try:
+            from app.services.blog_pipeline.utils import _llm_key
+
+            _TIER_COOLDOWN_KEYS[tier.key] = _llm_key(llm)
+        except Exception:  # pragma: no cover - health reporting is optional
+            logger.debug("Could not record cooldown key for %s", tier.name)
+        built.append((tier, llm))
+
+    if not built:
+        raise RuntimeError(
+            "No LLM tier could be built. Check GEMINI_API_KEY / OPENROUTER_API_KEY "
+            "and OLLAMA_API_BASE."
+        )
+    return built
+
+
 def build_fallback_cascade(
     settings: Settings,
     temperature: float = 0.4,
     max_tokens: int | None = None,
-) -> tuple[LLM, list[tuple[str, LLM]]]:
+) -> tuple[Any, list[tuple[str, Any]]]:
+    """The analysis cascade, as ``(primary_llm, [(tier_name, llm), ...])``.
+
+    Order comes from ``app.provider_tiers.DEFAULT_PROVIDER_CHAIN`` (overridable
+    with ``LLM_PROVIDER_CHAIN``), not from the shape of this function:
+
+      1. Gemini, primary key      — client grade
+      2. Gemini, backup key       — client grade
+      3. OpenRouter Nemotron 3 Ultra, SSE  — internal only
+      4. Ollama Cloud, Gemma 4 31B         — internal only
+      5. Ollama local, Qwen 2.5            — internal only
+
+    This replaced a hardcoded chain that put local Qwen at tier 2, ahead of every
+    hosted model — so losing Gemini quota dropped an audit straight onto the
+    weakest model available, silently.
     """
-    Build the 4-tier LLM fallback cascade, ordered by *measured* throughput:
-      1. Primary: Google Gemini Flash
-      2. Tier 2: Ollama Cloud (gemma4:31b-cloud)  — ~80 tok/s
-      3. Tier 3: NVIDIA NIM (DeepSeek AI)         — ~8 tok/s, needs a big budget
-      4. Tier 4: Local Ollama (qwen2.5:latest)
-
-    ``max_tokens`` applies to every tier; it used to be accepted and silently
-    ignored here, which is how the NVIDIA tiers ended up hardcoded at 16384.
-
-    Returns (primary_llm, [(tier_name, fallback_llm), ...])
-    """
-    max_tokens = max_tokens or settings.llm_max_tokens
-
-    # Tier 4 (always available locally if Ollama is running)
-    local_ollama = build_local_ollama_llm(settings, temperature=temperature, max_tokens=max_tokens)
-
-    # Tier 2: Ollama Cloud
-    try:
-        ollama_cloud = build_ollama_cloud_llm(settings, temperature=temperature, max_tokens=max_tokens)
-    except Exception as e:
-        logger.warning("Could not build Ollama Cloud LLM: %s", e)
-        ollama_cloud = None
-
-    # Tier 3: NVIDIA NIM (DeepSeek AI)
-    nvidia_deepseek = None
-    if settings.nvidia_api_key:
-        try:
-            nvidia_deepseek = build_nvidia_llm(settings, temperature=temperature, max_tokens=max_tokens)
-        except Exception as e:
-            logger.warning("Could not build NVIDIA DeepSeek LLM: %s", e)
-
-    # Build ordered fallback chain: fastest healthy provider first.
-    fallback_chain: list[tuple[str, LLM]] = []
-    if ollama_cloud is not None:
-        fallback_chain.append(("Tier 2: Ollama Cloud", ollama_cloud))
-    if nvidia_deepseek is not None:
-        fallback_chain.append(("Tier 3: NVIDIA DeepSeek", nvidia_deepseek))
-    fallback_chain.append(("Tier 4: Local Ollama (qwen2.5:latest)", local_ollama))
-
-    # Tier 1: Primary Gemini
-    try:
-        gemini_llm = build_gemini_llm(settings, temperature=temperature, max_tokens=max_tokens)
-        return gemini_llm, fallback_chain
-    except Exception as e:
-        logger.warning("Could not initialize Tier 1 Gemini LLM (%s); promoting the next tier to primary", e)
-        if fallback_chain:
-            _first_name, first_llm = fallback_chain[0]
-            return first_llm, fallback_chain[1:]
-        return local_ollama, []
-
+    built = build_tier_cascade(settings, temperature=temperature, max_tokens=max_tokens)
+    primary_tier, primary_llm = built[0]
+    if not primary_tier.is_client_grade:
+        logger.warning(
+            "LLM cascade: no client-grade tier is available; starting at %s. "
+            "Audits produced now will be marked internal_only and blocked from export.",
+            primary_tier.name,
+        )
+    return primary_llm, [(tier.name, llm) for tier, llm in built[1:]]
 
 
 def build_llm(provider: str, settings: Settings) -> Any:
@@ -261,3 +364,45 @@ def build_llm(provider: str, settings: Settings) -> Any:
         logger.warning(f"Failed to initialize primary provider '{provider}' ({e}). Falling back to local ollama.")
         return local_ollama_llm
 
+
+def describe_chain(settings: Settings) -> list[dict]:
+    """The cascade as data, for /api/health and the dashboard tier indicator.
+
+    Deliberately does no network I/O and builds no LLM objects: this is polled
+    every 30 seconds. Cooldown state comes from keys recorded the last time the
+    cascade was actually built, so a tier that has never been built reports
+    ``cooling_for = None`` rather than a confident zero.
+    """
+    from app.services.blog_pipeline.utils import cooldown_remaining_for_key
+
+    rows: list[dict] = []
+    for tier in settings.provider_chain:
+        configured = tier.is_configured(settings)
+        cooldown_key = _TIER_COOLDOWN_KEYS.get(tier.key)
+        cooling = cooldown_remaining_for_key(cooldown_key) if cooldown_key else None
+        rows.append(
+            {
+                "index": tier.index,
+                "key": tier.key,
+                "name": tier.name,
+                "grade": tier.grade,
+                "model": tier.model(settings),
+                "configured": configured,
+                "cooling_for": round(cooling) if cooling else (0 if cooling == 0 else None),
+                "available": configured and not cooling,
+            }
+        )
+    return rows
+
+
+def active_tier(settings: Settings) -> dict | None:
+    """The tier the next analysis call would land on, or None if none can serve.
+
+    This is what makes a silent degradation visible *before* somebody finds it in
+    a PDF: if this reports an internal_only tier, every audit generated right now
+    is going to be blocked from export.
+    """
+    for row in describe_chain(settings):
+        if row["available"]:
+            return row
+    return None

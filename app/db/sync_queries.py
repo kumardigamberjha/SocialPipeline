@@ -59,6 +59,8 @@ def update_run_status(
     status: str,
     final_result: str | None = None,
     duration: float | None = None,
+    topic: str | None = None,
+    image_url: str | None = None,
 ) -> bool:
     """Move a run to a new status. Returns False if the run isn't the user's."""
     values: dict = {
@@ -68,6 +70,10 @@ def update_run_status(
     }
     if status in ("completed", "failed"):
         values["completed_at"] = _now()
+    if topic is not None:
+        values["topic"] = topic
+    if image_url is not None:
+        values["image_url"] = image_url
 
     result = session.execute(
         update(AgentRun)

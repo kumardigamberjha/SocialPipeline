@@ -18,8 +18,8 @@ import time
 from crewai import Crew
 
 from app.config import Settings
-from app.db import queries
-from app.db.queries import save_task_step, update_agent_run, create_agent_run, update_run_status, increment_usage, save_blog_post
+from app.db import sync_queries
+from app.db.sync_session import sync_session_scope
 from app.ws_manager import manager
 from app.llm import build_llm
 
@@ -39,6 +39,52 @@ from app.db.content_tracker import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _sync_update_run_status(
+    run_id: str,
+    user_id: str,
+    status: str,
+    final_result: str | None = None,
+    duration: float | None = None,
+    topic: str | None = None,
+) -> None:
+    try:
+        with sync_session_scope() as session:
+            sync_queries.update_run_status(
+                session,
+                run_id=run_id,
+                user_id=user_id,
+                status=status,
+                final_result=final_result,
+                duration=duration,
+                topic=topic,
+            )
+    except Exception as e:
+        logger.error("Failed to update run status for %s: %s", run_id, e)
+
+
+def _sync_save_task_step(
+    run_id: str,
+    user_id: str,
+    agent_name: str,
+    task_name: str,
+    output: str | None,
+    status: str = "done",
+) -> None:
+    try:
+        with sync_session_scope() as session:
+            sync_queries.insert_task_step(
+                session,
+                run_id=run_id,
+                user_id=user_id,
+                agent_name=agent_name,
+                task_name=task_name,
+                output=output,
+                status=status,
+            )
+    except Exception as e:
+        logger.error("Failed to save task step for run %s: %s", run_id, e)
 
 
 # ── Niche Seed Banks ────────────────────────────────────────────────────────
@@ -395,11 +441,10 @@ async def run_pipeline_streaming(
     loop = asyncio.get_running_loop()
 
     # Run already created in ws.py; we just update it as we go.
-    from app.db.queries import update_run_status
-    update_run_status(run_id, 'running')
+    _sync_update_run_status(run_id, user_id, "running")
 
     def task_callback(task_name, output):
-        save_task_step(run_id, "Agent", task_name, output, "done")
+        _sync_save_task_step(run_id, user_id, "Agent", task_name, output, "done")
         _sync_ws_event(client_id, loop, "task_finished", {
             "task": task_name,
             "output": output
@@ -492,7 +537,7 @@ async def run_pipeline_streaming(
         # Run LinkedIn pipeline
         def linkedin_ws_cb(agent_name, task_name, output):
             # Save the step to DB but do NOT emit to UI
-            save_task_step(run_id, agent_name, task_name, output, "done")
+            _sync_save_task_step(run_id, user_id, agent_name, task_name, output, "done")
                 
         linkedin_orch = LinkedInPipelineOrchestrator(llm_provider=provider, run_id=run_id, step_callback=linkedin_ws_cb)
         linkedin_res = await linkedin_orch.run(resolved_topic, "ai", user_id)
@@ -506,7 +551,7 @@ async def run_pipeline_streaming(
         # Run Blog pipeline
         def blog_ws_cb(agent_name, task_name, output):
             # Save the step to DB but do NOT emit to UI
-            save_task_step(run_id, agent_name, task_name, output, "done")
+            _sync_save_task_step(run_id, user_id, agent_name, task_name, output, "done")
 
         blog_orch = BlogPipelineOrchestrator(llm_provider=provider, run_id=run_id, step_callback=blog_ws_cb)
         blog_res = await blog_orch.run(resolved_topic, "ai", user_id)
@@ -529,7 +574,7 @@ async def run_pipeline_streaming(
                     generated_title = (clean_line[:75] + '...') if len(clean_line) > 75 else clean_line
                     break
 
-        update_agent_run(run_id, final_output, 0.0, "completed", topic=generated_title)
+        _sync_update_run_status(run_id, user_id, "completed", final_result=final_output, duration=0.0, topic=generated_title)
 
         # Save local JSON
         os.makedirs("output", exist_ok=True)
@@ -545,7 +590,7 @@ async def run_pipeline_streaming(
         }, client_id)
     except Exception as e:
         logger.error(f"Streaming pipeline failed: {e}")
-        update_agent_run(run_id, "", 0.0, "failed")
+        _sync_update_run_status(run_id, user_id, "failed", final_result="", duration=0.0)
         await manager.send_json({"type": "error", "message": str(e)}, client_id)
 
 
@@ -634,11 +679,11 @@ def run_blog_pipeline(
     the saved blog dict. Raises on total failure (both providers).
     """
     start = time.perf_counter()
-    update_run_status(run_id, "running")
+    _sync_update_run_status(run_id, user_id, "running")
     keyword = _derive_keyword(topic)
 
     def step_callback(agent_name: str, task_name: str, output: str) -> None:
-        save_task_step(run_id, agent_name, task_name, str(output), "done")
+        _sync_save_task_step(run_id, user_id, agent_name, task_name, str(output), "done")
 
     try:
         result = asyncio.run(
@@ -646,19 +691,29 @@ def run_blog_pipeline(
         )
         elapsed = round(time.perf_counter() - start, 2)
 
-        blog = save_blog_post(
-            run_id=run_id,
-            user_id=user_id,
-            topic=topic,
-            title=result["title"],
-            content=result["markdown"],
-            niche=niche or "unknown",
-            approved=result["approved"],
-            word_count=result["word_count"],
-        )
+        with sync_session_scope() as session:
+            blog = sync_queries.save_blog_post(
+                session=session,
+                run_id=run_id,
+                user_id=user_id,
+                topic=topic,
+                title=result["title"],
+                content=result["markdown"],
+                niche=niche or "unknown",
+                approved=result["approved"],
+                word_count=result["word_count"],
+            )
+            sync_queries.update_run_status(
+                session=session,
+                run_id=run_id,
+                user_id=user_id,
+                status="completed",
+                final_result=result["markdown"],
+                duration=elapsed,
+                topic=result["title"],
+            )
+            sync_queries.increment_usage(session, user_id)
 
-        update_agent_run(run_id, result["markdown"], elapsed, "completed", topic=result["title"])
-        increment_usage(user_id)
         logger.info(
             "Blog DONE ▸ run_id=%s words=%s approved=%s flagged=%s duration=%.2fs",
             run_id, blog["word_count"], result["approved"], result["sections_flagged"], elapsed,
@@ -667,7 +722,7 @@ def run_blog_pipeline(
     except Exception as exc:
         elapsed = round(time.perf_counter() - start, 2)
         logger.error("Blog FAILED ▸ run_id=%s after %.2fs: %s", run_id, elapsed, exc)
-        update_run_status(run_id, "failed", duration=elapsed)
+        _sync_update_run_status(run_id, user_id, "failed", duration=elapsed)
         raise
 
 
@@ -690,12 +745,12 @@ async def run_blog_pipeline_streaming(
     word_count), qa_result, blog_complete, error.
     """
     loop = asyncio.get_running_loop()
-    update_run_status(run_id, "running")
+    _sync_update_run_status(run_id, user_id, "running")
     keyword = _derive_keyword(topic)
 
     def step_callback(agent_name: str, task_name: str, output: str) -> None:
         # Persist for telemetry and stream a lightweight live event.
-        save_task_step(run_id, agent_name, task_name, str(output), "done")
+        _sync_save_task_step(run_id, user_id, agent_name, task_name, str(output), "done")
         asyncio.run_coroutine_threadsafe(
             manager.send_json(
                 {"type": "agent_update", "agent": agent_name, "task": task_name}, client_id
@@ -716,11 +771,31 @@ async def run_blog_pipeline_streaming(
         elapsed = round(time.perf_counter() - start, 2)
 
         # Persist first so the post survives even if the socket drops mid-stream.
-        blog = await asyncio.to_thread(
-            save_blog_post, run_id, user_id, topic, result["title"],
-            result["markdown"], niche or "unknown", result["approved"], result["word_count"],
-        )
-        update_agent_run(run_id, result["markdown"], elapsed, "completed", topic=result["title"])
+        def _persist_blog():
+            with sync_session_scope() as session:
+                b = sync_queries.save_blog_post(
+                    session=session,
+                    run_id=run_id,
+                    user_id=user_id,
+                    topic=topic,
+                    title=result["title"],
+                    content=result["markdown"],
+                    niche=niche or "unknown",
+                    approved=result["approved"],
+                    word_count=result["word_count"],
+                )
+                sync_queries.update_run_status(
+                    session=session,
+                    run_id=run_id,
+                    user_id=user_id,
+                    status="completed",
+                    final_result=result["markdown"],
+                    duration=elapsed,
+                    topic=result["title"],
+                )
+                return b
+
+        blog = await asyncio.to_thread(_persist_blog)
         # Usage is already incremented by check_and_increment in the WS handler.
 
         # Sweep the parsed sections so the client TOC fills in progressively.
@@ -762,5 +837,5 @@ async def run_blog_pipeline_streaming(
         )
     except Exception as exc:
         logger.error("Streaming blog failed: %s", exc)
-        update_run_status(run_id, "failed")
+        _sync_update_run_status(run_id, user_id, "failed")
         await manager.send_json({"type": "error", "message": str(exc)}, client_id)

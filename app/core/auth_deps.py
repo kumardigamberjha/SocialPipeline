@@ -167,6 +167,10 @@ async def get_current_user_ws(
     """
     try:
         return await _authenticate(websocket.headers, websocket.cookies, session)
+    except EmailNotVerifiedError as exc:
+        logger.debug("WebSocket unverified user: %s", exc)
+        await websocket.close(code=WS_FORBIDDEN, reason="Email address has not been verified")
+        raise WebSocketAuthError(str(exc)) from exc
     except TokenError as exc:
         logger.debug("WebSocket authentication rejected: %s", exc)
         await websocket.close(code=WS_UNAUTHENTICATED, reason="Not authenticated")

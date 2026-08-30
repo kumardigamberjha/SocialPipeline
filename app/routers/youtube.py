@@ -58,13 +58,14 @@ async def _dispatch(
     background_tasks: BackgroundTasks,
 ) -> dict:
     """Enforce the monthly cap, create a run, and dispatch the pipeline."""
-    await queries.reset_usage_if_expired(session, user_id)
-    usage = await queries.get_usage(session, user_id)
-    if not usage:
-        await queries.init_usage(session, user_id)
+    if os.getenv("ENABLE_USAGE_LIMITS", "false").lower() in ("true", "1"):
+        await queries.reset_usage_if_expired(session, user_id)
         usage = await queries.get_usage(session, user_id)
-    if usage and usage["runs_this_month"] >= usage["max_runs_per_month"]:
-        raise HTTPException(status_code=429, detail="Usage limit exceeded for this month.")
+        if not usage:
+            await queries.init_usage(session, user_id)
+            usage = await queries.get_usage(session, user_id)
+        if usage and usage.get("max_runs_per_month") and usage["runs_this_month"] >= usage["max_runs_per_month"]:
+            raise HTTPException(status_code=429, detail="Usage limit exceeded for this month.")
 
     run = await queries.create_run(session, user_id, topic, provider)
     run_id = run["id"]

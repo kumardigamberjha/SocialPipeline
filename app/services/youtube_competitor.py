@@ -53,16 +53,36 @@ class QuotaExhausted(Exception):
     pass
 
 
+def _extract_text(obj) -> str:
+    if not obj:
+        return ""
+    if isinstance(obj, str):
+        return obj.strip()
+    if isinstance(obj, dict):
+        if "simpleText" in obj and obj["simpleText"]:
+            return str(obj["simpleText"]).strip()
+        if "runs" in obj and isinstance(obj["runs"], list):
+            return "".join(r.get("text", "") for r in obj["runs"] if isinstance(r, dict)).strip()
+        if "accessibility" in obj and isinstance(obj["accessibility"], dict):
+            acc = obj["accessibility"].get("accessibilityData", {})
+            if "label" in acc:
+                return str(acc["label"]).strip()
+    return ""
+
+
 def _parse_subscriber_count(text: str) -> int:
-    """Parse strings like '137K subscribers', '1.2M subscribers', '540 subscribers' into integers."""
+    """Parse strings like '137K subscribers', '1.2M subscribers', '2.39 million subscribers' into integers."""
     if not text:
         return 0
     t = text.lower().replace("subscribers", "").replace("subscriber", "").replace(",", "").strip()
+    t = t.replace("million", "m").replace("thousand", "k").replace("billion", "b").strip()
     try:
         if "m" in t:
             return int(float(t.replace("m", "").strip()) * 1_000_000)
         if "k" in t:
             return int(float(t.replace("k", "").strip()) * 1_000)
+        if "b" in t:
+            return int(float(t.replace("b", "").strip()) * 1_000_000_000)
         return int(float(t))
     except Exception:
         return 0
@@ -85,27 +105,26 @@ def search_youtube_channels_direct(query: str, limit: int = 20) -> list[dict]:
                 continue
             seen.add(cid)
 
-            title = (
-                item.get("title", {}).get("simpleText")
-                or (item.get("title", {}).get("runs", [{}])[0].get("text") if item.get("title") else "")
-                or "YouTube Creator"
-            )
+            title = _extract_text(item.get("title")) or "YouTube Creator"
             thumbs = item.get("thumbnail", {}).get("thumbnails", [{}])
             thumb_url = thumbs[-1].get("url", "") if thumbs else ""
             if thumb_url.startswith("//"):
                 thumb_url = f"https:{thumb_url}"
 
-            sub_text = (
-                item.get("subscriberCountText", {}).get("simpleText")
-                or item.get("videoCountText", {}).get("simpleText")
-                or ""
-            )
-            desc = ""
-            if item.get("descriptionSnippet") and item["descriptionSnippet"].get("runs"):
-                desc = "".join(r.get("text", "") for r in item["descriptionSnippet"]["runs"])
+            sub_raw = _extract_text(item.get("subscriberCountText"))
+            vid_raw = _extract_text(item.get("videoCountText"))
+            nav = item.get("navigationEndpoint", {}).get("browseEndpoint", {})
+            canonical = nav.get("canonicalBaseUrl", "").lstrip("/")
 
-            handle = sub_text if sub_text.startswith("@") else ""
-            sub_count = _parse_subscriber_count(sub_text) if not handle else 0
+            handle = sub_raw if sub_raw.startswith("@") else (canonical if canonical.startswith("@") else "")
+            sub_count = 0
+            if sub_raw and not sub_raw.startswith("@") and ("subscriber" in sub_raw.lower() or not vid_raw):
+                sub_count = _parse_subscriber_count(sub_raw)
+            elif vid_raw:
+                sub_count = _parse_subscriber_count(vid_raw)
+
+            desc = _extract_text(item.get("descriptionSnippet"))
+            tier = "aspirational" if sub_count >= 500_000 else ("peer" if sub_count >= 20_000 else "adjacent")
 
             channels.append({
                 "channel_id": cid,
@@ -118,7 +137,7 @@ def search_youtube_channels_direct(query: str, limit: int = 20) -> list[dict]:
                 "view_count": 0,
                 "video_count": 0,
                 "rationale": f"Direct YouTube match for \"{query}\"",
-                "tier": "peer",
+                "tier": tier,
                 "name": title,
             })
         return channels
@@ -194,6 +213,10 @@ def _to_row(candidate: dict, item: dict) -> dict:
     stats = item.get("statistics", {})
     snippet = item.get("snippet", {})
     thumbs = snippet.get("thumbnails", {})
+    sub_count = int(stats.get("subscriberCount", 0) or candidate.get("subscriber_count", 0) or 0)
+    tier = candidate.get("tier")
+    if not tier or tier == "peer":
+        tier = "aspirational" if sub_count >= 500_000 else ("peer" if sub_count >= 20_000 else "adjacent")
     return {
         "channel_id": item["id"],
         "title": snippet.get("title") or candidate.get("name", "") or candidate.get("title", ""),
@@ -204,11 +227,11 @@ def _to_row(candidate: dict, item: dict) -> dict:
             "uploads"
         ) or (f"UU{item['id'][2:]}" if item["id"].startswith("UC") else ""),
         "country": snippet.get("country"),
-        "subscriber_count": int(stats.get("subscriberCount", 0) or candidate.get("subscriber_count", 0) or 0),
+        "subscriber_count": sub_count,
         "view_count": int(stats.get("viewCount", 0) or candidate.get("view_count", 0) or 0),
         "video_count": int(stats.get("videoCount", 0) or candidate.get("video_count", 0) or 0),
         "rationale": candidate.get("rationale") or candidate.get("why", ""),
-        "tier": candidate.get("tier") or "peer",
+        "tier": tier,
     }
 
 
@@ -225,6 +248,9 @@ def get_own_channel_id(user_id: str) -> str | None:
 
 def verify_candidates(user_id: str, candidates: list[dict], ledger: QuotaLedger) -> list[dict]:
     """Confirm every candidate against YouTube (Data API if connected, or direct metadata)."""
+    if not candidates:
+        return []
+
     yt = None
     try:
         yt = _service(user_id)
@@ -232,54 +258,73 @@ def verify_candidates(user_id: str, candidates: list[dict], ledger: QuotaLedger)
         yt = None
 
     if yt is not None:
-        with_ids = [c for c in candidates if c.get("channel_id")]
-        without_ids = [c for c in candidates if not c.get("channel_id")]
+        try:
+            with_ids = [c for c in candidates if c.get("channel_id")]
+            without_ids = [c for c in candidates if not c.get("channel_id")]
 
-        resolved_by_id = _resolve_by_ids(yt, [c["channel_id"] for c in with_ids], ledger)
+            resolved_by_id = _resolve_by_ids(yt, [c["channel_id"] for c in with_ids], ledger) if with_ids else {}
 
-        verified: list[dict] = []
-        seen: set[str] = set()
+            verified: list[dict] = []
+            seen: set[str] = set()
 
-        def _keep(candidate: dict, item: dict | None) -> None:
-            if not item:
-                return
-            cid = item["id"]
-            if cid in seen:
-                return
-            stats = item.get("statistics", {})
-            if int(stats.get("subscriberCount", 0) or 0) == 0 and int(stats.get("videoCount", 0) or 0) == 0:
-                return  # dead/empty channel — not a real competitor
-            seen.add(cid)
-            verified.append(_to_row(candidate, item))
+            def _keep(candidate: dict, item: dict | None) -> None:
+                if not item:
+                    return
+                cid = item["id"]
+                if cid in seen:
+                    return
+                stats = item.get("statistics", {})
+                if int(stats.get("subscriberCount", 0) or 0) == 0 and int(stats.get("videoCount", 0) or 0) == 0:
+                    return  # dead/empty channel — not a real competitor
+                seen.add(cid)
+                verified.append(_to_row(candidate, item))
 
-        for c in with_ids:
-            _keep(c, resolved_by_id.get(c["channel_id"]))
+            for c in with_ids:
+                _keep(c, resolved_by_id.get(c["channel_id"]))
 
-        for c in without_ids:
-            item = _resolve_by_handle(yt, c.get("handle", ""), ledger) if c.get("handle") else None
-            if not item:
-                item = _resolve_by_search(yt, c.get("name", ""), ledger)
-            _keep(c, item)
+            for c in without_ids:
+                item = _resolve_by_handle(yt, c.get("handle", ""), ledger) if c.get("handle") else None
+                if not item and ledger.can_search():
+                    item = _resolve_by_search(yt, c.get("name", ""), ledger)
+                _keep(c, item)
 
-        if verified:
-            return verified
+            if verified:
+                return verified
+        except Exception as exc:
+            logger.warning("YouTube API candidate verification failed, falling back to direct: %s", exc)
 
     # Fallback or unauthenticated direct YouTube verification
-    verified_direct: list[dict] = []
-    seen = set()
-    for c in candidates:
-        cid = c.get("channel_id")
-        if not cid:
+    from concurrent.futures import ThreadPoolExecutor
+
+    # For candidates missing channel_id, resolve them in parallel
+    to_resolve = [c for c in candidates if not c.get("channel_id")]
+    if to_resolve:
+        def _resolve_one(c: dict) -> dict:
             query = c.get("handle") or c.get("name") or c.get("title")
             if query:
                 direct_matches = search_youtube_channels_direct(query, limit=1)
                 if direct_matches:
-                    c = {**c, **direct_matches[0]}
-                    cid = c.get("channel_id")
+                    return {**c, **direct_matches[0]}
+            return c
+
+        with ThreadPoolExecutor(max_workers=min(8, len(to_resolve))) as pool:
+            resolved_list = list(pool.map(_resolve_one, to_resolve))
+
+        resolved_map = {id(orig): res for orig, res in zip(to_resolve, resolved_list)}
+        candidates = [resolved_map.get(id(c), c) for c in candidates]
+
+    verified_direct: list[dict] = []
+    seen = set()
+    for c in candidates:
+        cid = c.get("channel_id")
         if not cid or cid in seen:
             continue
         seen.add(cid)
         uploads_id = c.get("uploads_playlist_id") or (f"UU{cid[2:]}" if cid.startswith("UC") else "")
+        sub_count = int(c.get("subscriber_count") or 0)
+        tier = c.get("tier")
+        if not tier or tier == "peer":
+            tier = "aspirational" if sub_count >= 500_000 else ("peer" if sub_count >= 20_000 else "adjacent")
         verified_direct.append({
             "channel_id": cid,
             "title": c.get("title") or c.get("name", "YouTube Creator"),
@@ -288,11 +333,11 @@ def verify_candidates(user_id: str, candidates: list[dict], ledger: QuotaLedger)
             "thumbnail_url": c.get("thumbnail_url") or "",
             "uploads_playlist_id": uploads_id,
             "country": c.get("country"),
-            "subscriber_count": int(c.get("subscriber_count") or 0),
+            "subscriber_count": sub_count,
             "view_count": int(c.get("view_count") or 0),
             "video_count": int(c.get("video_count") or 0),
             "rationale": c.get("rationale") or c.get("why", "Top creator in this niche"),
-            "tier": c.get("tier") or "peer",
+            "tier": tier,
         })
     return verified_direct
 
@@ -435,7 +480,8 @@ async def _own_channel_context(session, user_id: str) -> tuple[str, str]:
         return "", ""
     lines = [f"- {t['title']}" for t in titles]
     all_tags = [tag for t in titles for tag in (t.get("tags") or [])]
-    niche_guess = " ".join(dict.fromkeys(all_tags[:6]))
+    unique_tags = list(dict.fromkeys(all_tags))
+    niche_guess = " ".join(unique_tags[:3]) if unique_tags else ""
     return "This creator's recent videos:\n" + "\n".join(lines), niche_guess
 
 
@@ -445,6 +491,7 @@ async def run_discovery(session, user_id: str, niche: str = "", count: int = 20)
     Channels already tracked (any status) and the user's own channel are excluded.
     Candidates are verified and staged for user approval.
     """
+    from concurrent.futures import ThreadPoolExecutor
     from app.db import queries
     from app.services import youtube_ai_analysis
     from app.services.personal_intelligence import get_directives
@@ -452,7 +499,7 @@ async def run_discovery(session, user_id: str, niche: str = "", count: int = 20)
     run = await queries.create_competitor_discovery_run(session, user_id, niche)
 
     own_context, niche_guess = await _own_channel_context(session, user_id)
-    effective_niche = niche or niche_guess or "tech coding and AI"
+    effective_niche = niche.strip() if niche else (niche_guess or "tech coding and AI")
 
     exclude_names = await queries.list_competitor_names(session, user_id, limit=150)
     directives = await get_directives(session, user_id, scope="youtube")
@@ -462,8 +509,29 @@ async def run_discovery(session, user_id: str, niche: str = "", count: int = 20)
     seen_ids: set[str] = {own_channel_id} if own_channel_id else set()
     ledger = QuotaLedger()
 
-    # 1. Primary: Search YouTube directly for active channels in this niche
-    direct_candidates = await asyncio.to_thread(search_youtube_channels_direct, effective_niche, count * 2)
+    # 1. Primary: Search YouTube directly for active channels using multi-query concurrent search
+    queries_to_search = [effective_niche]
+    words = [w for w in effective_niche.split() if len(w) > 2]
+    if len(words) >= 2:
+        queries_to_search.append(" ".join(words[:2]))
+    if len(words) >= 3:
+        queries_to_search.append(" ".join(words[1:3]))
+    elif len(words) == 1:
+        queries_to_search.append(f"{words[0]} creator")
+
+    def _multi_search():
+        with ThreadPoolExecutor(max_workers=min(4, len(queries_to_search))) as pool:
+            lists = list(pool.map(lambda q: search_youtube_channels_direct(q, limit=count), queries_to_search))
+        res = []
+        seen = set()
+        for l in lists:
+            for c in l:
+                if c["channel_id"] not in seen:
+                    seen.add(c["channel_id"])
+                    res.append(c)
+        return res
+
+    direct_candidates = await asyncio.to_thread(_multi_search)
     if direct_candidates:
         verified_direct = await asyncio.to_thread(verify_candidates, user_id, direct_candidates, ledger)
         new_ids = [v["channel_id"] for v in verified_direct if v["channel_id"] not in seen_ids]
@@ -483,33 +551,28 @@ async def run_discovery(session, user_id: str, niche: str = "", count: int = 20)
 
     # 2. Secondary: If more channels are needed, run AI proposal & web research
     if len(verified_all) < count:
+        deficit = count - len(verified_all)
         try:
             from app.tools.custom import run_web_search
 
             web_context = await asyncio.to_thread(
-                run_web_search, f"best YouTube channels {effective_niche} 2026", 6
+                run_web_search, f"best YouTube channels {effective_niche} 2026", 5
             )
         except Exception as exc:
             logger.warning("Competitor discovery web search failed: %s", exc)
             web_context = ""
 
-        rounds = 0
-        max_rounds = 2
-        while len(verified_all) < count and rounds < max_rounds:
-            rounds += 1
-            already_named = exclude_names + [v["title"] for v in verified_all]
-            try:
-                proposed = await youtube_ai_analysis.propose_competitors(
-                    own_context, effective_niche, web_context, already_named,
-                    count=DISCOVERY_OVERFETCH, directives=directives,
-                )
-            except Exception as e:
-                logger.warning("AI propose_competitors failed: %s", e)
-                proposed = []
+        already_named = exclude_names + [v["title"] for v in verified_all]
+        try:
+            proposed = await youtube_ai_analysis.propose_competitors(
+                own_context, effective_niche, web_context, already_named,
+                count=min(20, max(deficit * 2, 10)), directives=directives,
+            )
+        except Exception as e:
+            logger.warning("AI propose_competitors failed: %s", e)
+            proposed = []
 
-            if not proposed:
-                break
-
+        if proposed:
             verified = await asyncio.to_thread(verify_candidates, user_id, proposed, ledger)
             new_ids = [v["channel_id"] for v in verified if v["channel_id"] not in seen_ids]
             if new_ids:

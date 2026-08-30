@@ -34,6 +34,7 @@ Intent = Literal[
     "schedule_lookup",
     "review_queue",
     "backlog",
+    "overdue",
     "analytics",
     "item_lookup",
     "action_request",
@@ -69,6 +70,21 @@ class QueryPlan(CoercingBaseModel):
     search_terms: list[str] = []
     needs_analytics: bool = False
     language: Literal["en", "hinglish"] = "en"
+
+    @field_validator("date_expression", mode="before")
+    @classmethod
+    def _null_expression_is_blank(cls, v):
+        """A JSON ``null`` here must not sink the whole plan.
+
+        ``CoercingBaseModel`` repairs ``list[str]`` fields only, so an explicit
+        null for this plain ``str`` is a hard ValidationError — and a
+        ValidationError is treated as non-transient, spending the cascade on
+        re-prompts and landing on the daily-digest fallback. The overdue intent
+        is told to send no dates, and weak tiers read that as
+        ``"date_expression": null`` too, so "what's overdue" would answer with
+        today's schedule: the very bug this field exists to make visible.
+        """
+        return "" if v is None else v
 
     @field_validator("date_from", "date_to", mode="before")
     @classmethod

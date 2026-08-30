@@ -16,7 +16,6 @@ import {
 } from "lucide-react";
 import { ApiError } from "@/lib/apiClient";
 import {
-  Competitor,
   CompetitorVideo,
   competitorsApi,
 } from "@/lib/youtubeCompetitorsApi";
@@ -100,7 +99,6 @@ export default function CompetitorVideosTab({
 
   useEffect(() => {
     setPage(1);
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     load(1);
   }, [load]);
 

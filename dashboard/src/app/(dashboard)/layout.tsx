@@ -5,6 +5,7 @@ import { useEffect, useState, useCallback } from "react";
 import Sidebar from "@/components/Sidebar";
 import TopBar from "@/components/TopBar";
 import Footer from "@/components/Footer";
+import LlmCascadeBanner from "@/components/LlmCascadeBanner";
 import { useAuth } from "@/lib/auth/AuthContext";
 
 export default function DashboardGroupLayout({ children }: { children: React.ReactNode }) {
@@ -85,6 +86,9 @@ export default function DashboardGroupLayout({ children }: { children: React.Rea
       >
         {/* Mobile Top Bar */}
         <TopBar onOpenSidebar={() => setIsMobileOpen(true)} />
+
+        {/* Global LLM Cascade Alert Banner */}
+        <LlmCascadeBanner />
 
         {/* Dynamic Page Content */}
         <main className="flex-1 flex flex-col py-6 sm:py-8 overflow-x-hidden">

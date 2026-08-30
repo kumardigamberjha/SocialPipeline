@@ -225,6 +225,7 @@ def create_app() -> FastAPI:
         billing,
         blog,
         google_auth,
+        images,
         instagram_analytics,
         instagram_auth,
         linkedin,
@@ -239,6 +240,7 @@ def create_app() -> FastAPI:
         youtube_analytics,
         youtube_competitors,
         youtube_playlist_items,
+        youtube_prospects,
     )
     application.include_router(health.router)
     application.include_router(generate.router)
@@ -260,11 +262,13 @@ def create_app() -> FastAPI:
     application.include_router(youtube.ws_router)
     application.include_router(planner.router)
     application.include_router(assistant.router)
+    application.include_router(images.router)
     application.include_router(saved_topics.router)
     application.include_router(google_auth.router)
     application.include_router(youtube_analytics.router)
     application.include_router(youtube_playlist_items.router)
     application.include_router(youtube_competitors.router)
+    application.include_router(youtube_prospects.router)
     application.include_router(personal_intelligence.router)
 
     _assert_all_routes_authenticated(application)

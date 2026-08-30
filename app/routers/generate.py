@@ -38,11 +38,11 @@ async def generate_content(
     try:
         logger.info("POST /api/generate  ▸ topic=%r  provider=%s", body.topic, body.provider)
 
-        user_id = user["id"]
-        await queries.reset_usage_if_expired(session, user_id)
-        usage = await queries.get_usage(session, user_id)
-        if usage and usage["runs_this_month"] >= usage["max_runs_per_month"]:
-            raise HTTPException(status_code=429, detail="Usage limit exceeded for this billing period.")
+        if os.getenv("ENABLE_USAGE_LIMITS", "false").lower() in ("true", "1"):
+            await queries.reset_usage_if_expired(session, user_id)
+            usage = await queries.get_usage(session, user_id)
+            if usage and usage.get("max_runs_per_month") and usage["runs_this_month"] >= usage["max_runs_per_month"]:
+                raise HTTPException(status_code=429, detail="Usage limit exceeded for this billing period.")
 
         provider = body.provider or settings.default_provider
         run = await queries.create_run(session, user_id, body.topic, provider)
@@ -139,10 +139,11 @@ async def generate_blog(
 ) -> BlogGenerateResponse:
     user_id = user["id"]
 
-    await queries.reset_usage_if_expired(session, user_id)
-    usage = await queries.get_usage(session, user_id)
-    if usage and usage["runs_this_month"] >= usage["max_runs_per_month"]:
-        raise HTTPException(status_code=429, detail="Usage limit exceeded for this billing period.")
+    if os.getenv("ENABLE_USAGE_LIMITS", "false").lower() in ("true", "1"):
+        await queries.reset_usage_if_expired(session, user_id)
+        usage = await queries.get_usage(session, user_id)
+        if usage and usage.get("max_runs_per_month") and usage["runs_this_month"] >= usage["max_runs_per_month"]:
+            raise HTTPException(status_code=429, detail="Usage limit exceeded for this billing period.")
 
     provider = body.provider or settings.default_provider
     run = await queries.create_run(session, user_id, body.topic, provider)

@@ -28,11 +28,11 @@ export function wsOrigin(): string {
   if (BACKEND_URL.startsWith("https")) return BACKEND_URL.replace(/^https/, "wss");
   if (BACKEND_URL.startsWith("http")) return BACKEND_URL.replace(/^http/, "ws");
 
-  // BACKEND_URL is empty (Next.js-proxied) — WS must bypass the proxy and go
-  // directly to the FastAPI port.  Fall back to 8001 in SSR/build contexts.
   if (typeof window !== "undefined") {
-    // In development Next.js runs on 3000; FastAPI is on 8001.
-    return `ws://127.0.0.1:8001`;
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const host = window.location.hostname;
+    const port = process.env.NEXT_PUBLIC_BACKEND_PORT || "8001";
+    return `${protocol}//${host}:${port}`;
   }
-  return "ws://127.0.0.1:8001";
+  return "ws://localhost:8001";
 }

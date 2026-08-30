@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.auth_deps import get_current_user
+from app.core.clock import user_today_iso
 from app.db import queries
 from app.db.session import get_session
 from app.models.planner import (
@@ -128,8 +129,15 @@ async def get_planner_stats(platform: str | None = None,
 
     Without `platform` the figures are cross-platform totals; the funnel then
     lists one vocabulary's stages and will not sum to `total_items`.
+
+    `today` is passed explicitly so the overdue/upcoming split is anchored to the
+    user's timezone rather than the database session's — in a UTC container those
+    disagree by a full day between 00:00 and 05:30 IST, which would show this page
+    a different overdue count from the assistant's.
     """
-    return await queries.get_planner_analytics(session, current_user["id"], platform)
+    return await queries.get_planner_analytics(
+        session, current_user["id"], platform, today=user_today_iso()
+    )
 
 
 # ── Board / calendar reads (declared before "/{plan_id}") ────────────────────

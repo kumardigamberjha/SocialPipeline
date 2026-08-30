@@ -19,15 +19,13 @@ logger = logging.getLogger(__name__)
 @celery_app.task(name="app.celery_tasks.youtube_task.youtube_nightly_sync", bind=True)
 def youtube_nightly_sync(self):
     """Nightly job: full sync of YouTube videos for all connected users."""
+    from app.services.youtube_cache import flush_youtube_cache_sync
     from app.services.youtube_sync_service import (
         sync_all_videos,
         get_all_connected_user_ids,
         YoutubeSyncError,
     )
-    import redis as _redis
-    from app.config import get_settings
 
-    settings = get_settings()
     user_ids = get_all_connected_user_ids()
 
     if not user_ids:
@@ -40,8 +38,9 @@ def youtube_nightly_sync(self):
             # Sync ALL videos — no max_results cap
             r = sync_all_videos(uid)
             results[uid] = r
+            flush_youtube_cache_sync(uid)
             logger.info(
-                "Nightly sync user %s: %d total (%d new, %d updated)",
+                "Nightly sync user %s: %d total (%d new, %d updated) — Redis cache flushed",
                 uid, r["synced"], r["new"], r["updated"],
             )
         except YoutubeSyncError as exc:
@@ -50,16 +49,6 @@ def youtube_nightly_sync(self):
         except Exception as exc:
             logger.exception("Unexpected error in nightly sync for user %s: %s", uid, exc)
             results[uid] = {"error": str(exc)}
-
-    # Flush ALL YouTube Redis cache keys (stats, videos, live-videos, etc.)
-    try:
-        rc = _redis.Redis.from_url(settings.redis_url, decode_responses=True)
-        keys = rc.keys("yt:*")
-        if keys:
-            rc.delete(*keys)
-            logger.info("Nightly sync flushed %d Redis cache keys", len(keys))
-    except Exception as exc:
-        logger.warning("Could not flush Redis after nightly sync: %s", exc)
 
     return {"status": "done", "users_processed": len(user_ids), "results": results}
 

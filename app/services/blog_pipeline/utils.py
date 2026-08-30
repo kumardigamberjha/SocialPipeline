@@ -23,6 +23,7 @@ from typing import Any, get_args, get_origin
 from pydantic import BaseModel, model_validator
 
 from app.config import get_settings
+from app.provider_tiers import UNKNOWN_GRADE
 from app.llm import build_llm
 
 logger = logging.getLogger(__name__)
@@ -103,7 +104,8 @@ def extract_json(raw: str) -> dict:
 
     text = str(raw)
 
-    # Step 1: strip markdown fences
+    # Step 1: strip think tags and markdown fences
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"```\s*", "", text)
 
@@ -153,10 +155,13 @@ def slugify(title: str) -> str:
 _SCHEMA_RETRY_DELAY = 1.0     # seconds, for "model wrote bad JSON" retries
 _BASE_BACKOFF = 2.0           # seconds, first provider-side backoff
 _MAX_BACKOFF = 10.0           # ceiling per sleep, so a call cannot stall forever
-_TRANSIENT_GRACE = 2          # extra attempts granted when the fault is provider-side
-# With a fallback model on hand there is no point sitting out a provider's
-# outage: back off briefly, then just switch.
-_FALLBACK_BACKOFF = 4.0
+_TRANSIENT_GRACE = 2          # historical; superseded by _TRANSIENT_ATTEMPTS below
+# Attempts a tier gets on a *transient* fault before the cascade gives up on
+# it. One: with a backup Gemini key and OpenRouter in the chain, retrying the
+# same dead provider just wastes the cascade deadline. A 503 "high demand"
+# from Gemini persists for minutes — three retries with backoff burned 90+
+# seconds before fallback could even start. One shot, then move on.
+_TRANSIENT_ATTEMPTS = 1
 
 # ── Time budgets ────────────────────────────────────────────────────────────
 # Each tier's wall-clock budget lives on the LLM object itself, as ``llm.timeout``
@@ -204,7 +209,35 @@ _DAILY_QUOTA_PATTERNS = re.compile(r"per.?day|daily|freetier|free_tier", re.IGNO
 
 
 def _llm_key(llm) -> str:
+    """Cooldown-map identity. **Internal only — never surfaced.**
+
+    Two tiers can run the same model on different API keys (Gemini primary vs
+    backup), and parking one for quota must not park the other, so the key has
+    to discriminate on the credential. It therefore embeds a fragment of the
+    API key and must never reach a response, a database row or a log line that
+    a user can read. Use :func:`_public_model` for anything outward-facing.
+    """
+    model = str(getattr(llm, "model", None) or type(llm).__name__)
+    key = getattr(llm, "api_key", None)
+    if key:
+        key_id = str(key)[-8:]
+        return f"{model}#{key_id}"
+    return model
+
+
+def _public_model(llm) -> str:
+    """The bare model string, safe to persist and display.
+
+    This exists because ``used["model"]`` used to be set from ``_llm_key``,
+    so ``"gemini/gemini-3.7-flash#AIzaSyQ1"`` was written to Postgres and sent
+    to the browser — leaking eight characters of the API key on every report.
+    """
     return str(getattr(llm, "model", None) or type(llm).__name__)
+
+
+def _tier_of(llm):
+    """The :class:`ProviderTier` stamped on the LLM by ``build_tier_cascade``."""
+    return getattr(llm, "provider_tier", None)
 
 
 def _note_if_exhausted(llm, exc: Exception) -> None:
@@ -225,16 +258,25 @@ def _note_if_exhausted(llm, exc: Exception) -> None:
     )
 
 
-def _cooldown_remaining(llm) -> float:
-    """Seconds until this provider is worth trying again (0 when it is now)."""
-    expiry = _PROVIDER_COOLDOWN.get(_llm_key(llm))
+def cooldown_remaining_for_key(key: str) -> float:
+    """Seconds until the provider behind ``key`` is worth trying again.
+
+    Public because ``app.llm.describe_chain`` reports parked tiers on
+    ``/api/health``, and needs to do so without building the cascade.
+    """
+    expiry = _PROVIDER_COOLDOWN.get(key)
     if expiry is None:
         return 0.0
     left = expiry - time.monotonic()
     if left <= 0:
-        _PROVIDER_COOLDOWN.pop(_llm_key(llm), None)
+        _PROVIDER_COOLDOWN.pop(key, None)
         return 0.0
     return left
+
+
+def _cooldown_remaining(llm) -> float:
+    """Seconds until this provider is worth trying again (0 when it is now)."""
+    return cooldown_remaining_for_key(_llm_key(llm))
 
 
 def _apply_timeout(llm, seconds: float) -> None:
@@ -377,6 +419,54 @@ def _is_transient(exc: Exception) -> bool:
     return bool(_TRANSIENT_PATTERNS.search(str(exc)))
 
 
+# Only these advance the cascade. Everything else transient — 5xx, connection
+# resets, read timeouts — is the provider having a bad minute, and the *same*
+# tier is still the best available answer, so it gets retried in place.
+#
+# The distinction is the whole point of the strict cascade: the old code
+# advanced on any timeout, which meant one slow Gemini response was enough to
+# drop a client audit onto a local 7B model.
+_AUTH_FAILURE_RE = re.compile(
+    r"\b(?:401|403)\b|unauthorized|forbidden|permission.?denied"
+    r"|api.?key.not.valid|invalid.api.key|authentication",
+    re.IGNORECASE,
+)
+_MODEL_MISSING_RE = re.compile(
+    r"\b404\b|not.?found|no longer available|deprecated|unknown model",
+    re.IGNORECASE,
+)
+_QUOTA_STATUS_RE = re.compile(r"\b429\b", re.IGNORECASE)
+
+
+def _tier_fatal_reason(exc: Exception) -> str | None:
+    """Why this tier cannot succeed on a retry, or ``None`` to retry it.
+
+    Returns a stable machine-readable reason so the escalation log is
+    greppable: ``quota_exhausted`` | ``auth_failed`` | ``model_not_found`` |
+    ``stream_truncated``.
+    """
+    # A truncated stream will truncate again at the same place; and its
+    # half-written JSON must never be treated as a partial success.
+    if type(exc).__name__ == "TruncatedStreamError":
+        return "stream_truncated"
+
+    # Our own parse/validation failures are ValueErrors. A model echoing "429"
+    # inside its output must not be read as a provider status.
+    if isinstance(exc, ValueError):
+        return None
+
+    text = str(exc)
+    status = getattr(exc, "status_code", None)
+
+    if status in (401, 403) or _AUTH_FAILURE_RE.search(text):
+        return "auth_failed"
+    if status == 404 or _MODEL_MISSING_RE.search(text):
+        return "model_not_found"
+    if status == 429 or _QUOTA_STATUS_RE.search(text) or _QUOTA_PATTERNS.search(text):
+        return "quota_exhausted"
+    return None
+
+
 def _retry_after_seconds(exc: Exception) -> float | None:
     """Provider-supplied wait, clamped to something a request can survive."""
     match = _RETRY_AFTER_RE.search(str(exc))
@@ -397,10 +487,37 @@ def _invoke_llm(llm, prompt: str) -> str:
 
 
 def build_fallback_chain(temperature: float = 0.4, max_tokens: int | None = None):
-    """Build the resilient LLM cascade: Gemini -> Ollama Cloud -> NVIDIA DeepSeek -> Local Ollama."""
+    """Build the resilient LLM cascade. Order lives in ``app.provider_tiers``."""
     from app.llm import build_fallback_cascade
     settings = get_settings()
     return build_fallback_cascade(settings, temperature=temperature, max_tokens=max_tokens)
+
+
+def _log_tier_advance(
+    agent_name: str,
+    llm,
+    reason: str,
+    exc: Exception,
+    extra: str = "",
+) -> None:
+    """WARNING on every tier advance, with a machine-readable reason.
+
+    Degradation used to be visible only as an INFO line, which is why nobody
+    noticed an audit had been written by a fallback model until it was read in
+    a PDF. Anything that drops the cascade a rung is a warning.
+    """
+    tier = _tier_of(llm)
+    logger.warning(
+        "LLM tier advance: agent=%s from_tier=%s from_grade=%s model=%s "
+        "reason=%s %s| %s",
+        agent_name,
+        getattr(tier, "index", "?"),
+        getattr(tier, "grade", "unknown"),
+        _public_model(llm),
+        reason,
+        f"({extra}) " if extra else "",
+        exc,
+    )
 
 
 async def call_llm_with_retry(
@@ -421,10 +538,13 @@ async def call_llm_with_retry(
     Retries on transient errors (429 quota exhaustion, 503 high demand, timeouts)
     and schema parse failures.
 
-    If primary fails, cascades through ``fallback_chain`` in order:
-      1. Tier 2: Ollama Cloud (gemma4:31b-cloud)
-      2. Tier 3: NVIDIA NIM (DeepSeek AI)
-      3. Tier 4: Local Ollama (qwen2.5:latest)
+    Retries on a *transient* fault (5xx, timeout, connection reset) stay on the
+    same tier — ``_TRANSIENT_ATTEMPTS`` of them, with exponential backoff. The
+    cascade advances only when another attempt cannot help: quota exhausted,
+    credentials rejected, model not found, or a truncated stream. See
+    ``_tier_fatal_reason``.
+
+    The chain itself is declared in ``app.provider_tiers``, not here.
 
     ``deadline`` is a ``time.monotonic()`` stamp shared by the whole cascade, so
     the total time spent across every tier is bounded. It must stay inside the
@@ -439,51 +559,76 @@ async def call_llm_with_retry(
         except Exception as err:
             logger.debug("Could not auto-build fallback chain: %s", err)
 
+    has_fallback = (fallback_chain is not None and len(fallback_chain) > 0) or (fallback_llm is not None)
+    can_escalate = has_fallback or is_fallback_tier
+
     if deadline is None:
         try:
-            deadline = time.monotonic() + float(get_settings().llm_timeout)
+            settings = get_settings()
+            if has_fallback:
+                usable_chain = getattr(settings, "usable_provider_chain", [])
+                tier_sum = sum(t.timeout(settings) for t in usable_chain) if usable_chain else 0
+                cascade_timeout = max(
+                    float(getattr(settings, "audit_llm_timeout", 300) or 300),
+                    float(tier_sum),
+                    450.0,
+                )
+                deadline = time.monotonic() + cascade_timeout
+            else:
+                deadline = time.monotonic() + float(settings.llm_timeout)
         except Exception:
-            deadline = time.monotonic() + _DEFAULT_TIER_TIMEOUT
+            deadline = time.monotonic() + (450.0 if has_fallback else _DEFAULT_TIER_TIMEOUT)
 
-    has_fallback = (fallback_chain is not None and len(fallback_chain) > 0) or (fallback_llm is not None)
-    # A fallback tier has somewhere to go too — its caller's loop advances to the
-    # next tier — so it should give up as fast as a primary with a chain would.
-    can_escalate = has_fallback or is_fallback_tier
     tier_budget = _tier_budget(llm)
     last_error: Exception | None = None
     last_was_transient = False
     transient_failures = 0
-    grace = 0 if can_escalate else _TRANSIENT_GRACE
-    backoff_cap = _FALLBACK_BACKOFF if can_escalate else _MAX_BACKOFF
     budget = max_retries
     attempt = 0
 
     # A primary that is parked has somewhere to go; don't spend an attempt on it.
     cooling = _cooldown_remaining(llm)
     if cooling > 0 and has_fallback:
-        logger.info(
-            "%s: %s still out of quota for %.0fs; starting at the next tier",
-            agent_name, _llm_key(llm), cooling,
+        tier = _tier_of(llm)
+        logger.warning(
+            "Primary AI key exhausted / parked for quota (cooling for %.0fs); running on fallback tiers. agent=%s, tier=%s, model=%s",
+            cooling,
+            agent_name,
+            getattr(tier, "name", "Tier 1"),
+            _public_model(llm),
         )
         budget = 0
-        last_error = RuntimeError(f"{_llm_key(llm)} out of quota for another {cooling:.0f}s")
+        last_error = RuntimeError(f"{_public_model(llm)} out of quota for another {cooling:.0f}s")
         last_was_transient = True
+
+    # When there are fallbacks, one shot per tier — no retry. The cascade
+    # itself provides redundancy; retrying a failed tier wastes the deadline
+    # and prevents fallbacks from ever running.
+    if can_escalate:
+        budget = 1
 
     while attempt < budget:
         attempt += 1
         effective_timeout = min(tier_budget, _remaining(deadline))
         if effective_timeout <= 0:
-            logger.warning(
-                "%s: cascade deadline exhausted before attempt %d; not starting a doomed call",
-                agent_name,
-                attempt,
-            )
-            last_error = last_error or TimeoutError("cascade deadline exhausted")
-            last_was_transient = True
-            break
+            if is_fallback_tier or has_fallback:
+                effective_timeout = min(tier_budget, 45.0)
+            else:
+                logger.warning(
+                    "%s: cascade deadline exhausted before attempt %d; not starting a doomed call",
+                    agent_name,
+                    attempt,
+                )
+                last_error = last_error or TimeoutError("cascade deadline exhausted")
+                last_was_transient = True
+                break
         try:
             try:
-                llm.temperature = temperature
+                model_str = str(getattr(llm, "model", "") or "")
+                if "gemini-3" in model_str or "gemini-2.5" in model_str:
+                    llm.temperature = 1.0
+                else:
+                    llm.temperature = temperature
             except Exception:
                 pass
             _apply_timeout(llm, effective_timeout)
@@ -500,45 +645,68 @@ async def call_llm_with_retry(
                 # Report the tier that actually answered. Callers used to label
                 # every result with the *primary* model, so a report written by
                 # Ollama still claimed to be Gemini.
-                used["model"] = _llm_key(llm)
-                used["tier"] = agent_name
+                #
+                # _public_model, not _llm_key: the latter carries an API-key
+                # fragment and this dict is persisted and returned to the client.
+                used["model"] = _public_model(llm)
+                used["agent"] = agent_name
+                tier = _tier_of(llm)
+                if tier is not None:
+                    used["tier_index"] = tier.index
+                    used["tier_name"] = tier.name
+                    used["tier_grade"] = tier.grade
+                    used["tier"] = tier.name
+                else:
+                    # An LLM built outside build_tier_cascade has no provenance.
+                    # Unknown provenance is treated as internal_only downstream.
+                    used["tier_index"] = None
+                    used["tier_name"] = agent_name
+                    used["tier_grade"] = UNKNOWN_GRADE
+                    used["tier"] = agent_name
+            if is_fallback_tier:
+                tier_obj = _tier_of(llm)
+                logger.warning(
+                    "LLM generation answered by fallback tier: agent=%s tier=%s (grade=%s, model=%s)",
+                    agent_name,
+                    getattr(tier_obj, "name", "fallback"),
+                    getattr(tier_obj, "grade", "unknown"),
+                    _public_model(llm),
+                )
             return validated
         except Exception as e:  # malformed JSON, schema error, or transport error
             last_error = e
             _note_if_exhausted(llm, e)
             last_was_transient = _is_transient(e) or isinstance(e, (asyncio.TimeoutError, TimeoutError))
+            fatal_reason = _tier_fatal_reason(e)
             if last_was_transient:
                 transient_failures += 1
-                if budget < max_retries + grace:
-                    budget += 1
-                delay = _retry_after_seconds(e) or _BASE_BACKOFF * 2 ** (
-                    transient_failures - 1
-                )
-                delay = min(delay, backoff_cap)
-                delay += random.uniform(0, delay * 0.25)  # jitter: don't retry in lockstep
-            else:
-                delay = _SCHEMA_RETRY_DELAY
             logger.warning(
                 "%s attempt %d/%d failed (%s): %s",
                 agent_name,
                 attempt,
                 budget,
-                "provider unavailable" if last_was_transient else "invalid output",
+                fatal_reason
+                or ("provider unavailable" if last_was_transient else "invalid output"),
                 e,
             )
-            # If 429 quota exhausted, 404 model not found, or timeout and we have somewhere
-            # else to go, cut over immediately rather than retrying a provider that is down.
-            if last_was_transient and can_escalate and (
-                "quota" in str(e).lower()
-                or "resource_exhausted" in str(e).lower()
-                or "timeout" in str(e).lower()
-                or "404" in str(e).lower()
-                or "not_found" in str(e).lower()
-                or "no longer available" in str(e).lower()
-                or isinstance(e, (asyncio.TimeoutError, TimeoutError))
-            ):
-                logger.info("%s: provider failure (%s); cutting over to the next tier", agent_name, e)
+
+            # When fallbacks exist, advance immediately on ANY error — no
+            # retries. The cascade has backup keys and other providers;
+            # retrying a broken tier just wastes the deadline.
+            if can_escalate:
+                reason = fatal_reason or ("provider_unavailable" if last_was_transient else "invalid_output")
+                _log_tier_advance(agent_name, llm, reason, e)
                 break
+
+            # No fallback chain — retry with backoff (this is the last resort).
+            if last_was_transient:
+                delay = _retry_after_seconds(e) or _BASE_BACKOFF * 2 ** (
+                    transient_failures - 1
+                )
+                delay = min(delay, _MAX_BACKOFF)
+                delay += random.uniform(0, delay * 0.25)
+            else:
+                delay = _SCHEMA_RETRY_DELAY
 
             if attempt < budget and _remaining(deadline) > delay:
                 await asyncio.sleep(delay)
@@ -560,15 +728,20 @@ async def call_llm_with_retry(
                     agent_name, tier_name, cooling,
                 )
                 continue
-            if _remaining(deadline) <= 0:
-                logger.warning("%s: cascade deadline exhausted; not trying %s", agent_name, tier_name)
-                break
+            # Ensure the fallback candidate has at least its tier budget
+            cand_budget = _tier_budget(fallback_candidate)
+            if _remaining(deadline) < cand_budget:
+                deadline = time.monotonic() + cand_budget + _CLIENT_TIMEOUT_GRACE
+            fatal_reason = _tier_fatal_reason(last_error) if last_error else ("quota_exhausted" if cooling > 0 else ("provider_unavailable" if last_was_transient else "invalid_output"))
+            tier_obj = _tier_of(fallback_candidate)
             logger.warning(
-                "%s: %s unusable (%s); escalating to %s",
+                "LLM generation running on fallback tier below primary: agent=%s target_tier=%s (grade=%s, model=%s) reason=%s | error=%s",
                 agent_name,
-                "provider" if last_was_transient else "output",
-                last_error,
                 tier_name,
+                getattr(tier_obj, "grade", "unknown"),
+                _public_model(fallback_candidate),
+                fatal_reason,
+                last_error,
             )
             try:
                 # fallback_chain=[] (not None) so the callee neither auto-builds a

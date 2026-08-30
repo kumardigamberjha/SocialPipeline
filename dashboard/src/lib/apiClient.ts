@@ -142,4 +142,46 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
-export const apiClient = { request };
+/**
+ * Same as `request`, but for binary responses (e.g. a generated image).
+ *
+ * A plain `<img src="/api/images/x/file">` only works while `BACKEND_URL` is
+ * empty and Next.js proxies the API onto this origin. Point
+ * NEXT_PUBLIC_BACKEND_API at a separate host and that `<img>` becomes a
+ * cross-origin request, which does not carry the session cookies — so the image
+ * silently 401s. Fetching here keeps `credentials: "include"` and the
+ * refresh-and-retry cycle; callers turn the Blob into an object URL.
+ */
+export async function requestBlob(
+  path: string,
+  options: RequestOptions = {}
+): Promise<Blob> {
+  const { skipAuthRetry, ...init } = options;
+
+  const doFetch = () =>
+    fetch(`${API_BASE_URL}${path}`, {
+      ...init,
+      credentials: "include",
+      headers: { ...csrfHeaders(init.method ?? "GET"), ...(init.headers ?? {}) },
+    });
+
+  let response = await doFetch();
+
+  if (response.status === 401 && !skipAuthRetry) {
+    if (await refreshSession()) {
+      response = await doFetch();
+    } else {
+      redirectToLogin();
+      throw new ApiError("Session expired", 401);
+    }
+  }
+
+  if (!response.ok) {
+    if (response.status === 401 && !skipAuthRetry) redirectToLogin();
+    throw new ApiError(await parseErrorDetail(response), response.status);
+  }
+
+  return response.blob();
+}
+
+export const apiClient = { request, requestBlob };

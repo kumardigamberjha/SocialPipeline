@@ -47,8 +47,11 @@ SCOPES = [
     # exposes these. Existing connections keep working; users must reconnect
     # to grant this too.
     "https://www.googleapis.com/auth/yt-analytics.readonly",
+    # Manage YouTube videos and metadata (title, description, tags, thumbnails)
+    "https://www.googleapis.com/auth/youtube.force-ssl",
 ]
 YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+YOUTUBE_WRITE_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
 YT_ANALYTICS_SCOPE = "https://www.googleapis.com/auth/yt-analytics.readonly"
 EVENT_START_HOUR = 9  # local time in settings.default_timezone
 DEFAULT_DURATION_MINUTES = 60

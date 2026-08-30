@@ -113,10 +113,17 @@ class YoutubePublishedVideoCreate(BaseModel):
     publish_time: Optional[str] = None
     duration_seconds: Optional[int] = None
     views: int = 0
-    watch_time_hours: float = 0.0
+    likes: Optional[int] = 0
+    comments: Optional[int] = 0
+    thumbnail_url: Optional[str] = None
+    # None means "not synced", which is not the same as zero watch time — the
+    # dashboard renders a dash for it rather than a confident 0.0.
+    watch_time_hours: Optional[float] = None
     subscribers: Optional[int] = None
     impressions: Optional[int] = None
     impressions_ctr: Optional[float] = None
+    average_view_percentage: Optional[float] = None
+    average_view_duration_seconds: Optional[int] = None
     imported_at: Optional[datetime] = Field(default_factory=datetime.utcnow)
 
 class YoutubePublishedVideo(YoutubePublishedVideoCreate):

@@ -4,12 +4,28 @@
 
 import { request } from "@/lib/apiClient";
 
+export interface LlmTierStatus {
+  index: number;
+  key: string;
+  name: string;
+  grade: string;
+  model: string;
+  configured: boolean;
+  cooling_for?: number | null;
+  available: boolean;
+}
+
 export interface HealthResponse {
   status: string;
   app_name: string;
   version: string;
   providers: string[];
   agents_available: number;
+  llm_tiers?: LlmTierStatus[];
+  active_tier_index?: number | null;
+  active_tier_name?: string | null;
+  active_tier_grade?: string | null;
+  client_grade_available?: boolean;
 }
 
 export interface GenerateResponse {
