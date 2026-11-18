@@ -1,0 +1,3 @@
+{
+  "/(report)/shortform-report/print/[id]/page": "app/(report)/shortform-report/print/[id]/page.js"
+}

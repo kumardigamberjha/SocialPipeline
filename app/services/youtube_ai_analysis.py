@@ -84,26 +84,37 @@ def _stamp_provenance(result: dict, used: dict, fallback_model: str) -> dict:
     return result
 
 
+import contextlib
+from contextvars import ContextVar
+
+_IS_AUDIT: ContextVar[bool] = ContextVar("_IS_AUDIT", default=False)
+
+
+@contextlib.contextmanager
+def audit_scope():
+    token = _IS_AUDIT.set(True)
+    try:
+        yield
+    finally:
+        _IS_AUDIT.reset(token)
+
+
 def _build_analysis_llm_and_chain():
     """Build the primary analysis LLM and the ordered fallback cascade.
 
-    The order is declared in ``app.provider_tiers.DEFAULT_PROVIDER_CHAIN`` and
-    overridable with ``LLM_PROVIDER_CHAIN`` — deliberately not restated here,
-    because three copies of it in three docstrings had already drifted apart
-    and none of them matched the code.
+    When ``_IS_AUDIT`` is set to True (by the channel audit page), uses the paid
+    Gemini 3.8 Flash tier on the paid API key with fallback to Gemma. For general
+    pages, uses the free Gemini key and model.
     """
+    is_audit = _IS_AUDIT.get()
     from app.llm import build_fallback_cascade
     settings = get_settings()
-    # These prompts all return a compact JSON report, so the default
-    # settings.llm_max_tokens is ample. The old 16384 was passed into a
-    # parameter build_fallback_cascade ignored; now that it is honoured, a
-    # ceiling that high just invites a long chain-of-thought from the slower
-    # tiers and blows the cascade deadline.
     primary_llm, fallback_chain = build_fallback_cascade(
         settings,
         temperature=ANALYSIS_TEMPERATURE,
+        is_audit=is_audit,
     )
-    model = getattr(primary_llm, "model", None) or settings.analysis_model or "gemini/gemini-2.5-flash"
+    model = getattr(primary_llm, "model", None) or (settings.audit_model if is_audit else settings.analysis_model) or "gemini/gemini-3.6-flash"
     return primary_llm, fallback_chain, model
 
 
@@ -370,17 +381,21 @@ ONE creator, so they never need to ask a generic AI for planning again.
 === CHANNEL DATA ({time_range}) ===
 {context}
 
-=== CURRENT WEB TRENDS (live search for this channel's niche) ===
+=== CURRENT TREND SIGNAL (external — not this channel's own data) ===
 {web_context}
 
 RULES:
 - Every point must reference the creator's actual data (views, CTR, cadence,
-  length buckets, upload timing, specific video titles) or a concrete trend from the search.
+  length buckets, upload timing, specific video titles) or a concrete item from the
+  trend signal above.
 - format_insights: call out which video LENGTHS, posting CADENCE, and optimal upload DAYS perform best
   for THIS channel, with the numbers. Name a time of day ONLY if the directives
   above permit it — the timing gate, not your reading of the hour buckets,
   decides whether this channel has enough timestamp data for an hour-level call.
-- content_gaps: use the web trends to name topics they should cover but haven't.
+- content_gaps: use the trend signal above to name topics this channel's audience
+  wants and it has not covered. If no trend signal was supplied, derive the gaps
+  from this channel's own catalogue — never from assumptions about what its
+  subject area ought to be talking about.
 - priorities: 4-6 concrete actions as plain strings, most important first
   (not "post consistently"). The array order carries the ranking — do not number
   them or wrap them in objects.
@@ -480,18 +495,26 @@ ONE creator, grounded in their real performance, the strategy audit directives, 
 
 {flagged_block}
 
-=== CURRENT WEB TRENDS ===
+=== CURRENT TREND SIGNAL (external — not this channel's own data) ===
 {web_context}
 
 RULES:
 - Produce exactly {weeks} weeks.
 - For each week, provide a clear focus and EXACTLY {items_per_week} concrete video release concept(s) matching the target cadence of "{target_cadence}". Do not over-schedule items.
 - STRICT STRATEGY AUDIT COMPLIANCE: Every single video concept must directly advance the strategic priorities and double down on what is working.
-- FORBIDDEN TOPICS & FRAMINGS: Under NO circumstances should you propose video titles, themes, or framings that resemble topics flagged as underperforming or advised to drop in the Strategy Audit (e.g. abstract neuroscience/theory, generic lecture discourse, or dropped formats). Every title must be practical, applied, and high-CTR.
+- FORBIDDEN TOPICS & FRAMINGS: Do not propose titles, themes or framings that
+  resemble anything the Strategy Audit above listed as underperforming or advised
+  dropping. The audit's own bullets are the complete list — do not add categories
+  it did not name, and do not assume a subject area, format or audience it did not
+  describe. Every title must be concrete and specific to THIS channel's subject matter.
 - JUSTIFICATION & RATIONALE RULES (MANDATORY):
   * Every item rationale MUST be anchored primarily to the channel's OWN proven performance: cite a specific named high-performing video of theirs with its view count, a winning format/length bucket, or a validated topic cluster from their catalogue.
   * An external trend may ONLY be mentioned as a secondary thematic hook, and NEVER with raw external metrics attached.
-  * FORBIDDEN IN RATIONALES: NEVER cite raw external platform metrics or popularity claims (no GitHub star counts, no "stars/day", no "/day" rates, no upvote counts, no "Product Hunt", no "GitHub", no follower counts, no launch dates, no "went viral", no "trended"). If the only evidence for a trend is raw external metrics, drop the external reference entirely and justify solely from channel data.
+  * FORBIDDEN IN RATIONALES: never cite a number that belongs to someone else's
+    platform or post — another creator's view count, subscriber count, follower
+    count, star count, upvote count or launch date — and never say something "went
+    viral" or "trended". If the only evidence for an idea is a third party's
+    popularity, justify it from this channel's own results instead, or drop the idea.
 - Titles must be specific working titles (<12 words, never "Intro to X").
 - The "cadence" field in the output JSON MUST state "{target_cadence}" verbatim, and no
   rationale may state a different publishing rate. Cadence is computed from this
@@ -534,7 +557,7 @@ def _format_flagged_videos(flagged_videos: list[dict] | None) -> str:
 
 
 def _format_strategy_constraints(
-    audit_strategy: dict | None, target_cadence: str, items_per_week: int
+    audit_strategy: dict | None, target_cadence: str, items_per_week: int, weeks: int = 4
 ) -> str:
     if not audit_strategy:
         return (
@@ -553,10 +576,12 @@ def _format_strategy_constraints(
         under_bullets = "\n".join(f"  * {u}" for u in under)
         sections.append(
             f"1. FORBIDDEN / UNDERPERFORMING FRAMINGS TO DROP (DO NOT PROPOSE):\n{under_bullets}\n"
-            f"  --> MANDATORY NEGATIVE CONSTRAINT: NEVER propose video titles or themes that use these "
-            f"underperforming framings or abstract topics (e.g., if the audit advises pivoting away from abstract "
-            f"theory, neuroscience, or theoretical lectures, DO NOT propose 'The Science of...', 'The Neuroscience of...', "
-            f"or purely theoretical concepts. Pivot completely to applied engineering, tangible builds, and high-performing formats)."
+            f"  --> MANDATORY NEGATIVE CONSTRAINT: NEVER propose a video title or theme that uses "
+            f"one of the framings listed immediately above, or a synonym or light rewording of one. "
+            f"That list is the complete definition of what is banned here: do not generalise it into "
+            f"a whole subject area, and do not ban anything it does not name. Replace each dropped "
+            f"framing with a concrete, specific, audience-facing treatment of the SAME subject "
+            f"matter this channel already covers."
         )
 
     ww = audit_strategy.get("whats_working") or []
@@ -579,13 +604,14 @@ def _format_strategy_constraints(
         pri_bullets = "\n".join(f"  {idx+1}. {p}" for idx, p in enumerate(pri))
         sections.append(
             f"5. RANKED STRATEGIC PRIORITIES:\n{pri_bullets}\n"
-            f"  --> MANDATORY RULE: The 4-week roadmap must directly execute these priorities in order."
+            f"  --> MANDATORY RULE: The {weeks}-week roadmap must directly execute these priorities in order."
         )
 
     sections.append(
         f"6. CADENCE & SCHEDULE VOLUME TARGET:\n"
         f"  - Target Cadence: {target_cadence}\n"
-        f"  - Weekly Release Count: EXACTLY {items_per_week} primary video idea per week ({items_per_week * 4} videos total across 4 weeks). "
+        f"  - Weekly Release Count: EXACTLY {items_per_week} primary video idea per week "
+        f"({items_per_week * weeks} videos total across {weeks} weeks). "
         f"Do NOT over-schedule or list more videos than the target cadence."
     )
     return "\n\n".join(sections)
@@ -636,7 +662,8 @@ async def generate_roadmap(
     target_cadence = cadence.label
 
     strategy_constraints = _format_strategy_constraints(
-        audit_strategy, target_cadence=target_cadence, items_per_week=items_per_week
+        audit_strategy, target_cadence=target_cadence, items_per_week=items_per_week,
+        weeks=weeks,
     )
     flagged_block = _format_flagged_videos(flagged_videos)
     if violation_note:

@@ -195,6 +195,13 @@ GRAMMAR_STOPWORDS = set(
     "she her they them but if also & part video videos".split()
 ) | META_STOPWORDS
 
+# Display casing only. This map can never introduce a word: it is applied in
+# _normalize_title_tokens to tokens that already came out of the analysed
+# channel's own titles, and the fallback for a miss is str.capitalize(). It looks
+# like an AI/dev vocabulary because it is one, but a cooking channel never hits an
+# entry, so it is not a route by which one channel's niche reaches another's
+# report. New entries must earn their place: if str.capitalize() already produces
+# the same string, the entry is dead weight.
 KNOWN_CASINGS = {
     "ai": "AI",
     "llm": "LLM",

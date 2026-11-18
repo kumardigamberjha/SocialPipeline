@@ -1,0 +1,6 @@
+{
+  "version": 3,
+  "sources": [],
+  "sections": [
+    {"offset": {"line": 4, "column": 0}, "map": {"version":3,"sources":["file:///media/digamber-jha/G13/MyEmpire/Content%20Creator/dashboard/src/app/%28auth%29/layout.tsx"],"sourcesContent":["export default function AuthLayout({ children }: { children: React.ReactNode }) {\n  return (\n    <div className=\"flex min-h-screen items-center justify-center bg-slate-950 px-4\">\n      <div className=\"w-full max-w-sm\">\n        <div className=\"mb-8 text-center\">\n          <h1 className=\"text-xl font-semibold text-slate-100\">Wings of AI</h1>\n          <p className=\"mt-1 text-sm text-slate-500\">Command Nexus</p>\n        </div>\n        {children}\n      </div>\n    </div>\n  );\n}\n"],"names":["AuthLayout","children","className"],"mappings":";;;;;;AAAe,SAASA,WAAW,EAAEC,QAAQ,EAAiC;IAC5E,qBACE,8OAAC;QAAIC,WAAU;kBACb,cAAA,8OAAC;YAAIA,WAAU;;8BACb,8OAAC;oBAAIA,WAAU;;sCACb,8OAAC;4BAAGA,WAAU;sCAAuC;;;;;;sCACrD,8OAAC;4BAAEA,WAAU;sCAA8B;;;;;;;;;;;;gBAE5CD;;;;;;;;;;;;AAIT"}}]
+}

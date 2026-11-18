@@ -42,11 +42,7 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
     gemini_api_key: str | None = None
-    # Second key, tried only when the primary fails for a reason another key can
-    # actually fix — quota exhausted, or the key itself rejected. Quota on the
-    # free tier is per project, so a second key is a second daily allowance.
-    # Note `extra="ignore"` above: without this field the env var is dropped
-    # silently rather than raising, which is why it appeared to do nothing.
+    gemini_paid_api_key: str | None = None
     gemini_backup_api_key: str | None = None
     gemma_api_key: str | None = None
     ollama_cloud_api_key: str | None = None
@@ -59,6 +55,9 @@ class Settings(BaseSettings):
     instagram_app_secret: str | None = None
     instagram_redirect_uri: str = "http://localhost:8000/api/instagram/oauth/callback"
     instagram_token_expires_at: str | None = None
+    linkedin_client_id: str | None = None
+    linkedin_client_secret: str | None = None
+    linkedin_redirect_uri: str = "http://localhost:8000/callback"
 
     # ── Database ──────────────────────────────────────────────
     # Postgres. The API uses the async (asyncpg) engine; Celery workers use the
@@ -112,6 +111,7 @@ class Settings(BaseSettings):
     # Tiers 1 and 2 of the analysis cascade: Google Gemini on two keys.
     analysis_model: str = "gemini/gemini-3.6-flash"
     ollama_analysis_model: str = "gemini/gemini-3.6-flash"
+    audit_model: str = "gemini/gemini-3.8-flash"
     # 2nd priority fallback: NVIDIA DeepSeek AI (NVIDIA NIM)
     nvidia_deepseek_model: str = "nvidia_nim/deepseek-ai/deepseek-v4-flash-0731"
     analysis_fallback_model: str = "nvidia_nim/deepseek-ai/deepseek-v4-flash-0731"
@@ -300,6 +300,12 @@ class Settings(BaseSettings):
         in every log line and health payload; the builder skips them.
         """
         return resolve_chain(self.llm_provider_chain)
+
+    @property
+    def audit_provider_chain(self) -> tuple["ProviderTier", ...]:
+        """The ordered cascade for the Channel Audit page."""
+        from app.provider_tiers import resolve_audit_chain
+        return resolve_audit_chain(self.llm_provider_chain)
 
     @property
     def usable_provider_chain(self) -> tuple["ProviderTier", ...]:

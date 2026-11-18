@@ -236,8 +236,10 @@ def refresh_instagram_post(media_id: str, user: dict = Depends(get_current_user)
             detail="No Instagram token connected. Please complete OAuth first.",
         )
 
+    cached = _get_cached(user_id)
+    followers = int((cached.get("profile") or {}).get("followers") or 0)
     try:
-        post = fetch_single_post(user_id, media_id)
+        post = fetch_single_post(user_id, media_id, followers=followers)
     except InstagramGraphAPIError as exc:
         logger.warning("Instagram post refresh failed for %s/%s: %s", user_id, media_id, exc)
         raise HTTPException(status_code=502, detail=f"Could not refresh this post: {exc}")
@@ -548,3 +550,75 @@ async def add_roadmap_to_plan(
         "skipped": skipped,
         "profile": profile,
     }
+
+
+@router.get("/inspect")
+async def inspect_instagram_creator(
+    handle: str, user: dict = Depends(get_current_user)
+) -> Dict[str, Any]:
+    """Inspect any public Instagram creator profile in real-time.
+
+    Extracts followers, post counts, bio, and representative topics
+    without requiring authenticated session cookies for that account.
+    """
+    from app.services.instagram_resolver import resolve_instagram_profile
+    clean_h = handle.strip() if handle else ""
+    if not clean_h:
+        raise HTTPException(status_code=400, detail="Instagram handle is required.")
+
+    try:
+        resolved = await asyncio.to_thread(resolve_instagram_profile, clean_h)
+        return resolved.model_dump()
+    except Exception as exc:
+        logger.error("Failed to inspect Instagram creator %s: %s", handle, exc)
+        raise HTTPException(status_code=502, detail=f"Could not inspect @{handle}: {exc}")
+
+
+class QuickDraftBody(BaseModel):
+    title: str
+    type: str = "reel"
+    caption: Optional[str] = ""
+    image_prompt: Optional[str] = ""
+    scheduled_date: Optional[str] = None
+    plan_id: Optional[str] = None
+
+
+@router.post("/quick-save-draft")
+async def quick_save_draft_post(
+    body: QuickDraftBody,
+    user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> Dict[str, Any]:
+    """Save an ad-hoc or AI generated draft post directly into the content planner."""
+    user_id = user["id"]
+    from datetime import date
+    plan_id = body.plan_id
+    if not plan_id:
+        plan = await queries.create_content_plan(
+            session,
+            user_id,
+            f"Instagram Quick Drafts — {date.today().isoformat()}",
+            "monthly",
+            "manual",
+            date.today().isoformat(),
+            (date.today() + timedelta(days=30)).isoformat(),
+            platform=PLATFORM,
+        )
+        plan_id = plan["id"]
+
+    item = await queries.create_plan_item(
+        session,
+        plan_id,
+        user_id,
+        platform=PLATFORM,
+        title=body.title,
+        scheduled_date=body.scheduled_date or date.today().isoformat(),
+        status="idea",
+        meta={
+            "type": body.type,
+            "caption": body.caption or "",
+            "image_prompt": body.image_prompt or "",
+            "source": "instagram_studio",
+        },
+    )
+    return {"status": "success", "plan_id": plan_id, "item": item}

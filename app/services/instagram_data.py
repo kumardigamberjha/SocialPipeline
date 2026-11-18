@@ -363,22 +363,31 @@ def _as_int(value: Optional[float]) -> Optional[int]:
 
 
 def _engagement_rate(
-    likes: int, comments: int, saves: Optional[int], shares: Optional[int], reach: Optional[int]
-) -> Optional[float]:
-    """Interactions as a percentage of reach, or None when reach is unmeasured.
+    likes: int,
+    comments: int,
+    saves: Optional[int],
+    shares: Optional[int],
+    reach: Optional[int],
+    followers: Optional[int] = None,
+) -> Tuple[Optional[float], str]:
+    """Interactions as a percentage of reach, or fallback to followers (ERR).
 
-    Percent, rounded to one decimal — a number, where this used to be the string
-    ``"6.2%"``. Callers that only render it gained a formatting step; the LLM
-    context and any future sort gained a value they can actually use.
+    Returns (rate, rate_type) where rate_type is "reach", "followers", or "none".
     """
-    if not reach:
-        return None
     interactions = likes + comments + (saves or 0) + (shares or 0)
-    return round(interactions / reach * 100, 1)
+    if reach and reach > 0:
+        return round(interactions / reach * 100, 1), "reach"
+    if followers and followers > 0:
+        return round((likes + comments + (saves or 0) + (shares or 0)) / followers * 100, 1), "followers"
+    return None, "none"
 
 
 def _build_post(
-    item: Dict[str, Any], token: str, client: httpx.Client, with_insights: bool
+    item: Dict[str, Any],
+    token: str,
+    client: httpx.Client,
+    with_insights: bool,
+    followers: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One post record. Every insights-derived field is None when unmeasured."""
     media_id = item.get("id", "")
@@ -400,6 +409,10 @@ def _build_post(
     if len(title) > 70:
         title = title[:67] + "..."
 
+    engagement_rate, rate_type = _engagement_rate(
+        likes, comments, saves, shares, reach, followers=followers
+    )
+
     return {
         "id": media_id,
         "title": title,
@@ -413,7 +426,8 @@ def _build_post(
         "reach": reach,
         "saves": saves,
         "shares": shares,
-        "engagement_rate": _engagement_rate(likes, comments, saves, shares, reach),
+        "engagement_rate": engagement_rate,
+        "rate_type": rate_type,
         "insights_available": bool(insights),
         "metrics_updated_at": datetime.now(timezone.utc).isoformat(),
         "thumbnail_url": item.get("thumbnail_url") or item.get("media_url") or "",
@@ -569,7 +583,21 @@ def _build_stats(
     carousels = [p for p in window if p["type"] == "carousel"]
     singles = [p for p in window if p["type"] == "single"]
 
-    rates = [p["engagement_rate"] for p in window if p["engagement_rate"] is not None]
+    rates = [p["engagement_rate"] for p in window if p.get("engagement_rate") is not None]
+    all_rates = [p["engagement_rate"] for p in posts if p.get("engagement_rate") is not None]
+
+    # Calculate interactions from posts if insights total_interactions is None
+    window_likes = sum(p.get("likes") or 0 for p in window)
+    window_comments = sum(p.get("comments") or 0 for p in window)
+    window_saves = sum(p.get("saves") or 0 for p in window)
+    window_shares = sum(p.get("shares") or 0 for p in window)
+    post_interactions = window_likes + window_comments + window_saves + window_shares
+
+    total_interactions = _as_int(insights.get("total_interactions"))
+    if total_interactions is None and post_interactions > 0:
+        total_interactions = post_interactions
+
+    avg_engagement = round(sum(rates) / len(rates), 1) if rates else (round(sum(all_rates) / len(all_rates), 1) if all_rates else None)
 
     return {
         "time_range": time_range,
@@ -582,17 +610,18 @@ def _build_stats(
         # which is what this field used to be.
         "total_impressions": _as_int(insights.get("impressions")),
         "accounts_engaged": _as_int(insights.get("accounts_engaged")),
-        "total_interactions": _as_int(insights.get("total_interactions")),
+        "total_interactions": total_interactions,
         "profile_visits": _as_int(insights.get("profile_views")),
         "link_clicks": _as_int(insights.get("website_clicks")),
         # Exact for every window: derived from each post's own timestamp.
         "posts_published": len(window),
+        "total_posts_catalog": len(posts),
         "total_reels_published": len(reels),
         "total_carousels_published": len(carousels),
         "total_images_published": len(singles),
-        "avg_reel_views": _mean([p["views"] for p in reels if p["views"] is not None]),
-        "avg_carousel_saves": _mean([p["saves"] for p in carousels if p["saves"] is not None]),
-        "avg_engagement_rate": round(sum(rates) / len(rates), 1) if rates else None,
+        "avg_reel_views": _mean([p["views"] for p in reels if p.get("views") is not None]),
+        "avg_carousel_saves": _mean([p["saves"] for p in carousels if p.get("saves") is not None]),
+        "avg_engagement_rate": avg_engagement,
         # Two different absences, which the UI must not conflate: all_time has
         # no account insights because the endpoint is windowed, not because the
         # connection lacks the permission.
@@ -646,17 +675,17 @@ def fetch_live_instagram_data(user_id: str) -> Dict[str, Any]:
             raise InstagramGraphAPIError("Invalid Instagram account ID received from Meta API.")
 
         media_items, media_complete = _fetch_media_pages(ig_id, token, client)
+        followers = int(profile.get("followers_count") or 0)
 
         # Per-post insights are one call each, so only the recent window the
         # dashboard renders gets them; older posts still contribute their exact
         # like/comment counts to the lifetime totals.
         posts = [
-            _build_post(item, token, client, with_insights=index < INSIGHTS_LIMIT)
+            _build_post(item, token, client, with_insights=index < INSIGHTS_LIMIT, followers=followers)
             for index, item in enumerate(media_items)
         ]
 
         stats_by_range: Dict[str, Dict[str, Any]] = {}
-        followers = int(profile.get("followers_count") or 0)
         for time_range, days in RANGE_DAYS.items():
             insights = None
             if days is not None:
@@ -714,7 +743,7 @@ def fetch_live_instagram_data(user_id: str) -> Dict[str, Any]:
     }
 
 
-def fetch_single_post(user_id: str, media_id: str) -> Dict[str, Any]:
+def fetch_single_post(user_id: str, media_id: str, followers: Optional[int] = None) -> Dict[str, Any]:
     """Re-read one media item and its insights — the per-post refresh button.
 
     Deliberately narrow: two API calls against one media id, rather than the
@@ -726,7 +755,7 @@ def fetch_single_post(user_id: str, media_id: str) -> Dict[str, Any]:
             item = _fetch(media_id, {"fields": MEDIA_FIELDS}, tok, client=client)
             if not item.get("id"):
                 raise InstagramGraphAPIError(f"No Instagram media found for id {media_id}.")
-            return _build_post(item, tok, client, with_insights=True)
+            return _build_post(item, tok, client, with_insights=True, followers=followers)
 
         _, post = _with_fresh_token(user_id, _read)
     return post
@@ -766,6 +795,21 @@ def recompute_derived(data: Dict[str, Any]) -> Dict[str, Any]:
     profile = dict(data.get("profile") or {})
     followers = int(profile.get("followers") or 0)
     stored_ranges = data.get("stats_by_range") or {}
+
+    # Ensure every post has engagement_rate and rate_type calculated
+    for p in posts:
+        if p.get("rate_type") is None:
+            rate, rtype = _engagement_rate(
+                p.get("likes") or 0,
+                p.get("comments") or 0,
+                p.get("saves"),
+                p.get("shares"),
+                p.get("reach"),
+                followers=followers,
+            )
+            p["rate_type"] = rtype
+            if p.get("engagement_rate") is None:
+                p["engagement_rate"] = rate
 
     stats_by_range: Dict[str, Dict[str, Any]] = {}
     for time_range in RANGE_DAYS:

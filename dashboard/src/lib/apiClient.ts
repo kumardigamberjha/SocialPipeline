@@ -107,8 +107,9 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   const { skipAuthRetry, ...init } = options;
   const method = init.method ?? "GET";
 
+  const normalizedPath = path.startsWith("/api/") ? path.slice(4) : path;
   const doFetch = () =>
-    fetch(`${API_BASE_URL}${path}`, {
+    fetch(`${API_BASE_URL}${normalizedPath}`, {
       ...init,
       credentials: "include",
       headers: {

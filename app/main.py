@@ -87,6 +87,9 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset({
     # authenticated by a signed `state` parameter rather than a session cookie.
     ("GET", "/api/google/callback"),
     ("GET", "/api/instagram/oauth/callback"),
+    ("GET", "/api/linkedin/callback"),
+    ("GET", "/callback"),
+
     # Stripe cannot send our session cookie or CSRF header; authenticated by
     # webhook signature instead (see app.routers.billing).
     ("POST", "/api/billing/webhook"),
@@ -96,6 +99,7 @@ PUBLIC_ROUTES: frozenset[tuple[str, str]] = frozenset({
     ("POST", "/api/auth/refresh"),
     ("POST", "/api/auth/verify-email"),
     ("POST", "/api/auth/resend-otp"),
+    ("POST", "/api/extension/auth/login"),
     # The public blog reader — deliberately unauthenticated (see
     # queries.get_public_blog_by_slug).
     ("GET", "/api/blog/view/{slug}"),
@@ -224,6 +228,7 @@ def create_app() -> FastAPI:
         auth,
         billing,
         blog,
+        extension,
         google_auth,
         images,
         instagram_analytics,
@@ -235,6 +240,7 @@ def create_app() -> FastAPI:
         rag,
         runs,
         saved_topics,
+        shortform_prospects,
         ws,
         youtube,
         youtube_analytics,
@@ -255,6 +261,7 @@ def create_app() -> FastAPI:
     application.include_router(instagram_auth.oauth_callback_router)
     application.include_router(billing.router)
     application.include_router(linkedin.router)
+    application.include_router(linkedin.callback_router)
     application.include_router(linkedin.ws_router)
     application.include_router(blog.router)
     application.include_router(blog.ws_router)
@@ -269,7 +276,9 @@ def create_app() -> FastAPI:
     application.include_router(youtube_playlist_items.router)
     application.include_router(youtube_competitors.router)
     application.include_router(youtube_prospects.router)
+    application.include_router(shortform_prospects.router)
     application.include_router(personal_intelligence.router)
+    application.include_router(extension.router)
 
     _assert_all_routes_authenticated(application)
 

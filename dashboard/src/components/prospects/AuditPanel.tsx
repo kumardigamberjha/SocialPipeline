@@ -36,6 +36,7 @@ import {
   type SimilarChannel,
   type Strategy,
 } from "@/lib/youtubeProspectsApi";
+import { derivePeakTiming } from "@/lib/timingAnalysis";
 
 /**
  * Screenshot target #1: the channel audit with vidIQ-grade channel vitals.
@@ -187,6 +188,7 @@ function UploadTimingSection({ metrics }: { metrics: ProspectMetrics }) {
     return null;
   }
 
+  const peakTiming = derivePeakTiming(timing);
   const bestWindow = timing.best_window;
   const maxDayAvg = Math.max(...timing.days.map((d) => d.avg_views), 1);
   // The exact list the backend cited and the validator checked — not a fresh
@@ -211,81 +213,106 @@ function UploadTimingSection({ metrics }: { metrics: ProspectMetrics }) {
       </div>
 
       {/* Hero Winning Window Card */}
-      {bestWindow && (
-        <div className="rounded-xl border border-amber-500/30 bg-gradient-to-r from-amber-500/[0.12] via-purple-500/[0.08] to-blue-500/[0.06] p-4 relative overflow-hidden">
-          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-            <div className="space-y-1.5">
-              <div className="flex items-center gap-2">
-                <span className="bg-amber-500/20 text-amber-300 border border-amber-500/30 text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full flex items-center gap-1">
-                  <Star size={10} className="fill-amber-300 text-amber-300" /> Optimal Release Window
+      <div
+        className={`rounded-xl border p-4 relative overflow-hidden transition-all ${
+          peakTiming.status === "VALID_PEAK"
+            ? "border-amber-500/30 bg-gradient-to-r from-amber-500/[0.12] via-purple-500/[0.08] to-blue-500/[0.06]"
+            : "border-slate-800 bg-[#0b101e]/80"
+        }`}
+      >
+        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+          <div className="space-y-1.5">
+            <div className="flex items-center gap-2">
+              <span
+                className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full flex items-center gap-1 border ${
+                  peakTiming.status === "VALID_PEAK"
+                    ? "bg-amber-500/20 text-amber-300 border-amber-500/30"
+                    : "bg-slate-700/40 text-slate-400 border-slate-600/40"
+                }`}
+              >
+                <Star
+                  size={10}
+                  className={
+                    peakTiming.status === "VALID_PEAK"
+                      ? "fill-amber-300 text-amber-300"
+                      : "text-slate-400"
+                  }
+                />{" "}
+                {peakTiming.badgeText}
+              </span>
+              {peakTiming.status === "VALID_PEAK" && peakTiming.multiplier > 1.0 && (
+                <span className="bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1">
+                  <TrendingUp size={10} /> +{Math.round((peakTiming.multiplier - 1.0) * 100)}% on{" "}
+                  {peakTiming.peakDay}
                 </span>
-                {bestWindow.day_lift_pct > 0 && (
-                  <span className="bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold px-2 py-0.5 rounded-full flex items-center gap-1">
-                    <TrendingUp size={10} /> +{bestWindow.day_lift_pct}% on {bestWindow.best_days.join(" & ")}
-                  </span>
-                )}
-              </div>
-              <h3 className="text-lg font-bold text-white tracking-tight">
-                {bestWindow.combined_label}
-              </h3>
-              <p className="text-xs text-slate-300 leading-relaxed max-w-2xl">
-                {bestWindow.recommendation}
-              </p>
-              {bestWindow.top_video_proof && (
-                <p className="text-[11px] text-amber-200/80 font-medium flex items-center gap-1">
-                  <Flame size={12} className="text-orange-400" /> {bestWindow.top_video_proof}
-                </p>
-              )}
-              {/* One gate, one message. The narrative on the page before reads
-                  the same flag, so it can no longer recommend an hour while this
-                  says none can be named. */}
-              {!bestWindow.slot_confident && (
-                <p className="text-[11px] text-slate-400 flex items-center gap-1">
-                  <Timer size={12} className="text-slate-500" />{" "}
-                  {timing.time_of_day_allowed === false || !timing.has_hour_data
-                    ? "Too few uploads carry a publish time to call a time of day — this recommends a day only."
-                    : "No time window survived its evidence check — this recommends a day only."}
-                </p>
               )}
             </div>
+            <h3 className="text-lg font-bold text-white tracking-tight">
+              {peakTiming.cardTitle}
+            </h3>
+            <p className="text-xs text-slate-300 leading-relaxed max-w-2xl">
+              {peakTiming.summaryText}
+            </p>
+            {peakTiming.status === "VALID_PEAK" && bestWindow?.top_video_proof && (
+              <p className="text-[11px] text-amber-200/80 font-medium flex items-center gap-1">
+                <Flame size={12} className="text-orange-400" /> {bestWindow.top_video_proof}
+              </p>
+            )}
+            {/* One gate, one message. The narrative on the page before reads
+                the same flag, so it can no longer recommend an hour while this
+                says none can be named. */}
+            {peakTiming.status === "VALID_PEAK" && !bestWindow?.slot_confident && (
+              <p className="text-[11px] text-slate-400 flex items-center gap-1">
+                <Timer size={12} className="text-slate-500" />{" "}
+                {timing.time_of_day_allowed === false || !timing.has_hour_data
+                  ? "Too few uploads carry a publish time to call a time of day — this recommends a day only."
+                  : "No time window survived its evidence check — this recommends a day only."}
+              </p>
+            )}
+          </div>
 
-            <div className="flex items-center gap-2 flex-shrink-0 bg-[#080d1a]/80 border border-white/10 p-3 rounded-xl">
-              {/* Day and time are separate findings with separate samples. They
-                  are never merged into one "multiplier", because a time claim
-                  backed by a day statistic is how the wrong window shipped. */}
-              <div className="text-center px-2">
-                <p className="text-[9px] uppercase font-bold text-slate-500">Best Day</p>
-                <p className="text-xl font-bold text-amber-300 tabular-nums">
-                  {bestWindow.day_multiplier}×
-                </p>
-                <p className="text-[9px] text-slate-400">
-                  n={bestWindow.day_sample} · vs median
-                </p>
-              </div>
-              <div className="h-8 w-px bg-white/10" />
-              <div className="text-center px-2">
-                <p className="text-[9px] uppercase font-bold text-slate-500">Best Window</p>
-                <p className="text-xl font-bold text-blue-300 tabular-nums">
-                  {bestWindow.slot_multiplier != null ? `${bestWindow.slot_multiplier}×` : "—"}
-                </p>
-                <p className="text-[9px] text-slate-400">
-                  {bestWindow.slot_multiplier != null
-                    ? `n=${bestWindow.slot_sample} · vs median`
-                    : "not enough data"}
-                </p>
-              </div>
-              <div className="h-8 w-px bg-white/10" />
-              <div className="text-center px-2">
-                <p className="text-[9px] uppercase font-bold text-slate-500">Proof</p>
-                <p className="text-xs font-bold text-white">
-                  {bestWindow.proof_count} of top {bestWindow.top_tier_count}
-                </p>
-                <p className="text-[9px] text-slate-400">by views</p>
-              </div>
+          <div className="flex items-center gap-2 flex-shrink-0 bg-[#080d1a]/80 border border-white/10 p-3 rounded-xl">
+            {/* Day and time are separate findings with separate samples. They
+                are never merged into one "multiplier", because a time claim
+                backed by a day statistic is how the wrong window shipped. */}
+            <div className="text-center px-2">
+              <p className="text-[9px] uppercase font-bold text-slate-500">Best Day</p>
+              <p
+                className={`text-xl font-bold tabular-nums ${
+                  peakTiming.status === "VALID_PEAK" ? "text-amber-300" : "text-slate-400"
+                }`}
+              >
+                {peakTiming.multiplierDisplay}
+              </p>
+              <p className="text-[9px] text-slate-400">{peakTiming.multiplierSubtext}</p>
+            </div>
+            <div className="h-8 w-px bg-white/10" />
+            <div className="text-center px-2">
+              <p className="text-[9px] uppercase font-bold text-slate-500">Best Window</p>
+              <p className="text-xl font-bold text-blue-300 tabular-nums">
+                {peakTiming.status === "VALID_PEAK" && bestWindow?.slot_multiplier != null
+                  ? `${bestWindow.slot_multiplier}×`
+                  : "—"}
+              </p>
+              <p className="text-[9px] text-slate-400">
+                {peakTiming.status === "VALID_PEAK" && bestWindow?.slot_multiplier != null
+                  ? `n=${bestWindow.slot_sample} · vs median`
+                  : "not enough data"}
+              </p>
+            </div>
+            <div className="h-8 w-px bg-white/10" />
+            <div className="text-center px-2">
+              <p className="text-[9px] uppercase font-bold text-slate-500">Proof</p>
+              <p className="text-xs font-bold text-white">
+                {peakTiming.status === "VALID_PEAK" && bestWindow
+                  ? `${bestWindow.proof_count} of top ${bestWindow.top_tier_count}`
+                  : "—"}
+              </p>
+              <p className="text-[9px] text-slate-400">by views</p>
             </div>
           </div>
         </div>
-      )}
+      </div>
 
       {/* 7-Day Performance Heatmap & Distribution Bars */}
       <div>
@@ -295,14 +322,15 @@ function UploadTimingSection({ metrics }: { metrics: ProspectMetrics }) {
         <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-2">
           {timing.days.map((d) => {
             const pct = maxDayAvg > 0 ? Math.max(6, (d.avg_views / maxDayAvg) * 100) : 6;
-            const isTop = d.is_best || d.multiplier >= 1.25;
+            const isPeak = peakTiming.isPeakDay(d.day);
+            const isTop = isPeak || (d.video_count >= 3 && d.multiplier >= 1.25);
             const isZero = d.video_count === 0;
 
             return (
               <div
                 key={d.day}
                 className={`rounded-xl border p-3 flex flex-col justify-between transition-all ${
-                  d.is_best
+                  isPeak
                     ? "bg-amber-500/[0.08] border-amber-500/40 shadow-sm"
                     : isTop
                     ? "bg-emerald-500/[0.05] border-emerald-500/30"
@@ -315,7 +343,7 @@ function UploadTimingSection({ metrics }: { metrics: ProspectMetrics }) {
                   <div className="flex items-center justify-between gap-1 mb-1.5">
                     <span
                       className={`text-xs font-bold ${
-                        d.is_best
+                        isPeak
                           ? "text-amber-300"
                           : isTop
                           ? "text-emerald-300"
@@ -324,11 +352,11 @@ function UploadTimingSection({ metrics }: { metrics: ProspectMetrics }) {
                     >
                       {d.day_short}
                     </span>
-                    {d.is_best ? (
+                    {isPeak ? (
                       <span className="bg-amber-500/20 text-amber-300 text-[9px] font-bold px-1 rounded flex items-center gap-0.5">
                         <Star size={9} className="fill-amber-300" /> Best
                       </span>
-                    ) : d.multiplier >= 1.1 ? (
+                    ) : d.multiplier >= 1.1 && d.video_count >= 3 ? (
                       <span className="text-[10px] font-semibold text-emerald-400">
                         {d.multiplier}×
                       </span>
@@ -353,7 +381,7 @@ function UploadTimingSection({ metrics }: { metrics: ProspectMetrics }) {
                   <div className="w-full bg-white/[0.06] rounded-full h-1.5">
                     <div
                       className={`h-1.5 rounded-full ${
-                        d.is_best
+                        isPeak
                           ? "bg-gradient-to-r from-amber-500 to-yellow-400"
                           : isTop
                           ? "bg-gradient-to-r from-emerald-500 to-teal-400"

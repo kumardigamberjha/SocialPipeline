@@ -27,7 +27,7 @@ from app.db import queries
 from app.db.session import get_session
 from app.models.prospects import ProspectLookupRequest, UpdateProspectRequest
 from app.provider_tiers import CLIENT_GRADE, UNKNOWN_GRADE
-from app.routers.youtube_analytics import _cached_web_search, _domain_key, _get_cached, _set_cached
+from app.routers.youtube_analytics import _domain_key, _get_cached, _set_cached
 from app.services import youtube_channel_lookup as lookup
 from app.services import youtube_prospect_service as prospects
 
@@ -37,6 +37,10 @@ router = APIRouter(prefix="/api/youtube-prospects", tags=["YouTube Prospects"])
 
 MAX_WEEKS = 8
 UPLOAD_LIMIT = 200
+# The trend scrape is a nice-to-have on a request that already spends two LLM
+# calls behind a proxy timeout. Cap it rather than let a hanging fetch decide how
+# long the audit takes.
+TREND_TIMEOUT_SECONDS = 20
 
 # Channel fields persisted on the prospect row (the rest of the resolver's
 # output is display-only and lives in the report payload).
@@ -169,6 +173,7 @@ async def generate_report(
 
     # Niche keywords come from the channel's own titles, same as the owner flow.
     from app.services.youtube_metrics import extract_keywords
+    from app.services import youtube_trend_source as trend_source
 
     keywords = extract_keywords(
         [v.get("title") or "" for v in videos],
@@ -176,16 +181,25 @@ async def generate_report(
         channel_title=channel.get("title") or "",
         channel_handle=channel.get("handle") or "",
     )
-    niche = " ".join(keywords[:4]) or "youtube content"
-    # Trend context sharpens the roadmap but is not required for it. The search
-    # backend is a rate-limited third party, so a failure degrades the prompt
-    # rather than the request.
+    # Trend context sharpens the roadmap but is not required for it, and it comes
+    # from YouTube rather than the general web: app.tools.research_engine is wired
+    # to Hacker News, ArXiv, GitHub Trending and a fixed set of tech subreddits, so
+    # it answered a cooking channel's audit with LLM tooling and pulled every
+    # roadmap toward one niche. Searching YouTube on this channel's own keywords is
+    # on-niche by construction. Best-effort: a scrape failure degrades the prompt,
+    # never the request.
     try:
-        web_context = await _cached_web_search(
-            f"trending YouTube video topics {niche} 2026", 6, refresh
+        web_context = await asyncio.wait_for(
+            asyncio.to_thread(
+                trend_source.build_niche_trend_context,
+                keywords,
+                channel["channel_id"],
+                channel.get("title") or "",
+            ),
+            timeout=TREND_TIMEOUT_SECONDS,
         )
     except Exception:
-        logger.warning("Web trend search failed; continuing without it", exc_info=True)
+        logger.warning("YouTube trend search failed; continuing without it", exc_info=True)
         web_context = ""
 
     try:

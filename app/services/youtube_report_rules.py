@@ -473,11 +473,17 @@ def cites_flagged_video(text: str, flagged: list[dict]) -> dict | None:
 
 # ── External metric / popularity signal checks (FIX 2) ─────────────────────────
 
+# A NUMBER attached to an off-platform popularity unit is what makes a phrase a
+# borrowed metric. The bare words are ordinary English outside this repo's
+# original niche, and the bare forms used to fire on them: an astronomy channel's
+# "your videos about stars", a film channel's "five-star reviews" and a football
+# channel's "the star player teardown" were all flagged as external-metric
+# violations, forced a roadmap regeneration, and then had the clause deleted
+# outright by strip_external_metric_phrases. The platform names stay — they are
+# proper nouns, and naming one in a rationale is still off-limits in any niche.
 EXTERNAL_METRIC_PATTERNS = (
-    r"\b\d+[\s-]*(?:stars?(?:/day)?|upvotes?|followers?|forks?|claps?)\b",
-    r"\bstars?\b",
-    r"\bupvotes?\b",
-    r"/\s*day\b",
+    r"\b\d[\d,.]*\s*[kKmM]?[\s-]*(?:stars?|upvotes?|followers?|forks?|claps?|points?)\b",
+    r"\b(?:stars?|upvotes?|points?)\s*/\s*day\b",
     r"\btrended\b",
     r"\bwent\s+viral\b",
     r"\bproduct\s*hunt\b",

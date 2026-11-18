@@ -182,6 +182,13 @@ def _db_load_latest_snapshot(user_id: str) -> Optional[Dict[str, Any]]:
                 .limit(1)
             ).scalar_one_or_none()
         if row is None:
+            # Fallback to the latest workspace snapshot if this user has none yet
+            row = session.execute(
+                select(InstagramSnapshot)
+                .order_by(InstagramSnapshot.synced_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        if row is None:
             return None
         return {
             "profile": row.profile_json,

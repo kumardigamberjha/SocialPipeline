@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VidIQ Pulse — Channel AI Copilot</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Header -->
+  <header class="popup-header">
+    <div class="brand-wrap">
+      <div class="logo-badge">⚡ VidIQ Pulse</div>
+      <div class="brand-text">
+        <h1>Channel Copilot</h1>
+        <p id="channel-niche-header">Grounded in Account DB</p>
+      </div>
+    </div>
+    <div class="status-indicator">
+      <div class="status-dot" id="conn-status-dot"></div>
+      <span id="conn-status-text">Checking...</span>
+    </div>
+  </header>
+
+  <!-- Navigation Tabs -->
+  <nav class="nav-tabs">
+    <button class="tab-btn active" id="tab-btn-active" data-view="view-active">Active Video</button>
+    <button class="tab-btn" id="tab-btn-channel" data-view="view-channel">My Channel</button>
+    <button class="tab-btn" id="tab-btn-videos" data-view="view-videos">Previous Videos</button>
+    <button class="tab-btn" id="tab-btn-settings" data-view="view-settings">Settings</button>
+  </nav>
+
+  <!-- Alert Message Container -->
+  <div style="padding: 0 16px; margin-top: 10px;">
+    <div id="popup-alert" class="msg-alert"></div>
+  </div>
+
+  <!-- View 1: Active Video Inspector -->
+  <main class="main-view active" id="view-active">
+    <div id="active-video-container">
+      <div class="glass-card" style="text-align: center; padding: 20px;">
+        <p style="font-size: 12px; color: var(--text-muted); margin-bottom: 12px;">
+          Detecting video from active YouTube tab...
+        </p>
+        <button id="btn-inspect-active-tab" class="btn-primary">
+          🔍 Analyze Current YouTube Video
+        </button>
+      </div>
+    </div>
+  </main>
+
+  <!-- View 2: My Channel Intel -->
+  <main class="main-view" id="view-channel">
+    <div class="glass-card">
+      <div class="card-title">
+        <span>Channel Overview</span>
+        <span id="badge-channel-title" style="color: #c4b5fd; text-transform: none;">My Channel</span>
+      </div>
+      <div class="stats-grid">
+        <div class="stat-box">
+          <div class="stat-label">Total Videos</div>
+          <div class="stat-value" id="stat-total-videos">--</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Total Views</div>
+          <div class="stat-value" id="stat-total-views">--</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Watch Hours</div>
+          <div class="stat-value" id="stat-watch-hours">--</div>
+        </div>
+        <div class="stat-box">
+          <div class="stat-label">Baseline Views</div>
+          <div class="stat-value" id="stat-baseline-views">--</div>
+        </div>
+      </div>
+      <div style="font-size: 11px; margin-top: 6px;">
+        <strong>Detected Niche:</strong> <span id="niche-label" style="color: #a5b4fc;">--</span>
+      </div>
+    </div>
+
+    <div class="glass-card">
+      <div class="card-title">Top Niche Keywords</div>
+      <div class="keyword-wrap" id="channel-keywords-cloud">
+        <span style="font-size: 11px; color: var(--text-dim);">No keywords loaded yet.</span>
+      </div>
+    </div>
+
+    <div class="glass-card">
+      <div class="card-title">Creator Directives & Rules</div>
+      <div id="channel-directives-box" style="font-size: 11px; color: var(--text-muted); line-height: 1.4; max-height: 120px; overflow-y: auto;">
+        No custom creator directives found in personal intelligence database.
+      </div>
+    </div>
+  </main>
+
+  <!-- View 3: Previous Videos Library -->
+  <main class="main-view" id="view-videos">
+    <input type="text" id="video-search-input" class="search-input" placeholder="Search previous videos or tags...">
+    <div id="previous-videos-list">
+      <div style="text-align: center; padding: 20px; font-size: 11px; color: var(--text-dim);">
+        Loading previous videos from database...
+      </div>
+    </div>
+  </main>
+
+  <!-- View 4: Settings & Account -->
+  <main class="main-view" id="view-settings">
+    <!-- Server Config -->
+    <div class="glass-card">
+      <div class="card-title">Backend API Server</div>
+      <div class="form-group">
+        <label class="form-label" for="setting-server-url">Server URL</label>
+        <input type="text" id="setting-server-url" class="form-input" value="http://localhost:8000">
+      </div>
+      <button id="btn-save-server-url" class="btn-secondary">Save Server URL</button>
+    </div>
+
+    <!-- Login / Account Status -->
+    <div class="glass-card">
+      <div class="card-title" id="account-card-title">Account Authentication</div>
+      
+      <!-- When Logged In -->
+      <div id="account-logged-in" style="display: none;">
+        <div style="font-size: 12px; margin-bottom: 12px;">
+          Signed in as: <strong id="logged-in-email" style="color: #38bdf8;">user@example.com</strong>
+        </div>
+        <button id="btn-sync-channel" class="btn-primary" style="margin-bottom: 8px;">
+          ⚡ Sync Channel from YouTube Data API
+        </button>
+        <button id="btn-logout" class="btn-secondary">Log Out</button>
+      </div>
+
+      <!-- When Logged Out -->
+      <div id="account-logged-out">
+        <div class="form-group">
+          <label class="form-label" for="input-login-email">Email</label>
+          <input type="email" id="input-login-email" class="form-input" placeholder="creator@example.com">
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="input-login-pass">Password</label>
+          <input type="password" id="input-login-pass" class="form-input" placeholder="••••••••">
+        </div>
+        <button id="btn-login-submit" class="btn-primary">Sign In to Database</button>
+      </div>
+    </div>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

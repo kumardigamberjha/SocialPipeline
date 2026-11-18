@@ -5,6 +5,8 @@ import React, { useState, useEffect } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import { request } from '@/lib/apiClient';
 import InstagramAchievements from './InstagramAchievements';
+import InstagramCharts from './InstagramCharts';
+import InstagramProfileInspector from './InstagramProfileInspector';
 import {
   Instagram,
   Trophy,
@@ -27,6 +29,10 @@ import {
   CalendarRange,
   Info,
   AlertTriangle,
+  Search,
+  Plus,
+  Download,
+  Check,
 } from 'lucide-react';
 
 interface InstagramProfile {
@@ -89,6 +95,7 @@ interface InstagramPost {
   reach: number | null;
   /** Percent as a number now, where this used to be the string "6.2%". */
   engagement_rate: number | null;
+  rate_type?: 'reach' | 'followers' | string;
   insights_available: boolean;
   metrics_updated_at: string;
   permalink: string;
@@ -153,8 +160,18 @@ export default function InstagramAnalyticsDashboard() {
   const [genTopic, setGenTopic] = useState("Build AI Agents with CrewAI & Python");
   const [genPalette, setGenPalette] = useState("void_purple");
   const [genLayout, setGenLayout] = useState("bottom_hero");
+  const [genAspectRatio, setGenAspectRatio] = useState<'1:1' | '4:5' | '9:16'>('1:1');
   const [isGenerating, setIsGenerating] = useState(false);
   const [generatedResult, setGeneratedResult] = useState<any>(null);
+  const [isSchedulingConcept, setIsSchedulingConcept] = useState(false);
+  const [conceptSaveSuccess, setConceptSaveSuccess] = useState<string | null>(null);
+
+  // Inspector state
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+
+  // Strategy hook draft state
+  const [savingHookIdx, setSavingHookIdx] = useState<number | null>(null);
+  const [hookSaveSuccess, setHookSaveSuccess] = useState<string | null>(null);
 
   // Which single post is being re-read from Meta right now, and the last
   // per-post failure (kept out of the console so the user actually sees it).
@@ -381,9 +398,24 @@ export default function InstagramAnalyticsDashboard() {
     }
   };
 
+  const handleQuickSaveDraft = async (data: {
+    title: string;
+    content_type?: string;
+    hook?: string;
+    caption?: string;
+    image_prompt?: string;
+    media_urls?: string[];
+  }) => {
+    return await request<any>('/instagram-analytics/quick-save-draft', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  };
+
   const handleGenerateImage = async () => {
     setIsGenerating(true);
     setGeneratedResult(null);
+    setConceptSaveSuccess(null);
     try {
       const data = await request<any>('/instagram/generate', {
         method: 'POST',
@@ -391,7 +423,8 @@ export default function InstagramAnalyticsDashboard() {
           topic: genTopic,
           palette: genPalette,
           layout: genLayout,
-          model: 'gemini_flash'
+          model: 'gemini_flash',
+          style_hints: `aspect_ratio: ${genAspectRatio}`
         })
       });
       setGeneratedResult(data);
@@ -486,6 +519,14 @@ export default function InstagramAnalyticsDashboard() {
           <div className="flex-1 h-px bg-gradient-to-r from-white/10 to-transparent ml-2 w-24" />
         </div>
         <div className="flex items-center gap-3">
+          {/* Creator Inspector — search and audit any public creator */}
+          <button
+            onClick={() => setInspectorOpen(true)}
+            className="flex items-center gap-2 px-3 py-1.5 glass-card text-purple-300 text-xs rounded-lg hover:bg-purple-500/10 transition-colors border border-purple-500/20 uppercase tracking-wider font-semibold shadow-sm"
+          >
+            <Search size={14} />
+            Inspect Creator
+          </button>
           {/* Planning lives in one place now — this page analyses, the planner plans. */}
           <Link
             href="/planner?platform=instagram&view=board"
@@ -731,6 +772,13 @@ export default function InstagramAnalyticsDashboard() {
             </div>
           </div>
 
+          {/* Dynamic Interactive Charts: Trajectory, Format Efficiency, and Tag Clusters */}
+          <InstagramCharts
+            posts={posts}
+            hashtags={hashtags}
+            followersCount={profile?.followers || stats?.total_followers || 246}
+          />
+
           {/* Posts & Performance Table */}
           <div className="glass-card rounded-2xl border border-white/5 bg-white/[0.02] overflow-hidden">
             <div className="p-6 border-b border-white/5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
@@ -826,9 +874,18 @@ export default function InstagramAnalyticsDashboard() {
                         {post.engagement_rate === null || post.engagement_rate === undefined ? (
                           <span className="text-slate-600 font-mono text-xs">—</span>
                         ) : (
-                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold bg-green-500/10 text-green-400 border border-green-500/20">
-                            {formatRate(post.engagement_rate)}
-                          </span>
+                          <div className="inline-flex flex-col items-end">
+                            <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-semibold ${
+                              post.rate_type === 'followers'
+                                ? 'bg-sky-500/10 text-sky-300 border border-sky-500/20'
+                                : 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20'
+                            }`}>
+                              {formatRate(post.engagement_rate)}
+                            </span>
+                            <span className="text-[9px] font-mono text-slate-500 mt-0.5">
+                              {post.rate_type === 'followers' ? 'vs Followers' : 'vs Reach'}
+                            </span>
+                          </div>
                         )}
                       </td>
                       <td className="px-6 py-4 text-right">
@@ -984,6 +1041,18 @@ export default function InstagramAnalyticsDashboard() {
                 ))}
               </select>
             </label>
+            <label className="block">
+              <span className="text-[10px] uppercase tracking-wider text-slate-500">Aspect Ratio</span>
+              <select
+                value={genAspectRatio}
+                onChange={(e: any) => setGenAspectRatio(e.target.value)}
+                className="mt-1 w-full rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-pink-500/50"
+              >
+                <option value="1:1" className="bg-slate-900">1:1 Square (Post)</option>
+                <option value="4:5" className="bg-slate-900">4:5 Portrait (Feed)</option>
+                <option value="9:16" className="bg-slate-900">9:16 Vertical (Reel / Story)</option>
+              </select>
+            </label>
             <button
               onClick={handleGenerateImage}
               disabled={isGenerating || !genTopic.trim()}
@@ -995,13 +1064,61 @@ export default function InstagramAnalyticsDashboard() {
           </div>
 
           {generatedResult?.images?.[0] && (
-            /* eslint-disable-next-line @next/next/no-img-element -- base64 payload
-               returned inline by Gemini; there is no URL for next/image to fetch. */
-            <img
-              src={`data:image/png;base64,${generatedResult.images[0]}`}
-              alt={`Generated concept for ${genTopic}`}
-              className="rounded-xl border border-white/10 max-h-96 w-auto"
-            />
+            <div className="space-y-4 pt-2">
+              <div className="relative group inline-block">
+                {/* eslint-disable-next-line @next/next/no-img-element -- base64 payload
+                   returned inline by Gemini; there is no URL for next/image to fetch. */}
+                <img
+                  src={`data:image/png;base64,${generatedResult.images[0]}`}
+                  alt={`Generated concept for ${genTopic}`}
+                  className="rounded-xl border border-white/10 max-h-96 w-auto shadow-2xl"
+                />
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  onClick={async () => {
+                    setIsSchedulingConcept(true);
+                    try {
+                      await handleQuickSaveDraft({
+                        title: `Visual Concept: ${genTopic}`,
+                        content_type: genAspectRatio === '9:16' ? 'reel' : 'single',
+                        hook: genTopic,
+                        caption: `🎨 Concept: ${genTopic}\n\nGenerated with Gemini AI Visual Studio.\n\n#creators #ai #design #innovation`,
+                        image_prompt: genTopic,
+                      });
+                      setConceptSaveSuccess("Saved to Content Planner as draft!");
+                      setTimeout(() => setConceptSaveSuccess(null), 4000);
+                    } catch {
+                      alert("Failed to schedule concept in planner");
+                    } finally {
+                      setIsSchedulingConcept(false);
+                    }
+                  }}
+                  disabled={isSchedulingConcept}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-pink-500/20 hover:bg-pink-500/30 text-pink-200 border border-pink-500/30 text-xs font-semibold transition-all disabled:opacity-50"
+                >
+                  <CalendarRange size={14} />
+                  {isSchedulingConcept ? "Scheduling…" : "Schedule as Draft in Planner"}
+                </button>
+
+                <a
+                  href={`data:image/png;base64,${generatedResult.images[0]}`}
+                  download={`instagram-concept-${Date.now()}.png`}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white/5 hover:bg-white/10 text-slate-200 border border-white/10 text-xs font-semibold transition-all"
+                >
+                  <Download size={14} />
+                  Download PNG
+                </a>
+
+                {conceptSaveSuccess && (
+                  <span className="text-xs text-emerald-400 font-medium flex items-center gap-1.5 animate-in fade-in">
+                    <CheckCircle2 size={13} />
+                    {conceptSaveSuccess}
+                  </span>
+                )}
+              </div>
+            </div>
           )}
         </div>
       )}
@@ -1063,16 +1180,48 @@ export default function InstagramAnalyticsDashboard() {
                 <Film size={18} className="text-purple-400" />
                 High-Conversion Reel Hook Templates
               </h3>
+              {hookSaveSuccess && (
+                <div className="mb-3 px-3.5 py-2 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-medium flex items-center gap-2">
+                  <CheckCircle2 size={14} />
+                  {hookSaveSuccess}
+                </div>
+              )}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 {strategy.viral_reel_hooks.map((hook: string, idx: number) => (
-                  <div key={idx} className="p-3.5 rounded-xl glass-card border border-white/5 bg-white/[0.01] flex items-center justify-between text-xs text-slate-200">
-                    <span>"{hook}"</span>
-                    <button
-                      onClick={() => navigator.clipboard.writeText(hook)}
-                      className="text-[10px] px-2 py-1 bg-white/5 hover:bg-white/10 rounded text-pink-300 font-mono"
-                    >
-                      Copy
-                    </button>
+                  <div key={idx} className="p-3.5 rounded-xl glass-card border border-white/5 bg-white/[0.01] flex items-center justify-between gap-3 text-xs text-slate-200">
+                    <span className="line-clamp-2">"{hook}"</span>
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      <button
+                        onClick={() => navigator.clipboard.writeText(hook)}
+                        className="text-[10px] px-2 py-1 bg-white/5 hover:bg-white/10 rounded text-pink-300 font-mono transition-colors"
+                      >
+                        Copy
+                      </button>
+                      <button
+                        onClick={async () => {
+                          setSavingHookIdx(idx);
+                          try {
+                            await handleQuickSaveDraft({
+                              title: hook.length > 55 ? hook.slice(0, 52) + '...' : hook,
+                              content_type: 'reel',
+                              hook: hook,
+                              caption: `${hook}\n\nComment below with your thoughts! 👇\n\n#coding #ai #python #developer`
+                            });
+                            setHookSaveSuccess(`Hook #${idx + 1} added to Planner as Draft!`);
+                            setTimeout(() => setHookSaveSuccess(null), 4000);
+                          } catch {
+                            alert("Failed to add hook to planner");
+                          } finally {
+                            setSavingHookIdx(null);
+                          }
+                        }}
+                        disabled={savingHookIdx === idx}
+                        className="text-[10px] px-2.5 py-1 bg-pink-500/20 hover:bg-pink-500/30 border border-pink-500/30 rounded text-pink-200 font-medium transition-colors flex items-center gap-1"
+                      >
+                        <Plus size={11} />
+                        {savingHookIdx === idx ? "Adding…" : "Planner"}
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1175,7 +1324,13 @@ export default function InstagramAnalyticsDashboard() {
         </div>
       )}
 
-      {/* Add Item Modal */}
+      {/* Public Profile Inspector Modal */}
+      <InstagramProfileInspector
+        isOpen={inspectorOpen}
+        onClose={() => setInspectorOpen(false)}
+        myFollowers={profile?.followers || stats?.total_followers || 246}
+        myHandle={profile?.handle || '@codingindiaai'}
+      />
     </div>
   );
 }

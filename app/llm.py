@@ -213,22 +213,14 @@ def build_tier_cascade(
     settings: Settings,
     temperature: float = 0.4,
     max_tokens: int | None = None,
+    chain: tuple[ProviderTier, ...] | None = None,
 ) -> list[tuple[ProviderTier, Any]]:
-    """Instantiate the ordered provider chain from ``settings.provider_chain``.
-
-    Every returned LLM carries its :class:`ProviderTier` as ``llm.provider_tier``.
-    That is what lets ``call_llm_with_retry`` report the tier that actually
-    answered without a parallel lookup table — and it is why the primary and the
-    fallbacks need no different treatment.
-
-    A tier that is unconfigured or fails to construct is skipped **with a
-    warning** and does not shift the others: tier indices come from the
-    declaration, so "tier 4" means Ollama Cloud whether or not tier 3 is on.
-    """
+    """Instantiate the ordered provider chain from ``chain`` or ``settings.provider_chain``."""
     max_tokens = max_tokens or settings.llm_max_tokens
     built: list[tuple[ProviderTier, Any]] = []
+    tiers = chain if chain is not None else settings.provider_chain
 
-    for tier in settings.provider_chain:
+    for tier in tiers:
         if not tier.is_configured(settings):
             logger.warning(
                 "LLM cascade: skipping %s — not configured (model=%r, key=%s)",
@@ -262,7 +254,7 @@ def build_tier_cascade(
 
     if not built:
         raise RuntimeError(
-            "No LLM tier could be built. Check GEMINI_API_KEY / OPENROUTER_API_KEY "
+            "No LLM tier could be built. Check GEMINI_PAID_API_KEY / GEMINI_API_KEY "
             "and OLLAMA_API_BASE."
         )
     return built
@@ -272,23 +264,11 @@ def build_fallback_cascade(
     settings: Settings,
     temperature: float = 0.4,
     max_tokens: int | None = None,
+    is_audit: bool = False,
 ) -> tuple[Any, list[tuple[str, Any]]]:
-    """The analysis cascade, as ``(primary_llm, [(tier_name, llm), ...])``.
-
-    Order comes from ``app.provider_tiers.DEFAULT_PROVIDER_CHAIN`` (overridable
-    with ``LLM_PROVIDER_CHAIN``), not from the shape of this function:
-
-      1. Gemini, primary key      — client grade
-      2. Gemini, backup key       — client grade
-      3. OpenRouter Nemotron 3 Ultra, SSE  — internal only
-      4. Ollama Cloud, Gemma 4 31B         — internal only
-      5. Ollama local, Qwen 2.5            — internal only
-
-    This replaced a hardcoded chain that put local Qwen at tier 2, ahead of every
-    hosted model — so losing Gemini quota dropped an audit straight onto the
-    weakest model available, silently.
-    """
-    built = build_tier_cascade(settings, temperature=temperature, max_tokens=max_tokens)
+    """The analysis cascade, as ``(primary_llm, [(tier_name, llm), ...])``."""
+    chain = settings.audit_provider_chain if is_audit else settings.provider_chain
+    built = build_tier_cascade(settings, temperature=temperature, max_tokens=max_tokens, chain=chain)
     primary_tier, primary_llm = built[0]
     if not primary_tier.is_client_grade:
         logger.warning(

@@ -134,6 +134,38 @@ def _scraped_match(query: str) -> dict | None:
     return results[0] if results else None
 
 
+def _slug(text: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def _identity_matches(parsed: dict, scraped: dict) -> bool:
+    """May this search hit stand in for what the caller actually asked for?
+
+    Free text is a search, so hit #1 *is* the answer. A ``UC...`` id or an
+    @handle is an assertion about WHICH channel, and a YouTube search for either
+    string happily returns a different, more popular creator — which is how an
+    audit ends up describing the wrong channel under the right id, internally
+    consistent and undetectable downstream. The no-OAuth branch of
+    ``resolve_channel`` already refuses that trade; this is the same refusal,
+    applied to the OAuth branch that was missing it.
+
+    The handle check is deliberately lenient about a missing handle: scrapetube
+    often omits it, and a ``/c/`` custom URL legitimately differs from the modern
+    @handle (``normalize_channel_query`` sets both ``handle`` and ``name`` for
+    exactly that case).
+    """
+    want_id = parsed.get("channel_id")
+    if want_id:
+        return scraped.get("channel_id") == want_id
+    want_handle = (parsed.get("handle") or "").lstrip("@").lower()
+    if want_handle:
+        got_handle = (scraped.get("handle") or "").lstrip("@").lower()
+        if got_handle:
+            return got_handle == want_handle
+        return _slug(scraped.get("title")) == _slug(want_handle)
+    return True
+
+
 def resolve_channel(user_id: str, query: str, ledger: QuotaLedger | None = None) -> dict | None:
     """Resolve free text / a URL / a handle / a channel id to one channel row.
 
@@ -175,14 +207,15 @@ def resolve_channel(user_id: str, query: str, ledger: QuotaLedger | None = None)
         # Scrapetube costs nothing, so try it before the 100-unit search.list.
         probe = name or (handle or "").lstrip("@") or parsed["raw"]
         scraped = _scraped_match(probe)
-        if scraped:
+        if scraped and _identity_matches(parsed, scraped):
             item = _resolve_by_ids(yt, [scraped["channel_id"]], ledger).get(scraped["channel_id"])
             if item:
                 return _to_row(scraped, item)
             return scraped
 
         item = _resolve_by_search(yt, probe, ledger)
-        if item:
+        # search.list returns a channels.list item, whose "id" is the channel id.
+        if item and (not channel_id or item.get("id") == channel_id):
             return _to_row(parsed, item)
         return None
 

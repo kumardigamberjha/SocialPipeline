@@ -39,6 +39,7 @@ import {
   type SimilarChannel,
   type Strategy,
 } from "@/lib/youtubeProspectsApi";
+import { derivePeakTiming } from "@/lib/timingAnalysis";
 
 // ── Print Header & Footer Component ──────────────────────────────────────────
 
@@ -580,72 +581,86 @@ export default function ProspectPrintReportView({ report }: { report: ProspectRe
           )}
 
           {/* Upload Timing & Best Slot */}
-          {metrics.upload_timing?.has_timing_data && (
-            <div className="mb-3.5">
-              <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1.5 flex items-center gap-1">
-                <Clock size={12} className="text-amber-600" /> Optimal Upload Timing & Day Velocity
-              </p>
+          {metrics.upload_timing?.has_timing_data && (() => {
+            const peakTiming = derivePeakTiming(metrics.upload_timing);
+            return (
+              <div className="mb-3.5">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-slate-500 mb-1.5 flex items-center gap-1">
+                  <Clock size={12} className="text-amber-600" /> Optimal Upload Timing & Day Velocity
+                </p>
 
-              {metrics.upload_timing.best_window && (
-                <div className="rounded-lg border border-amber-300 bg-amber-50/70 p-2.5 mb-2 flex items-center justify-between gap-3">
+                <div
+                  className={`rounded-lg border p-2.5 mb-2 flex items-center justify-between gap-3 ${
+                    peakTiming.status === "VALID_PEAK"
+                      ? "border-amber-300 bg-amber-50/70"
+                      : "border-slate-200 bg-slate-50"
+                  }`}
+                >
                   <div>
                     <div className="flex items-center gap-2">
-                      <span className="text-[9px] font-bold bg-amber-200 text-amber-900 px-1.5 py-0.2 rounded">
-                        Peak Slot
+                      <span
+                        className={`text-[9px] font-bold px-1.5 py-0.5 rounded ${
+                          peakTiming.status === "VALID_PEAK"
+                            ? "bg-amber-200 text-amber-900"
+                            : "bg-slate-200 text-slate-700"
+                        }`}
+                      >
+                        {peakTiming.badgeText}
                       </span>
                       <p className="text-xs font-bold text-slate-900">
-                        {metrics.upload_timing.best_window.combined_label}
+                        {peakTiming.cardTitle}
                       </p>
-                      {metrics.upload_timing.best_window.day_lift_pct > 0 && (
+                      {peakTiming.status === "VALID_PEAK" && peakTiming.multiplier > 1.0 && (
                         <span className="text-[9px] font-bold text-emerald-700">
-                          +{metrics.upload_timing.best_window.day_lift_pct}% on{" "}
-                          {metrics.upload_timing.best_window.best_days.join(" & ")}
+                          +{Math.round((peakTiming.multiplier - 1.0) * 100)}% on {peakTiming.peakDay}
                         </span>
                       )}
                     </div>
                     <p className="text-[10px] text-slate-600 mt-0.5">
-                      {metrics.upload_timing.best_window.recommendation}
+                      {peakTiming.summaryText}
                     </p>
-                    {metrics.upload_timing.best_window.top_video_proof && (
+                    {peakTiming.status === "VALID_PEAK" && metrics.upload_timing?.best_window?.top_video_proof && (
                       <p className="text-[10px] text-amber-800 mt-0.5">
                         {metrics.upload_timing.best_window.top_video_proof}
                       </p>
                     )}
                   </div>
-                  <div className="text-right flex-shrink-0 bg-white border border-amber-200 px-2 py-1 rounded text-center">
-                    {/* Day and window are separate statistics with separate
-                        samples; neither may stand in for the other. */}
-                    <p className="text-[8px] uppercase font-bold text-slate-500">Day · Window</p>
-                    <p className="text-sm font-black text-amber-800">
-                      {metrics.upload_timing.best_window.day_multiplier}×
-                      {metrics.upload_timing.best_window.slot_multiplier != null
-                        ? ` · ${metrics.upload_timing.best_window.slot_multiplier}×`
-                        : " · —"}
+                  <div className="text-right flex-shrink-0 bg-white border border-slate-200 px-2 py-1 rounded text-center">
+                    <p className="text-[8px] uppercase font-bold text-slate-500">Day Velocity</p>
+                    <p
+                      className={`text-sm font-black ${
+                        peakTiming.status === "VALID_PEAK" ? "text-amber-800" : "text-slate-600"
+                      }`}
+                    >
+                      {peakTiming.multiplierDisplay}
                     </p>
-                    <p className="text-[8px] text-slate-500">vs channel median</p>
+                    <p className="text-[8px] text-slate-500">{peakTiming.multiplierSubtext}</p>
                   </div>
                 </div>
-              )}
 
-              {/* 7-Day Velocity Bars */}
-              <div className="grid grid-cols-7 gap-1 text-center">
-                {metrics.upload_timing.days.map((d) => (
-                  <div
-                    key={d.day}
-                    className={`rounded border p-1.5 ${
-                      d.is_best
-                        ? "bg-amber-100 border-amber-400 font-bold"
-                        : "bg-slate-50 border-slate-200"
-                    }`}
-                  >
-                    <p className="text-[9px] text-slate-600 uppercase">{d.day_short}</p>
-                    <p className="text-[11px] font-bold text-slate-900 mt-0.5">{d.multiplier}×</p>
-                    <p className="text-[8px] text-slate-500">n={d.video_count}</p>
-                  </div>
-                ))}
+                {/* 7-Day Velocity Bars */}
+                <div className="grid grid-cols-7 gap-1 text-center">
+                  {metrics.upload_timing.days.map((d) => {
+                    const isPeak = peakTiming.isPeakDay(d.day);
+                    return (
+                      <div
+                        key={d.day}
+                        className={`rounded border p-1.5 ${
+                          isPeak
+                            ? "bg-amber-100 border-amber-400 font-bold"
+                            : "bg-slate-50 border-slate-200"
+                        }`}
+                      >
+                        <p className="text-[9px] text-slate-600 uppercase">{d.day_short}</p>
+                        <p className="text-[11px] font-bold text-slate-900 mt-0.5">{d.multiplier}×</p>
+                        <p className="text-[8px] text-slate-500">n={d.video_count}</p>
+                      </div>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
+            );
+          })()}
 
           {/* Similar Benchmark Channels */}
           {similar_channels && similar_channels.length > 0 && (

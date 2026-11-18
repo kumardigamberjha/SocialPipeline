@@ -46,6 +46,7 @@ EXEMPT_PATHS = frozenset(
         "/api/auth/resend-otp",
         "/api/auth/refresh",
         "/api/billing/webhook",
+        "/api/extension/auth/login",
     }
 )
 

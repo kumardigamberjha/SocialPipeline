@@ -594,10 +594,8 @@ async def save_linkedin_post(
 
 
 async def get_linkedin_posts(
-    session: AsyncSession, user_id: str, limit: int = 20
+    session: AsyncSession, user_id: str, limit: int = 50
 ) -> list[dict]:
-    # post_text is deliberately omitted: the list view never renders it and it
-    # is the largest column in the row.
     return await _all(
         session,
         select(
@@ -611,6 +609,10 @@ async def get_linkedin_posts(
             LinkedinPost.hashtag_count,
             LinkedinPost.approved,
             LinkedinPost.niche,
+            LinkedinPost.published_at,
+            LinkedinPost.linkedin_urn,
+            LinkedinPost.linkedin_post_url,
+            LinkedinPost.post_text,
             LinkedinPost.created_at,
             LinkedinPost.deleted_at,
         )
@@ -657,6 +659,128 @@ async def soft_delete_linkedin_post(
         )
         .values(deleted_at=_now()),
     )
+
+
+async def get_linkedin_analytics(
+    session: AsyncSession, user_id: str, time_range: str = "all_time"
+) -> dict:
+    """Aggregate analytics for user's generated LinkedIn posts."""
+    conditions = [LinkedinPost.user_id == user_id, LinkedinPost.deleted_at.is_(None)]
+    now = datetime.now(timezone.utc)
+    if time_range == "7d":
+        conditions.append(LinkedinPost.created_at >= now - timedelta(days=7))
+    elif time_range == "30d":
+        conditions.append(LinkedinPost.created_at >= now - timedelta(days=30))
+    elif time_range == "90d":
+        conditions.append(LinkedinPost.created_at >= now - timedelta(days=90))
+
+    query = (
+        select(LinkedinPost)
+        .where(and_(*conditions))
+        .order_by(LinkedinPost.created_at.desc())
+    )
+    posts = await _all(session, query)
+
+    total_posts = len(posts)
+    approved_posts = sum(1 for p in posts if p.get("approved"))
+    published_posts = sum(1 for p in posts if p.get("published_at") is not None)
+    pending_posts = total_posts - approved_posts
+    approval_rate = (
+        round((approved_posts / total_posts * 100), 1) if total_posts > 0 else 0.0
+    )
+
+    word_counts = [p["word_count"] for p in posts if p.get("word_count") is not None]
+    avg_word_count = (
+        int(round(sum(word_counts) / len(word_counts))) if word_counts else 0
+    )
+
+    hashtag_counts = [
+        p["hashtag_count"] for p in posts if p.get("hashtag_count") is not None
+    ]
+    avg_hashtag_count = (
+        round(sum(hashtag_counts) / len(hashtag_counts), 1) if hashtag_counts else 0.0
+    )
+
+    angle_counts: dict[str, dict] = {}
+    for p in posts:
+        angle = p.get("angle_type") or "Standard Hook"
+        if angle not in angle_counts:
+            angle_counts[angle] = {"angle": angle, "count": 0, "approved": 0}
+        angle_counts[angle]["count"] += 1
+        if p.get("approved"):
+            angle_counts[angle]["approved"] += 1
+
+    niche_counts: dict[str, int] = {}
+    for p in posts:
+        niche = p.get("niche") or "AI & Tech"
+        niche_counts[niche] = niche_counts.get(niche, 0) + 1
+
+    velocity_dict: dict[str, dict] = {}
+    for p in posts:
+        created = p.get("created_at")
+        if created:
+            day_str = (
+                created.strftime("%Y-%m-%d")
+                if isinstance(created, (date, datetime))
+                else str(created)[:10]
+            )
+        else:
+            day_str = now.strftime("%Y-%m-%d")
+        if day_str not in velocity_dict:
+            velocity_dict[day_str] = {"date": day_str, "posts": 0, "approved": 0}
+        velocity_dict[day_str]["posts"] += 1
+        if p.get("approved"):
+            velocity_dict[day_str]["approved"] += 1
+
+    velocity_list = sorted(velocity_dict.values(), key=lambda x: x["date"])
+
+    recent_posts = []
+    for p in posts[:30]:
+        post_text = p.get("post_text") or ""
+        snippet = (post_text[:280] + "...") if len(post_text) > 280 else post_text
+        recent_posts.append({
+            "id": p["id"],
+            "topic": p.get("topic", ""),
+            "hook": p.get("hook") or "",
+            "angle_type": p.get("angle_type") or "Standard Hook",
+            "word_count": p.get("word_count") or 0,
+            "hashtag_count": p.get("hashtag_count") or 0,
+            "approved": bool(p.get("approved")),
+            "published_at": (
+                p["published_at"].isoformat()
+                if isinstance(p.get("published_at"), (datetime, date))
+                else None
+            ),
+            "linkedin_urn": p.get("linkedin_urn"),
+            "linkedin_post_url": p.get("linkedin_post_url"),
+            "niche": p.get("niche") or "AI & Tech",
+            "snippet": snippet,
+            "full_text": post_text,
+            "created_at": (
+                p["created_at"].isoformat()
+                if isinstance(p.get("created_at"), (datetime, date))
+                else str(p.get("created_at") or "")
+            ),
+        })
+
+    return {
+        "time_range": time_range,
+        "total_posts": total_posts,
+        "approved_posts": approved_posts,
+        "published_posts": published_posts,
+        "pending_posts": pending_posts,
+        "approval_rate": approval_rate,
+        "avg_word_count": avg_word_count,
+        "avg_hashtag_count": avg_hashtag_count,
+        "angle_distribution": list(angle_counts.values()),
+        "niche_distribution": [
+            {"niche": k, "count": v} for k, v in niche_counts.items()
+        ],
+        "velocity": velocity_list,
+        "recent_posts": recent_posts,
+    }
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

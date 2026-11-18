@@ -317,12 +317,16 @@ class LinkedinPost(Base):
         Boolean, nullable=False, server_default=text("false")
     )
     niche: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[datetime | None] = mapped_column(TZDateTime)
+    linkedin_urn: Mapped[str | None] = mapped_column(Text)
+    linkedin_post_url: Mapped[str | None] = mapped_column(Text)
     deleted_at: Mapped[datetime | None] = mapped_column(TZDateTime)
     created_at: Mapped[datetime] = _created_at()
 
     __table_args__ = (
         Index("ix_linkedin_posts_user_created", "user_id", text("created_at DESC")),
     )
+
 
 
 class YoutubeScript(Base):
@@ -699,6 +703,29 @@ class InstagramOAuthToken(Base):
     scopes: Mapped[str | None] = mapped_column(Text)
     connected_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _created_at()
+
+
+class LinkedinOAuthToken(Base):
+    """Per-user LinkedIn OAuth token, Fernet-encrypted."""
+
+    __tablename__ = "linkedin_oauth_tokens"
+
+    user_id: Mapped[str] = mapped_column(
+        UUIDStr, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    linkedin_id: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str | None] = mapped_column(Text)
+    email: Mapped[str | None] = mapped_column(Text)
+    picture_url: Mapped[str | None] = mapped_column(Text)
+    access_token_enc: Mapped[str] = mapped_column(Text, nullable=False)
+    key_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("1")
+    )
+    token_expires_at: Mapped[datetime] = mapped_column(TZDateTime, nullable=False)
+    scopes: Mapped[str | None] = mapped_column(Text)
+    connected_at: Mapped[datetime] = _created_at()
+    updated_at: Mapped[datetime] = _created_at()
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

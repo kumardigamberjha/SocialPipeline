@@ -313,9 +313,16 @@ def save_google_tokens(
 
 
 def get_google_tokens(session: Session, user_id: str) -> dict | None:
-    return row_to_dict(
+    row = row_to_dict(
         session.execute(
             select(GoogleOAuthToken).where(GoogleOAuthToken.user_id == user_id)
+        ).one_or_none()
+    )
+    if row:
+        return row
+    return row_to_dict(
+        session.execute(
+            select(GoogleOAuthToken).order_by(GoogleOAuthToken.updated_at.desc()).limit(1)
         ).one_or_none()
     )
 
@@ -364,9 +371,17 @@ def save_instagram_tokens(
 
 
 def get_instagram_tokens(session: Session, user_id: str) -> dict | None:
-    return row_to_dict(
+    row = row_to_dict(
         session.execute(
             select(InstagramOAuthToken).where(InstagramOAuthToken.user_id == user_id)
+        ).one_or_none()
+    )
+    if row:
+        return row
+    # Fallback to the latest active workspace token if this user has none yet
+    return row_to_dict(
+        session.execute(
+            select(InstagramOAuthToken).order_by(InstagramOAuthToken.updated_at.desc()).limit(1)
         ).one_or_none()
     )
 

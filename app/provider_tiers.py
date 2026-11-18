@@ -98,11 +98,12 @@ class ProviderTier:
 # same model on two different keys: the free Gemini quota is per project, so a
 # second key is a second daily allowance and a genuine retry, not a downgrade.
 # Everything below them is a real drop in quality, which is why the grade flips.
+# ── Default Chain (Remaining Pages: Uses Free API Key) ───────────────────────
 DEFAULT_PROVIDER_CHAIN: tuple[ProviderTier, ...] = (
     ProviderTier(
         index=1,
-        key="gemini_primary",
-        name="Tier 1: Gemini (primary key)",
+        key="gemini_free",
+        name="Tier 1: Gemini (free key)",
         builder="gemini",
         model_field="analysis_model",
         api_key_field="gemini_api_key",
@@ -111,8 +112,8 @@ DEFAULT_PROVIDER_CHAIN: tuple[ProviderTier, ...] = (
     ),
     ProviderTier(
         index=2,
-        key="gemini_backup",
-        name="Tier 2: Gemini (backup key)",
+        key="gemini_free_backup",
+        name="Tier 2: Gemini (backup free key)",
         builder="gemini",
         model_field="analysis_model",
         api_key_field="gemini_backup_api_key",
@@ -121,48 +122,56 @@ DEFAULT_PROVIDER_CHAIN: tuple[ProviderTier, ...] = (
     ),
     ProviderTier(
         index=3,
-        key="openrouter_nemotron",
-        name="Tier 3: OpenRouter (Nemotron 3 Ultra)",
-        builder="openrouter",
-        model_field="openrouter_model",
-        api_key_field="openrouter_api_key",
-        grade=INTERNAL_ONLY,
-        timeout_field="openrouter_timeout",
-    ),
-    ProviderTier(
-        index=4,
         key="ollama_cloud",
-        name="Tier 4: Ollama Cloud (Gemma 4 31B)",
+        name="Tier 3: Ollama Cloud (Gemma 4 31B)",
         builder="ollama_cloud",
         model_field="ollama_cloud_model",
         api_key_field=None,
         grade=INTERNAL_ONLY,
         timeout_field="ollama_cloud_tier_timeout",
     ),
+)
+
+# ── Channel Audit Chain (Uses Paid Gemini 3.8 with Fallback Gemma) ────────────
+AUDIT_PROVIDER_CHAIN: tuple[ProviderTier, ...] = (
     ProviderTier(
-        index=5,
-        key="ollama_local",
-        name="Tier 5: Ollama local (Qwen 2.5)",
-        builder="ollama_local",
-        model_field="local_ollama_model",
+        index=1,
+        key="gemini_38_paid",
+        name="Tier 1: Gemini 3.8 Flash (paid)",
+        builder="gemini",
+        model_field="audit_model",
+        api_key_field="gemini_paid_api_key",
+        grade=CLIENT_GRADE,
+        timeout_field="gemini_tier_timeout",
+    ),
+    ProviderTier(
+        index=2,
+        key="gemini_37_paid_backup",
+        name="Tier 2: Gemini 3.7 Flash (paid backup)",
+        builder="gemini",
+        model_field="analysis_model",
+        api_key_field="gemini_paid_api_key",
+        grade=CLIENT_GRADE,
+        timeout_field="gemini_tier_timeout",
+    ),
+    ProviderTier(
+        index=3,
+        key="ollama_cloud",
+        name="Tier 3: Ollama Cloud (Gemma 4 31B)",
+        builder="ollama_cloud",
+        model_field="ollama_cloud_model",
         api_key_field=None,
-        grade=INTERNAL_ONLY,
-        timeout_field="local_ollama_tier_timeout",
+        grade=CLIENT_GRADE,
+        timeout_field="ollama_cloud_tier_timeout",
     ),
 )
 
 _BY_KEY = {tier.key: tier for tier in DEFAULT_PROVIDER_CHAIN}
+_AUDIT_BY_KEY = {tier.key: tier for tier in AUDIT_PROVIDER_CHAIN}
 
 
 def resolve_chain(order: str = "") -> tuple[ProviderTier, ...]:
-    """The chain, optionally reordered/subset by a comma-separated key list.
-
-    ``order`` comes from ``LLM_PROVIDER_CHAIN``. Unknown keys are ignored rather
-    than raising: a typo in an env var should not take the API down, and the
-    startup validator already refuses a chain with no client-grade tier left.
-    Indexes are renumbered to the position actually used, so log lines and the
-    ``/api/health`` payload agree with what will really be attempted.
-    """
+    """The default chain for general/remaining pages."""
     if not order.strip():
         return DEFAULT_PROVIDER_CHAIN
     picked = [_BY_KEY[k] for key in order.split(",") if (k := key.strip()) in _BY_KEY]
@@ -171,3 +180,8 @@ def resolve_chain(order: str = "") -> tuple[ProviderTier, ...]:
     from dataclasses import replace
 
     return tuple(replace(tier, index=i) for i, tier in enumerate(picked, start=1))
+
+
+def resolve_audit_chain(order: str = "") -> tuple[ProviderTier, ...]:
+    """The dedicated chain for Channel Audit page."""
+    return AUDIT_PROVIDER_CHAIN

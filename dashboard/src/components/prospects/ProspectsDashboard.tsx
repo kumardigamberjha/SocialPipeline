@@ -5,16 +5,29 @@ import Link from "next/link";
 import {
   ArrowLeft,
   ExternalLink,
+  Film,
+  Instagram,
   Loader2,
   Printer,
+  Scissors,
   Search,
   Sparkles,
   Telescope,
   Trash2,
   Users,
+  Video,
+  Youtube,
+  Zap,
 } from "lucide-react";
 import { ApiError } from "@/lib/apiClient";
 import ProspectReportView from "@/components/prospects/ProspectReportView";
+import ShortFormAuditPanel from "@/components/prospects/ShortFormAuditPanel";
+import {
+  shortformApi,
+  type ShortFormAuditReport,
+  type ShortFormLookupResponse,
+  type ShortFormPlatform,
+} from "@/lib/shortformProspectsApi";
 import {
   fmtCompact,
   fmtDate,
@@ -82,15 +95,28 @@ function SafeAvatar({
 }
 
 export default function ProspectsDashboard() {
+  const [auditMode, setAuditMode] = useState<"shortform_reels" | "youtube_channel">("shortform_reels");
+
+  // YouTube Channel Audit State
   const [query, setQuery] = useState("");
   const [candidate, setCandidate] = useState<ProspectChannel | null>(null);
   const [report, setReport] = useState<ProspectReport | null>(null);
   const [saved, setSaved] = useState<ProspectSummary[]>([]);
-
   const [looking, setLooking] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [loadingList, setLoadingList] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  // Short-Form & Reels Audit State
+  const [sfPlatform, setSfPlatform] = useState<ShortFormPlatform>("youtube");
+  const [sfQuery, setSfQuery] = useState("");
+  const [sfCandidate, setSfCandidate] = useState<ShortFormLookupResponse | null>(null);
+  const [sfReport, setSfReport] = useState<ShortFormAuditReport | null>(null);
+  const [sfSaved, setSfSaved] = useState<ShortFormAuditReport[]>([]);
+  const [sfLooking, setSfLooking] = useState(false);
+  const [sfGenerating, setSfGenerating] = useState(false);
+  const [sfLoadingList, setSfLoadingList] = useState(true);
+  const [sfError, setSfError] = useState<string | null>(null);
 
   const loadSaved = useCallback(async () => {
     setLoadingList(true);
@@ -98,17 +124,28 @@ export default function ProspectsDashboard() {
       const data = await prospectsApi.list();
       setSaved(data.items ?? []);
     } catch {
-      // A failed list must not block a fresh lookup — the primary action here
-      // is auditing a new channel, not reviewing old ones.
       setSaved([]);
     } finally {
       setLoadingList(false);
     }
   }, []);
 
+  const loadSfSaved = useCallback(async () => {
+    setSfLoadingList(true);
+    try {
+      const data = await shortformApi.list();
+      setSfSaved(data.items ?? []);
+    } catch {
+      setSfSaved([]);
+    } finally {
+      setSfLoadingList(false);
+    }
+  }, []);
+
   useEffect(() => {
     loadSaved();
-  }, [loadSaved]);
+    loadSfSaved();
+  }, [loadSaved, loadSfSaved]);
 
   const runLookup = async () => {
     if (!query.trim() || looking) return;
@@ -189,18 +226,340 @@ export default function ProspectsDashboard() {
     }
   };
 
+  const runSfLookup = async () => {
+    if (!sfQuery.trim() || sfLooking) return;
+    setSfLooking(true);
+    setSfError(null);
+    setSfCandidate(null);
+    setSfReport(null);
+    try {
+      const data = await shortformApi.lookup(sfPlatform, sfQuery.trim());
+      setSfCandidate(data);
+    } catch (e) {
+      setSfError(e instanceof ApiError ? e.message : "Creator lookup failed");
+    } finally {
+      setSfLooking(false);
+    }
+  };
+
+  const runSfGenerate = async () => {
+    if (!sfCandidate || sfGenerating) return;
+    setSfGenerating(true);
+    setSfError(null);
+    try {
+      const rep = await shortformApi.generate(sfCandidate.profile.platform, sfCandidate.profile.identifier);
+      setSfReport(rep);
+      loadSfSaved();
+    } catch (e) {
+      setSfError(e instanceof ApiError ? e.message : "Short-form audit generation failed");
+    } finally {
+      setSfGenerating(false);
+    }
+  };
+
+  const openSavedSf = async (reportId: string) => {
+    setSfGenerating(true);
+    setSfError(null);
+    try {
+      const rep = await shortformApi.getReport(reportId);
+      setSfReport(rep);
+    } catch (e) {
+      setSfError(e instanceof ApiError ? e.message : "Could not load that audit");
+    } finally {
+      setSfGenerating(false);
+    }
+  };
+
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-8">
-      <header>
-        <p className="flex items-center gap-2 text-[11px] font-bold tracking-[0.25em] uppercase text-red-400">
-          <Telescope size={13} /> Prospect Audits
+      {/* ── Mode Switcher ── */}
+      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 pb-4">
+        <div className="flex items-center gap-2.5">
+          <button
+            onClick={() => {
+              setAuditMode("shortform_reels");
+              setError(null);
+              setSfError(null);
+            }}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-xs md:text-sm transition-all cursor-pointer ${
+              auditMode === "shortform_reels"
+                ? "bg-gradient-to-r from-purple-600 via-pink-600 to-indigo-600 text-white shadow-lg shadow-purple-600/30 border border-purple-400/40"
+                : "bg-white/[0.04] text-slate-400 hover:text-white border border-white/5"
+            }`}
+          >
+            <Scissors size={15} /> Short-Form & Reels Audit
+            <span className="text-[9px] uppercase font-black px-1.5 py-0.2 rounded bg-amber-400 text-slate-950">
+              NEW
+            </span>
+          </button>
+
+          <button
+            onClick={() => {
+              setAuditMode("youtube_channel");
+              setError(null);
+              setSfError(null);
+            }}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-xl font-bold text-xs md:text-sm transition-all cursor-pointer ${
+              auditMode === "youtube_channel"
+                ? "bg-red-600/30 border border-red-500/40 text-red-200 shadow-lg"
+                : "bg-white/[0.04] text-slate-400 hover:text-white border border-white/5"
+            }`}
+          >
+            <Youtube size={15} className="text-red-400" /> YouTube Channel Audit
+          </button>
+        </div>
+
+        <p className="text-xs text-slate-500 hidden sm:block">
+          {auditMode === "shortform_reels"
+            ? "Viral Hook Teardowns & 30-Day Sprint Roadmaps"
+            : "Channel Vitals & Publishing Roadmaps"}
         </p>
-        <h1 className="text-2xl font-bold text-white mt-1">Audit any channel</h1>
+      </div>
+
+      {/* ── HEADER ── */}
+      <header>
+        <p className="flex items-center gap-2 text-[11px] font-bold tracking-[0.25em] uppercase text-purple-400">
+          {auditMode === "shortform_reels" ? (
+            <>
+              <Film size={13} /> Short-Form Repurposing & Virality Engine
+            </>
+          ) : (
+            <>
+              <Telescope size={13} className="text-red-400" /> YouTube Channel Audits
+            </>
+          )}
+        </p>
+        <h1 className="text-2xl font-bold text-white mt-1">
+          {auditMode === "shortform_reels"
+            ? "Audit Short-Form & Viral Reels Potential"
+            : "Audit any YouTube channel"}
+        </h1>
         <p className="text-sm text-slate-500 mt-1 max-w-2xl">
-          Paste a channel name, @handle or YouTube URL. Get a data-grounded audit, a 30-day content
-          plan, and an outreach opener with the real numbers already filled in.
+          {auditMode === "shortform_reels"
+            ? "Audit any YouTube channel or Instagram creator. Uncover high-retention viral moments from long-form videos, diagnose 3-second hook leaks, and generate an institutional 30-day Short-Form sprint deliverable."
+            : "Paste a channel name, @handle or YouTube URL. Get a data-grounded audit, a 30-day content plan, and an outreach opener with the real numbers already filled in."}
         </p>
       </header>
+
+      {/* ── SECTION: Short-Form & Reels Mode ── */}
+      {auditMode === "shortform_reels" && (
+        <div className="space-y-6">
+          {/* Active Short-Form Report View */}
+          {sfReport ? (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <button
+                  onClick={() => {
+                    setSfReport(null);
+                    setSfCandidate(null);
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-white/[0.05] text-slate-300 border border-white/10 hover:bg-white/[0.1] hover:text-white transition-colors cursor-pointer"
+                >
+                  <ArrowLeft size={13} /> Back to Search & Saved Audits
+                </button>
+              </div>
+
+              <ShortFormAuditPanel report={sfReport} />
+            </div>
+          ) : (
+            <>
+              {/* Lookup Card */}
+              <div className="glass-card rounded-2xl border border-white/10 bg-[#0f172a]/80 p-6 space-y-4">
+                {/* Platform selector */}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-semibold text-slate-400 mr-1">Platform:</span>
+                  <button
+                    onClick={() => {
+                      setSfPlatform("youtube");
+                      setSfCandidate(null);
+                    }}
+                    className={`px-3 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 border transition-all cursor-pointer ${
+                      sfPlatform === "youtube"
+                        ? "bg-red-500/20 text-red-200 border-red-500/40"
+                        : "bg-white/5 text-slate-400 border-white/5 hover:text-white"
+                    }`}
+                  >
+                    <Youtube size={13} className="text-red-400" /> YouTube (Long-to-Shorts Repurposing)
+                  </button>
+                  <button
+                    onClick={() => {
+                      setSfPlatform("instagram");
+                      setSfCandidate(null);
+                    }}
+                    className={`px-3 py-1 rounded-lg text-xs font-bold flex items-center gap-1.5 border transition-all cursor-pointer ${
+                      sfPlatform === "instagram"
+                        ? "bg-pink-500/20 text-pink-200 border-pink-500/40"
+                        : "bg-white/5 text-slate-400 border-white/5 hover:text-white"
+                    }`}
+                  >
+                    <Instagram size={13} className="text-pink-400" /> Instagram (@handle / Reels)
+                  </button>
+                </div>
+
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <div className="relative flex-1">
+                    <Search
+                      size={15}
+                      className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-600 pointer-events-none"
+                    />
+                    <input
+                      value={sfQuery}
+                      onChange={(e) => setSfQuery(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && runSfLookup()}
+                      placeholder={
+                        sfPlatform === "youtube"
+                          ? "Fireship · @fireship · youtube.com/@fireship"
+                          : "@codingindiaai · instagram.com/codingindiaai"
+                      }
+                      className="w-full pl-9 pr-3 py-2.5 bg-white/[0.03] border border-white/10 rounded-lg text-sm text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-purple-500/40"
+                    />
+                  </div>
+                  <button
+                    onClick={runSfLookup}
+                    disabled={sfLooking || !sfQuery.trim()}
+                    className="flex items-center justify-center gap-2 px-5 py-2.5 rounded-lg text-sm font-semibold bg-purple-600/30 text-purple-200 border border-purple-500/40 hover:bg-purple-600/40 transition-colors disabled:opacity-50 cursor-pointer"
+                  >
+                    {sfLooking ? <Loader2 size={15} className="animate-spin" /> : <Search size={15} />}
+                    Audit Creator
+                  </button>
+                </div>
+
+                {sfError && (
+                  <div className="rounded-lg border border-red-500/25 bg-red-500/10 px-4 py-2.5 text-sm text-red-200">
+                    {sfError}
+                  </div>
+                )}
+
+                {/* Candidate Resolution Preview */}
+                {sfCandidate && !sfReport && (
+                  <div className="mt-4 rounded-xl bg-[#0b101e] border border-purple-500/30 p-4 flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div className="flex items-center gap-3">
+                      {sfCandidate.profile.avatar_url ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={sfCandidate.profile.avatar_url}
+                          alt=""
+                          className="w-12 h-12 rounded-xl object-cover border border-white/10"
+                        />
+                      ) : (
+                        <div className="w-12 h-12 rounded-xl bg-purple-600/20 text-purple-300 font-bold flex items-center justify-center border border-purple-500/30">
+                          {sfCandidate.profile.title.charAt(0).toUpperCase()}
+                        </div>
+                      )}
+                      <div>
+                        <p className="text-sm font-bold text-white flex items-center gap-2">
+                          {sfCandidate.profile.title}
+                          <span className="text-xs font-normal text-slate-400">
+                            {sfCandidate.profile.handle}
+                          </span>
+                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                            Live Profile
+                          </span>
+                        </p>
+                        <p className="text-xs text-slate-400 mt-0.5">
+                          {sfCandidate.profile.followers_or_subs.toLocaleString()} followers/subs · {sfCandidate.sample_videos_count} catalog videos found
+                        </p>
+                        {sfCandidate.profile.bio && (
+                          <p className="text-xs text-slate-300/90 italic mt-1 max-w-md line-clamp-2">
+                            &ldquo;{sfCandidate.profile.bio}&rdquo;
+                          </p>
+                        )}
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                      <div className="text-left sm:text-right">
+                        <p className="text-[10px] uppercase font-bold text-purple-400">Opportunity Score</p>
+                        <p className="text-base font-black text-amber-300">
+                          {sfCandidate.gap_metrics.shortform_opportunity_score} / 100
+                        </p>
+                        <p className="text-[10px] text-slate-400 max-w-[200px] truncate sm:text-right">
+                          {sfCandidate.gap_metrics.opportunity_verdict}
+                        </p>
+                      </div>
+
+                      <button
+                        onClick={runSfGenerate}
+                        disabled={sfGenerating}
+                        className="px-4 py-2.5 rounded-xl bg-gradient-to-r from-purple-600 to-pink-600 hover:from-purple-500 hover:to-pink-500 text-white text-xs font-bold flex items-center justify-center gap-2 shadow-lg shadow-purple-600/30 transition-all cursor-pointer disabled:opacity-50"
+                      >
+                        {sfGenerating ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : (
+                          <Sparkles size={14} />
+                        )}
+                        {sfGenerating ? "Extracting Viral Cuts…" : "Generate Short-Form & Reels Audit"}
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Saved Short-Form Audits List */}
+              <section className="space-y-3">
+                <p className="flex items-center gap-2 text-[11px] font-bold tracking-[0.25em] uppercase text-slate-400">
+                  <Film size={13} /> Saved Short-Form & Reels Audits
+                </p>
+
+                {sfLoadingList ? (
+                  <div className="flex justify-center py-8">
+                    <Loader2 className="animate-spin text-slate-600" size={20} />
+                  </div>
+                ) : sfSaved.length === 0 ? (
+                  <div className="rounded-2xl border border-white/5 bg-white/[0.02] py-8 text-center">
+                    <Film size={24} className="mx-auto text-slate-700" />
+                    <p className="text-xs text-slate-400 mt-2">No Short-Form audits generated yet</p>
+                    <p className="text-[11px] text-slate-600 mt-0.5">
+                      Audit a creator above to extract your first 5 viral Reel blueprints.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                    {sfSaved.map((r) => (
+                      <div
+                        key={r.report_id}
+                        className="rounded-xl border border-white/5 bg-white/[0.02] p-4 flex flex-col justify-between gap-3 hover:border-purple-500/30 transition-all"
+                      >
+                        <div className="flex items-center justify-between">
+                          <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                            {r.profile.platform === "instagram" ? (
+                              <Instagram size={14} className="text-pink-400" />
+                            ) : (
+                              <Youtube size={14} className="text-red-400" />
+                            )}
+                            {r.profile.title}
+                          </span>
+                          <span className="text-[10px] font-bold text-amber-300 bg-amber-500/10 px-1.5 py-0.2 rounded border border-amber-500/20">
+                            {r.gap_metrics.shortform_opportunity_score}/100
+                          </span>
+                        </div>
+
+                        <p className="text-[11px] text-slate-400 line-clamp-2 leading-relaxed">
+                          {r.executive_summary}
+                        </p>
+
+                        <div className="flex items-center justify-between pt-2 border-t border-white/5 text-[10px]">
+                          <span className="text-slate-500">{new Date(r.generated_at).toLocaleDateString()}</span>
+                          <button
+                            onClick={() => openSavedSf(r.report_id)}
+                            className="text-purple-300 hover:text-purple-200 font-bold transition-colors cursor-pointer"
+                          >
+                            Open Short-Form Report →
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── SECTION: YouTube Long-Form Channel Mode ── */}
+      {auditMode === "youtube_channel" && (
+        <div className="space-y-6">
 
       {/* ── Lookup ────────────────────────────────────────────────────────── */}
       <div className="glass-card rounded-2xl border border-white/5 p-6">
@@ -438,6 +797,8 @@ export default function ProspectsDashboard() {
             </div>
           )}
         </section>
+      )}
+        </div>
       )}
     </div>
   );

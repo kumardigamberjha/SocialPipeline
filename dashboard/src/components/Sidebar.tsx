@@ -15,6 +15,7 @@ import {
   Image as ImageIcon,
   Instagram,
   LayoutDashboard,
+  Linkedin,
   LogOut,
   MessageSquare,
   Radio,
@@ -44,6 +45,7 @@ export const NAV_ITEMS: NavItem[] = [
   { href: "/image-studio", label: "Image Studio", subLabel: "Prompt to Image", icon: ImageIcon },
   { href: "/youtube-analysis", label: "YouTube", subLabel: "Channel & Competitors", icon: Youtube },
   { href: "/instagram-analysis", label: "Instagram", subLabel: "Media & Audience", icon: Instagram },
+  { href: "/linkedin-analysis", label: "LinkedIn", subLabel: "Automation & Growth", icon: Linkedin },
   { href: "/prospects", label: "Prospects", subLabel: "Channel Audits", icon: Telescope },
   { href: "/personal-intelligence", label: "Intelligence", subLabel: "Knowledge & Directives", icon: Brain },
 ];
